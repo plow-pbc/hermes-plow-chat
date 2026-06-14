@@ -89,6 +89,12 @@ def _clear_env(monkeypatch):
             {"method": "GET", "auth": "Bearer conn-tok"},
             id="connector-token-overrides-chat-token",
         ),
+        pytest.param(
+            {"PLOW_CHAT_TOKEN": "tok-abc"},
+            ("gmail", "messages.list"),
+            {"method": "POST", "json": {}, "content_type": "application/json"},
+            id="post-empty-body-defaults-to-empty-object",
+        ),
     ],
 )
 def test_request_shape(monkeypatch, mod, captured, env, args, expected):
@@ -148,6 +154,13 @@ def test_missing_token_is_fatal(monkeypatch, mod):
     _clear_env(monkeypatch)
     with pytest.raises(SystemExit):
         mod.call("gmail", "status")
+
+
+def test_malformed_json_body_is_fatal(monkeypatch, mod):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["gmail", "messages.list", "{not valid json"])
+    assert exc.value.code == 1
 
 
 def test_http_error_exits_nonzero(monkeypatch, mod):
