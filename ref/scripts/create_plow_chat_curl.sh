@@ -292,7 +292,7 @@ redeem_once() {
 
 # GET a JSON surface with the verified Bearer token. The auth header is fed to
 # curl via --config on stdin so the user-wide token never appears in argv where
-# a local `ps` could read it (defect #13 / SEED.md:67). $1 = URL; prints the
+# a local `ps` could read it (defect #13 / see SEED.md). $1 = URL; prints the
 # response body, or '{}' on any failure (these snapshots are best-effort).
 get_with_token() {
   printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \

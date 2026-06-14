@@ -96,7 +96,7 @@ Each run prints `Profile <name> activated. Wrote PLOW_CHAT_CHAT_UID +
 PLOW_CHAT_TOKEN to <path>.` on success. Confirm with:
 
 ```bash
-# Expect 2 — -c prints the match count, not the secret values (SEED.md:67).
+# Expect 2 — -c prints the match count, not the secret values (see SEED.md).
 grep -cE '^PLOW_CHAT_(CHAT_UID|TOKEN)=' hermes-agent/data/profiles/daniel/.env
 ```
 
