@@ -1,6 +1,18 @@
-# Hermes Plow Chat Platform Adapter SEED
+# seed-hermes-plow — Plow on Hermes
 
 ## Purpose
+
+This seed runs **Plow on Hermes**. It bundles two capabilities for a
+Docker-backed Hermes Agent:
+
+1. the **`plow_chat` messaging gateway** — REST + WSS to the Plow Chat API, so
+   the owner messages Hermes over their Plow line (specified below); and
+2. the **`plow-connectors` skill** — lets the agent use the owner's
+   Plow-connected **Gmail, Google Calendar, and Slack** accounts with the same
+   credentials, no separate setup (see *Plow connectors* near the end).
+
+It is the superset "Plow capabilities on Hermes" seed. The rest of this document
+specifies the messaging gateway.
 
 This SEED provides the Hermes gateway platform plugin named `plow_chat`. It
 wires Hermes to the [Plow Chat](https://github.com/plow-pbc/seed-plow-chat)
