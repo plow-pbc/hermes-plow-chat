@@ -36,7 +36,7 @@ def _env(*names: str, default: str | None = None) -> str | None:
 def call(connector: str, action: str, body: str = "") -> str:
     if connector not in CONNECTORS:
         raise SystemExit(f"unknown connector {connector!r}; expected one of {', '.join(CONNECTORS)}")
-    if not ACTION_RE.match(action):
+    if not ACTION_RE.fullmatch(action):  # fullmatch, not match: `$` would allow a trailing newline
         raise SystemExit(f"invalid action {action!r}; must be a single connector action token")
 
     token = _env("PLOW_CONNECTOR_TOKEN", "PLOW_CHAT_TOKEN")
@@ -64,13 +64,15 @@ def main(argv: list[str]) -> None:
     connector, action = argv[0], argv[1]
     body = argv[2] if len(argv) > 2 else ""
     try:
-        sys.stdout.write(call(connector, action, body))
-        if not body.endswith("\n"):
-            sys.stdout.write("\n")
+        resp = call(connector, action, body)
     except urllib.error.HTTPError as exc:  # fail loud — surface the API error verbatim
         detail = exc.read().decode("utf-8", "replace")[:1000]
         sys.stderr.write(f"HTTP {exc.code} {exc.reason}: {detail}\n")
         raise SystemExit(1)
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:  # transport / bad body — same fail-loud contract
+        sys.stderr.write(f"error: {exc}\n")
+        raise SystemExit(1)
+    sys.stdout.write(resp if resp.endswith("\n") else resp + "\n")
 
 
 if __name__ == "__main__":

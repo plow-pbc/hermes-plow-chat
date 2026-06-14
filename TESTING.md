@@ -24,7 +24,7 @@ From a disposable Hermes host folder:
 
 ```bash
 mkdir -p hermes-agent/data
-PLOW_CHAT_PLUGIN_LOCAL_DIR=/path/to/seed-hermes-plow-chat \
+PLOW_CHAT_PLUGIN_LOCAL_DIR=/path/to/seed-hermes-plow \
   ref/scripts/install_direct_mount.sh --scaffold ./hermes-agent
 cat >> hermes-agent/data/.env <<'EOF'
 PLOW_CHAT_BASE_URL=https://api.plow.co
