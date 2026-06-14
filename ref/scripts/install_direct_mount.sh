@@ -7,7 +7,7 @@ PLUGIN_NAME="plow-chat-platform"
 PLUGIN_DIR=""
 SOURCE_DIR="${PLOW_CHAT_PLUGIN_LOCAL_DIR:-}"
 PLUGIN_REF="${PLOW_CHAT_PLUGIN_REF:-main}"
-RAW_BASE="${PLOW_CHAT_SEED_RAW_BASE:-https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow-chat/${PLUGIN_REF}}"
+RAW_BASE="${PLOW_CHAT_SEED_RAW_BASE:-https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow/${PLUGIN_REF}}"
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 usage() {
@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
     --scaffold) SCAFFOLD_DIR="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
     --source-dir|--local-dir) SOURCE_DIR="$2"; shift 2 ;;
-    --ref) PLUGIN_REF="$2"; RAW_BASE="https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow-chat/${PLUGIN_REF}"; shift 2 ;;
+    --ref) PLUGIN_REF="$2"; RAW_BASE="https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow/${PLUGIN_REF}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac

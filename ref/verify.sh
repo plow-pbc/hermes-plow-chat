@@ -24,7 +24,7 @@ PY
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/hermes-agent"
-PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/tmp/seed-hermes-plow-chat-install.out
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/tmp/seed-hermes-plow-install.out
 
 for path in \
   "$tmpdir/hermes-agent/data/plugins/plow-chat-platform/plugin.yaml" \
@@ -47,7 +47,7 @@ plugins:
 terminal:
   cwd: /opt/data/workspace
 YAML
-PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/tmp/seed-hermes-plow-chat-install-existing.out
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/tmp/seed-hermes-plow-install-existing.out
 grep -q 'enabled: \[other-plugin, plow-chat-platform\]' "$tmpdir/hermes-agent/data/config.yaml" || {
   echo 'config.yaml inline enabled list was not preserved and extended' >&2
   exit 1

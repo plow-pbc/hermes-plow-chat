@@ -47,7 +47,7 @@ From the parent folder that contains the seed-hermes scaffold at
 `./hermes-agent/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow-chat/main/ref/scripts/install_direct_mount.sh \
+curl -fsSL https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow/main/ref/scripts/install_direct_mount.sh \
   -o /tmp/install_plow_chat.sh
 bash /tmp/install_plow_chat.sh --scaffold ./hermes-agent
 ```
