@@ -4,6 +4,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 class Platform(str):
     pass
@@ -81,10 +83,11 @@ class RecordingAdapter(adapter_mod.PlowChatAdapter):
         super().__init__(DummyConfig())
         self.sent = []
         self.handled = []
+        self.send_success = True
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append((chat_id, content))
-        return SendResult(success=True, message_id="msg_welcome")
+        return SendResult(success=self.send_success, message_id="msg_welcome")
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -102,16 +105,6 @@ def test_chat_active_sends_default_welcome(monkeypatch):
             "Hi — Plow Chat is connected to Hermes now. Reply here to start chatting.",
         )
     ]
-
-
-def test_chat_active_welcome_is_sent_once(monkeypatch):
-    monkeypatch.setenv("PLOW_CHAT_WELCOME_MESSAGE", "ready!")
-    adapter = RecordingAdapter(monkeypatch)
-
-    asyncio.run(adapter._handle_ws_frame({"type": "chat_active"}))
-    asyncio.run(adapter._handle_ws_frame({"type": "chat_active"}))
-
-    assert adapter.sent == [("cht_test", "ready!")]
 
 
 def test_inbound_message_auto_approves_verified_sender(monkeypatch):
@@ -169,30 +162,23 @@ class FakeResponse:
 
 
 class RecordingSession:
-    def __init__(self, payload=None, *, get_payload=None):
+    def __init__(self, payload=None):
         self.payload = payload or {}
-        self.get_payload = get_payload or {}
         self.posts = []
-        self.gets = []
 
     def post(self, url, **kwargs):
         self.posts.append((url, kwargs))
         return FakeResponse(self.payload)
 
-    def get(self, url, **kwargs):
-        self.gets.append((url, kwargs))
-        return FakeResponse(self.get_payload)
-
     async def close(self):
-        # send() now uses a per-call aiohttp.ClientSession() and closes it.
-        pass
+        return None
 
 
 def test_send_uses_bearer_token(monkeypatch):
     adapter = RecordingAdapter(monkeypatch)
     session = RecordingSession({"uid": "msg_1", "status": "sent"})
-    # send() opens a fresh per-call aiohttp.ClientSession(); make the stub hand
-    # back our recording session so we can assert on the request it issues.
+    # send() opens a fresh per-call aiohttp.ClientSession (see adapter.send),
+    # so stub the constructor to hand back the recording session.
     monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession", lambda *a, **k: session, raising=False)
 
     result = asyncio.run(adapter_mod.PlowChatAdapter.send(adapter, "cht_test", "hello"))
@@ -228,20 +214,28 @@ def test_ws_ticket_is_scoped_to_chat_and_uses_bearer(monkeypatch):
     ]
 
 
-def test_connected_active_chat_sends_welcome_once(monkeypatch):
+SENT = [("cht_test", "ready!")]
+
+
+@pytest.mark.parametrize(
+    "send_success, frames, expected_sent",
+    [
+        # chat_active sends the welcome once; a duplicate chat_active does not re-send.
+        (True, ["chat_active", "chat_active"], SENT),
+        # An ambiguous send (committed server-side, reported as a client failure)
+        # latches on attempt, so a later chat_active does not re-send.
+        (False, ["chat_active", "chat_active"], SENT),
+        # connected frames never trigger the welcome (no first-connect path).
+        (True, ["connected", "connected"], []),
+    ],
+    ids=["chat-active-once", "ambiguous-send-latched", "connected-no-welcome"],
+)
+def test_activation_welcome_latch(monkeypatch, send_success, frames, expected_sent):
     monkeypatch.setenv("PLOW_CHAT_WELCOME_MESSAGE", "ready!")
     adapter = RecordingAdapter(monkeypatch)
-    session = RecordingSession(get_payload={"uid": "cht_test", "status": "active"})
-    adapter._http_session = session
+    adapter.send_success = send_success
 
-    asyncio.run(adapter._handle_ws_frame({"type": "connected"}))
-    asyncio.run(adapter._handle_ws_frame({"type": "connected"}))
-    asyncio.run(adapter._handle_ws_frame({"type": "chat_active"}))
+    for frame in frames:
+        asyncio.run(adapter._handle_ws_frame({"type": frame}))
 
-    assert adapter.sent == [("cht_test", "ready!")]
-    assert session.gets == [
-        (
-            "https://api.plow.co/v1/chats/cht_test",
-            {"headers": {"Authorization": "Bearer token_test"}},
-        )
-    ]
+    assert adapter.sent == expected_sent
