@@ -86,7 +86,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._seen_message_uids: set[str] = set()
         self._stop_event = asyncio.Event()
         self._welcome_sent = False
-        self._checked_initial_chat_status = False
 
     @property
     def name(self) -> str:
@@ -223,7 +222,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         if frame_type == "connected":
             self._mark_connected()
             logger.info("[plow_chat] websocket subscribed")
-            await self._send_welcome_if_chat_already_active()
             return
         if frame_type == "chat_active":
             logger.info("[plow_chat] chat active")
@@ -278,44 +276,24 @@ class PlowChatAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _send_activation_welcome(self) -> None:
-        """Send one setup-success message after Plow reports activation.
+        """Send one setup-success message when Plow reports the chat active.
 
-        The WebSocket can be connected while the chat is still pending. When
-        the user texts the verification code, Plow emits ``chat_active``; at
-        that point sends no longer return ``chat_not_ready`` and the user should
-        get an immediate confirmation instead of wondering whether setup
-        worked.
+        The WebSocket can be connected while the chat is still pending; Plow
+        emits ``chat_active`` after the user texts the verification code, at
+        which point the user gets an immediate setup confirmation.
         """
         if self._welcome_sent or not _auto_welcome_enabled():
             return
         message = _welcome_message_from_env()
         if not message:
             return
+        # Latch before sending: a welcome POST can commit server-side even when
+        # the client observes a failure, so we attempt it at most once and a
+        # duplicate ``chat_active`` frame does not re-send.
+        self._welcome_sent = True
         result = await self.send(self.chat_uid, message)
-        if result.success:
-            self._welcome_sent = True
-        else:
+        if not result.success:
             logger.warning("[plow_chat] activation welcome send failed: %s", result.error)
-
-    async def _send_welcome_if_chat_already_active(self) -> None:
-        if self._checked_initial_chat_status:
-            return
-        self._checked_initial_chat_status = True
-        try:
-            async with self._http_session.get(
-                f"{self.base_url}/v1/chats/{self.chat_uid}",
-                headers={"Authorization": f"Bearer {self.token}"},
-            ) as resp:
-                data = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    err = data.get("error", {}) if isinstance(data, dict) else {}
-                    logger.warning("[plow_chat] initial chat status check failed: %s", err.get("message") or resp.status)
-                    return
-        except Exception as exc:
-            logger.warning("[plow_chat] initial chat status check failed: %s", exc)
-            return
-        if isinstance(data, dict) and data.get("status") == "active":
-            await self._send_activation_welcome()
 
     def _approve_sender_from_frame(self, frame: dict[str, Any]) -> None:
         """Best-effort approval from activation/verification frames."""
