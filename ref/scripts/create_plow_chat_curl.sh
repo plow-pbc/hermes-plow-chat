@@ -290,6 +290,15 @@ redeem_once() {
   rm -f "$body_file"
 }
 
+# GET a JSON surface with the verified Bearer token. The auth header is fed to
+# curl via --config on stdin so the user-wide token never appears in argv where
+# a local `ps` could read it (defect #13 / SEED.md:67). $1 = URL; prints the
+# response body, or '{}' on any failure (these snapshots are best-effort).
+get_with_token() {
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+    | curl -fsSL --config - "$1" 2>/dev/null || printf '{}'
+}
+
 # --- Non-interactive test binding (defect #14): skip the phone-bind dance. ----
 if [[ -n "$TEST_MODE" ]]; then
   if [[ -z "$TEST_CHAT_UID" || -z "$TEST_TOKEN" ]]; then
@@ -382,12 +391,15 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
       echo "Activation verified, but redeem did not include both token and chat uid." >&2
       exit 1
     fi
-    OWNER_IDENTITY_JSON="$(curl -fsSL \
-      -H "Authorization: Bearer ${TOKEN}" \
-      "${BASE_URL}/v1/auth/owner-identity" 2>/dev/null || printf '{}')"
-    CHANNELS_JSON="$(curl -fsSL \
-      -H "Authorization: Bearer ${TOKEN}" \
-      "${BASE_URL}/v1/me/channels" 2>/dev/null || printf '{}')"
+    # Fail fast on a token carrying quote/backslash/CR/LF: a real Plow bearer
+    # token never does, and such chars would break out of get_with_token's
+    # curl --config "header = \"...\"" line (config-injection).
+    if [[ "$TOKEN" == *[$'\r\n"\\']* ]]; then
+      echo "Redeem token contains unexpected control or quote characters; refusing to proceed." >&2
+      exit 1
+    fi
+    OWNER_IDENTITY_JSON="$(get_with_token "${BASE_URL}/v1/auth/owner-identity")"
+    CHANNELS_JSON="$(get_with_token "${BASE_URL}/v1/me/channels")"
     # Re-apply permissions right before writing: the container may have churned
     # data/ ownership during the poll window (defect #16).
     ensure_data_dir_writable

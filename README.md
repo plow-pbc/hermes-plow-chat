@@ -150,14 +150,18 @@ ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel 
 This is **not** a real activation — it never contacts Plow and the audit file
 records `"status": "test-mode"`. Never use it for a real operator install.
 
-The host poll uses:
+The redeem request shape — the secret is piped via stdin, never argv — is:
 
 ```bash
-curl -sSL \
+printf '{"activation_secret":"%s"}' "$ACTIVATION_SECRET" | curl -sSL \
   -H 'Content-Type: application/json' \
-  -d '{"activation_secret":"<secret>"}' \
+  -d @- \
   "https://api.plow.co/v1/auth/activate/redeem"
 ```
+
+`create_plow_chat_curl.sh` runs the actual poll: it captures the HTTP status
+without aborting on non-2xx, so an expired `410` prints re-run guidance instead
+of an opaque `curl` transport error.
 
 If the adapter is connected when Plow emits `chat_active`, it sends exactly one
 welcome message from Hermes through the normal Plow message endpoint. Set
