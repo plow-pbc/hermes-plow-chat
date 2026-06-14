@@ -136,7 +136,7 @@ def test_real_actions_accepted(monkeypatch, mod, captured, action):
     assert captured["url"].endswith(f"/{action}")
 
 
-@pytest.mark.parametrize("action", ["messages/list", "..", "a?b=1", "/v1/me", "messages..list", ""])
+@pytest.mark.parametrize("action", ["messages/list", "..", "a?b=1", "/v1/me", "messages..list", "", "status\n", "messages.list\n"])
 def test_url_escaping_action_is_rejected(monkeypatch, mod, action):
     # A prompted agent must not be able to smuggle / ? or .. into the URL path.
     monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")

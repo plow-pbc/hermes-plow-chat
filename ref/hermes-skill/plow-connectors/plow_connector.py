@@ -36,7 +36,7 @@ def _env(*names: str, default: str | None = None) -> str | None:
 def call(connector: str, action: str, body: str = "") -> str:
     if connector not in CONNECTORS:
         raise SystemExit(f"unknown connector {connector!r}; expected one of {', '.join(CONNECTORS)}")
-    if not ACTION_RE.match(action):
+    if not ACTION_RE.fullmatch(action):  # fullmatch, not match: `$` would allow a trailing newline
         raise SystemExit(f"invalid action {action!r}; must be a single connector action token")
 
     token = _env("PLOW_CONNECTOR_TOKEN", "PLOW_CHAT_TOKEN")
