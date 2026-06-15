@@ -80,7 +80,6 @@ enabled_count="$(awk '/^  enabled:/{in_enabled=1; next} in_enabled && /^  [^ -]/
   echo "expected exactly one plow-chat-platform in enabled, got $enabled_count" >&2
   exit 1
 }
-PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
 # Absent case: 2-space sibling present, plow-chat-platform missing -> appended at
 # the sibling's indent (no mixed-indent item), staying valid YAML.
 cat >"$tmpdir/hermes-agent/data/config.yaml" <<'YAML'
