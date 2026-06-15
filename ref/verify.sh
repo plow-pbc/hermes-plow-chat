@@ -72,14 +72,14 @@ terminal:
 YAML
 PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
 PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
-python3 - "$tmpdir/hermes-agent/data/config.yaml" <<'PY'
-import sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1]))  # raises if the script corrupted the YAML
-enabled = (cfg.get('plugins') or {}).get('enabled') or []
-count = sum(1 for x in enabled if x == 'plow-chat-platform')
-if count != 1:
-    raise SystemExit(f'expected exactly one plow-chat-platform in enabled, got {count}: {enabled}')
-PY
+# enabled: block list must contain plow-chat-platform exactly once (indent-agnostic),
+# no duplicate at a mismatched indent. awk scans the enabled: block until the next
+# sibling key and counts matching items.
+enabled_count="$(awk '/^  enabled:/{in_enabled=1; next} in_enabled && /^  [^ -]/{in_enabled=0} in_enabled && /^[[:space:]]*-[[:space:]]*plow-chat-platform[[:space:]]*$/{n++} END{print n+0}' "$tmpdir/hermes-agent/data/config.yaml")"
+[[ "$enabled_count" -eq 1 ]] || {
+  echo "expected exactly one plow-chat-platform in enabled, got $enabled_count" >&2
+  exit 1
+}
 PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
 # Absent case: 2-space sibling present, plow-chat-platform missing -> appended at
 # the sibling's indent (no mixed-indent item), staying valid YAML.
@@ -92,13 +92,13 @@ terminal:
   cwd: /opt/data/workspace
 YAML
 PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
-python3 - "$tmpdir/hermes-agent/data/config.yaml" <<'PY'
-import sys, yaml
-cfg = yaml.safe_load(open(sys.argv[1]))  # raises if mixed indent broke the YAML
-enabled = (cfg.get('plugins') or {}).get('enabled') or []
-if enabled != ['some-other', 'plow-chat-platform']:
-    raise SystemExit(f'unexpected enabled list after append: {enabled}')
-PY
+# plow-chat-platform appended at the sibling's indent (no mixed-indent item), so the
+# enabled: block items are exactly [some-other, plow-chat-platform] in order.
+appended="$(awk '/^  enabled:/{in_enabled=1; next} in_enabled && /^  [^ -]/{in_enabled=0} in_enabled && /^[[:space:]]*-[[:space:]]*[^[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/, ""); printf "%s ", $0}' "$tmpdir/hermes-agent/data/config.yaml")"
+[[ "$appended" == "some-other plow-chat-platform " ]] || {
+  echo "unexpected enabled list after append: $appended" >&2
+  exit 1
+}
 
 # 3. Host shell helpers are syntax-valid and contain no Python/git/Hermes CLI dependency.
 bash -n ref/scripts/install_direct_mount.sh ref/scripts/create_plow_chat_curl.sh ref/scripts/install_connectors.sh
