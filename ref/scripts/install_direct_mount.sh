@@ -96,9 +96,17 @@ EOF
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
       return s
     }
+    function leading_ws(s,    m) {
+      m = s
+      sub(/[^[:space:]].*$/, "", m)
+      return m
+    }
     function flush_enabled() {
       if (in_enabled && !enabled_has) {
-        print "    - plow-chat-platform"
+        # Match the indentation of existing list items so the YAML stays valid
+        # regardless of whether the scaffold used a 2- or 4-space list style.
+        # Default to 4 spaces when the list was empty.
+        print (enabled_indent == "" ? "    " : enabled_indent) "- plow-chat-platform"
       }
       in_enabled = 0
     }
@@ -166,13 +174,18 @@ EOF
       saw_enabled = 1
       in_enabled = 1
       enabled_has = 0
+      enabled_indent = ""
       in_disabled = 0
       print
       next
     }
-    in_plugins && /^    -[[:space:]]*plow-chat-platform[[:space:]]*$/ {
+    # A block list item naming the plugin, at ANY indent. Under enabled: it
+    # marks the plugin already present (idempotent: no duplicate append) and
+    # records the item indent; under disabled: it is dropped so re-enabling wins.
+    in_plugins && /^[[:space:]]+-[[:space:]]*plow-chat-platform[[:space:]]*$/ {
       if (in_enabled) {
         enabled_has = 1
+        enabled_indent = leading_ws($0)
       }
       if (in_disabled) {
         next
@@ -180,7 +193,15 @@ EOF
       print
       next
     }
-    in_enabled && !/^    -/ {
+    # Any other block list item under enabled: records the sibling indent so an
+    # appended entry lines up with it.
+    in_enabled && /^[[:space:]]+-/ {
+      enabled_indent = leading_ws($0)
+      print
+      next
+    }
+    # First non-list-item line ends the enabled block; flush any pending append.
+    in_enabled && !/^[[:space:]]+-/ {
       flush_enabled()
     }
     in_plugins && /^  disabled:[[:space:]]*\[/ {

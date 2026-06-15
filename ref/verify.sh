@@ -57,6 +57,49 @@ if awk '/disabled:/{in_disabled=1; next} in_disabled && /^  [^ ]/{in_disabled=0}
   exit 1
 fi
 
+# 2b. Idempotent, indent-agnostic enable (corruption regression). A config whose
+# block enabled: list uses 2-space item indent (valid YAML, but a different style
+# than the script emitted) must NOT gain a duplicate entry at a mismatched indent
+# — that produced invalid YAML and a silent fallback to default config. Running
+# the installer twice must leave a valid, single-entry enabled list.
+cat >"$tmpdir/hermes-agent/data/config.yaml" <<'YAML'
+plugins:
+  enabled:
+  - plow-chat-platform
+  disabled: []
+terminal:
+  cwd: /opt/data/workspace
+YAML
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
+python3 - "$tmpdir/hermes-agent/data/config.yaml" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1]))  # raises if the script corrupted the YAML
+enabled = (cfg.get('plugins') or {}).get('enabled') or []
+count = sum(1 for x in enabled if x == 'plow-chat-platform')
+if count != 1:
+    raise SystemExit(f'expected exactly one plow-chat-platform in enabled, got {count}: {enabled}')
+PY
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
+# Absent case: 2-space sibling present, plow-chat-platform missing -> appended at
+# the sibling's indent (no mixed-indent item), staying valid YAML.
+cat >"$tmpdir/hermes-agent/data/config.yaml" <<'YAML'
+plugins:
+  enabled:
+  - some-other
+  disabled: []
+terminal:
+  cwd: /opt/data/workspace
+YAML
+PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold "$tmpdir/hermes-agent" >/dev/null
+python3 - "$tmpdir/hermes-agent/data/config.yaml" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1]))  # raises if mixed indent broke the YAML
+enabled = (cfg.get('plugins') or {}).get('enabled') or []
+if enabled != ['some-other', 'plow-chat-platform']:
+    raise SystemExit(f'unexpected enabled list after append: {enabled}')
+PY
+
 # 3. Host shell helpers are syntax-valid and contain no Python/git/Hermes CLI dependency.
 bash -n ref/scripts/install_direct_mount.sh ref/scripts/create_plow_chat_curl.sh ref/scripts/install_connectors.sh
 if [[ -e after-install.md || -e ref/scripts/bootstrap_fresh_hermes.sh || -e ref/scripts/configure_hermes_env.py ]]; then
