@@ -250,7 +250,10 @@ grep -q 'Profile daniel activated. Wrote PLOW_CHAT_CHAT_UID + PLOW_CHAT_TOKEN to
 }
 
 # 4c. Activation 410 expiry is actionable (defect #13): no raw curl error, a
-# human-readable expiry line, a retry command, and a non-zero exit.
+# human-readable expiry line, a retry command, and a non-zero exit. An
+# immediate 410 (elapsed < threshold) is a server-deduped already-stale
+# activation (cncorp/plow#926), so the message must say re-running returns the
+# SAME stale code and advise waiting — not "run again to get a fresh code".
 exp_count="$(mktemp)"
 set +e
 PATH="$mockdir/bin" PLOW_FAKE_COUNT_FILE="$exp_count" PLOW_FAKE_REDEEM_CODE=410 \
@@ -274,6 +277,14 @@ if grep -qi 'curl: (22)' "$mockdir/out-410.txt"; then
   echo '410 expiry leaked the raw curl (22) error' >&2
   exit 1
 fi
+grep -qi 'same' "$mockdir/out-410.txt" || {
+  echo 'immediate 410 did not warn that re-running returns the same stale code' >&2
+  exit 1
+}
+grep -qi 'wait' "$mockdir/out-410.txt" || {
+  echo 'immediate 410 did not advise waiting for the activation to clear' >&2
+  exit 1
+}
 
 # 4d. Non-interactive test mode (defect #14): no curl/phone-bind, writes the
 # operator-supplied credentials, prints the verification message.
