@@ -17,6 +17,21 @@ TEST_MODE=""
 TEST_CHAT_UID="${PLOW_CHAT_TEST_CHAT_UID:-}"
 TEST_TOKEN="${PLOW_CHAT_TEST_TOKEN:-}"
 
+# --env-file: write the PLOW_CHAT_* vars to an explicit path instead of the
+# <data-dir>/.env computed from --scaffold/--profile/--data-dir. Used by the
+# up-front prepare-script to land creds in the openseed inputs file before any
+# on-Pi scaffold exists. PLOW_CHAT_ENV_FILE is the env override.
+ENV_FILE_EXPLICIT="${PLOW_CHAT_ENV_FILE:-}"
+
+# --from-env: place already-obtained creds (from a real prior phone-bind) and
+# skip the phone-bind dance entirely. A first-class operator path, distinct from
+# --test-mode: reads PLOW_CHAT_TOKEN/PLOW_CHAT_CHAT_UID (+ optional
+# PLOW_CHAT_BASE_URL, PLOW_CHAT_HOME_CHANNEL) and records status:"preset".
+FROM_ENV=""
+FROM_ENV_TOKEN="${PLOW_CHAT_TOKEN:-}"
+FROM_ENV_CHAT_UID="${PLOW_CHAT_CHAT_UID:-}"
+FROM_ENV_HOME_CHANNEL="${PLOW_CHAT_HOME_CHANNEL:-}"
+
 # Initialized up-front so they are always defined under `set -u`, even on the
 # test-mode path where the live activation block never runs.
 DISPLAY_CODE=""
@@ -38,6 +53,14 @@ Options:
   --scaffold PATH        seed-hermes scaffold directory, default ./hermes-agent
   --profile NAME         Write to <scaffold>/data/profiles/<NAME>/.env
   --data-dir PATH        Explicit Hermes data directory override (wins over --profile)
+  --env-file PATH        Write PLOW_CHAT_* to exactly PATH (no scaffold required);
+                         wins over --scaffold/--profile/--data-dir. For the
+                         up-front prepare-script writing to the openseed inputs
+                         file before any on-Pi scaffold exists.
+  --from-env             Place already-obtained creds and skip the phone-bind.
+                         Reads PLOW_CHAT_TOKEN + PLOW_CHAT_CHAT_UID (and optional
+                         PLOW_CHAT_BASE_URL, PLOW_CHAT_HOME_CHANNEL) from the env.
+                         A real, supported operator path (records status:"preset").
   --base-url URL         Plow API base URL, default https://api.plow.co
   --display-name NAME    Session display name, default "Hermes user"
   --timeout SECONDS      Poll timeout, default 900
@@ -56,12 +79,24 @@ Environment overrides:
   PLOW_CHAT_DISPLAY_NAME
   PLOW_CHAT_VERIFY_TIMEOUT
   PLOW_CHAT_VERIFY_POLL_INTERVAL
+  PLOW_CHAT_ENV_FILE             (same as --env-file)
+  PLOW_CHAT_TOKEN                (with --from-env)
+  PLOW_CHAT_CHAT_UID             (with --from-env)
+  PLOW_CHAT_HOME_CHANNEL         (with --from-env, default = chat uid)
   PLOW_CHAT_TEST_CHAT_UID        (with --test-mode)
   PLOW_CHAT_TEST_TOKEN           (with --test-mode)
 
 Examples:
   # Activate the owner profile "daniel":
   ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel
+
+  # Up-front phone-bind: run the real activation, write creds to the inputs file:
+  ref/scripts/create_plow_chat_curl.sh \
+    --env-file ~/.config/seed/seed-life-dashboard-hermes.env
+
+  # Place already-obtained creds into the on-Pi scaffold (no phone-bind):
+  PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx \
+    ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel --from-env
 
   # Non-interactive test binding for DinD/CI (no phone required):
   ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel \
@@ -74,6 +109,8 @@ while [[ $# -gt 0 ]]; do
     --scaffold) SCAFFOLD_DIR="$2"; shift 2 ;;
     --profile) PROFILE="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; DATA_DIR_EXPLICIT="1"; shift 2 ;;
+    --env-file) ENV_FILE_EXPLICIT="$2"; shift 2 ;;
+    --from-env) FROM_ENV="1"; shift ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
     --display-name) DISPLAY_NAME="$2"; shift 2 ;;
     --timeout) TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -96,8 +133,15 @@ if [[ -z "$DATA_DIR" ]]; then
     DATA_DIR="${SCAFFOLD_DIR%/}/data"
   fi
 fi
-ENV_FILE="${DATA_DIR%/}/.env"
-ACTIVATION_AUDIT_FILE="${DATA_DIR%/}/.activation.json"
+# --env-file wins over the computed <data-dir>/.env: write to exactly that path
+# and land the audit beside it, without requiring a scaffold/data dir to exist.
+if [[ -n "$ENV_FILE_EXPLICIT" ]]; then
+  ENV_FILE="$ENV_FILE_EXPLICIT"
+  ACTIVATION_AUDIT_FILE="$(dirname "$ENV_FILE")/.activation.json"
+else
+  ENV_FILE="${DATA_DIR%/}/.env"
+  ACTIVATION_AUDIT_FILE="${DATA_DIR%/}/.activation.json"
+fi
 
 # Human-readable profile label for the success/verification message (defect #16).
 if [[ -n "$PROFILE" ]]; then
@@ -194,6 +238,29 @@ ensure_data_dir_writable() {
   fi
 }
 
+# --env-file variant: there is no scaffold data dir, so just make sure ENV_FILE's
+# parent dir exists and we can create/write ENV_FILE.
+ensure_env_file_writable() {
+  local dir
+  dir="$(dirname "$ENV_FILE")"
+  mkdir -p "$dir" 2>/dev/null || true
+  if [[ ! -d "$dir" || ! -w "$dir" ]] || { [[ -e "$ENV_FILE" ]] && [[ ! -w "$ENV_FILE" ]]; }; then
+    echo "ERROR: env file is not writable: ${ENV_FILE}" >&2
+    echo "       Ensure its parent directory exists and is writable, then re-run:" >&2
+    echo "         ${RETRY_CMD}" >&2
+    exit 73
+  fi
+}
+
+# Dispatch the right pre-write writability guard for the configured target.
+ensure_target_writable() {
+  if [[ -n "$ENV_FILE_EXPLICIT" ]]; then
+    ensure_env_file_writable
+  else
+    ensure_data_dir_writable
+  fi
+}
+
 write_env_var() {
   local key="$1"
   local value="$2"
@@ -258,6 +325,13 @@ write_activation_audit() {
 EOF
   if ! mv "$tmp" "$ACTIVATION_AUDIT_FILE" 2>/dev/null; then
     rm -f "$tmp"
+    # When writing to an explicit --env-file (e.g. the openseed inputs file), the
+    # audit is best-effort: a failure to write it MUST NOT fail the run, since the
+    # PLOW_CHAT_* creds — the deliverable — already landed in ENV_FILE.
+    if [[ -n "$ENV_FILE_EXPLICIT" ]]; then
+      echo "WARN: could not write activation audit ${ACTIVATION_AUDIT_FILE}; continuing." >&2
+      return 0
+    fi
     echo "ERROR: failed to write activation audit ${ACTIVATION_AUDIT_FILE}." >&2
     exit 73
   fi
@@ -308,7 +382,7 @@ if [[ -n "$TEST_MODE" ]]; then
     exit 2
   fi
   echo "TEST MODE: skipping Plow phone-bind activation (testing only)."
-  ensure_data_dir_writable
+  ensure_target_writable
   write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
   write_env_var "PLOW_CHAT_CHAT_UID" "$TEST_CHAT_UID"
   write_env_var "PLOW_CHAT_TOKEN" "$TEST_TOKEN"
@@ -318,10 +392,33 @@ if [[ -n "$TEST_MODE" ]]; then
   exit 0
 fi
 
+# --- Preset creds (--from-env): place already-obtained creds from a real prior --
+# phone-bind and skip the phone-bind dance. A first-class, supported operator
+# path (unlike --test-mode): used to land creds the operator already obtained
+# up front into the on-Pi scaffold at install time. Records status:"preset".
+if [[ -n "$FROM_ENV" ]]; then
+  if [[ -z "$FROM_ENV_TOKEN" || -z "$FROM_ENV_CHAT_UID" ]]; then
+    echo "ERROR: --from-env requires PLOW_CHAT_TOKEN and PLOW_CHAT_CHAT_UID in the environment." >&2
+    echo "       Export both (from a prior phone-bind) and re-run, e.g.:" >&2
+    echo "         PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx ${RETRY_CMD} --from-env" >&2
+    exit 2
+  fi
+  HOME_CHANNEL="${FROM_ENV_HOME_CHANNEL:-$FROM_ENV_CHAT_UID}"
+  echo "Placing preset Plow chat credentials (skipping phone-bind activation)."
+  ensure_target_writable
+  write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
+  write_env_var "PLOW_CHAT_CHAT_UID" "$FROM_ENV_CHAT_UID"
+  write_env_var "PLOW_CHAT_TOKEN" "$FROM_ENV_TOKEN"
+  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$HOME_CHANNEL"
+  write_activation_audit "$FROM_ENV_TOKEN" "$FROM_ENV_CHAT_UID" '{}' '{}' "preset"
+  print_activation_success "$FROM_ENV_CHAT_UID"
+  exit 0
+fi
+
 # Fail fast if we cannot write the profile env BEFORE asking a human to text the
 # activation code, so the operator never completes the phone-bind only to hit a
 # write failure afterward (defect #15).
-ensure_data_dir_writable
+ensure_target_writable
 
 PAYLOAD="$(printf '{"name":"%s","provision_chat":true}' "$(json_escape "$DISPLAY_NAME")")"
 
@@ -402,7 +499,7 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
     CHANNELS_JSON="$(get_with_token "${BASE_URL}/v1/me/channels")"
     # Re-apply permissions right before writing: the container may have churned
     # data/ ownership during the poll window (defect #16).
-    ensure_data_dir_writable
+    ensure_target_writable
     write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
     write_env_var "PLOW_CHAT_CHAT_UID" "$CHAT_UID"
     write_env_var "PLOW_CHAT_TOKEN" "$TOKEN"

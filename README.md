@@ -135,6 +135,40 @@ prints `Activation code expired.` plus the exact command to re-run for a fresh
 code, and exits non-zero (75) instead of surfacing a raw `curl: (22)` error.
 Just run the same command again.
 
+### Up-front activation (one-shot installs)
+
+To make a parent umbrella install one-shot, the phone-bind MAY run up front in
+the operator's preflight prepare-script instead of mid-install. Pass
+`--env-file <path>` to write the verified `PLOW_CHAT_*` creds to exactly that
+file — typically the openseed inputs file — rather than a scaffold
+`data/.env` that does not exist yet (the scaffold is provisioned later, on the
+Pi). With `--env-file` the helper does not require a scaffold/data dir; it only
+ensures the file's parent directory is writable, and the `.activation.json`
+audit beside it is best-effort.
+
+```bash
+ref/scripts/create_plow_chat_curl.sh \
+  --env-file ~/.config/seed/seed-life-dashboard-hermes.env
+```
+
+### Placing already-obtained creds (`--from-env`)
+
+When the phone-bind already ran up front, place those creds into the on-Pi
+scaffold at install time with `--from-env`, which reads `PLOW_CHAT_TOKEN` and
+`PLOW_CHAT_CHAT_UID` from the environment (plus optional `PLOW_CHAT_BASE_URL`
+and `PLOW_CHAT_HOME_CHANNEL`) and skips the phone-bind dance entirely:
+
+```bash
+PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx \
+  ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel --from-env
+```
+
+Unlike `--test-mode` below, this is a **real, supported** operator path: the
+creds come from an actual prior phone-bind. The audit records
+`"status": "preset"` (token last four only). If `PLOW_CHAT_TOKEN` or
+`PLOW_CHAT_CHAT_UID` is missing, the helper exits non-zero with an actionable
+error.
+
 ### Non-interactive test mode (testing/CI only)
 
 Phase 4 normally requires a human texting the activation code from the target
