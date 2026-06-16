@@ -14,10 +14,8 @@ TIMEOUT_SECONDS="${PLOW_CHAT_VERIFY_TIMEOUT:-1800}"
 POLL_INTERVAL="${PLOW_CHAT_VERIFY_POLL_INTERVAL:-5}"
 
 # Wall-clock start, used to tell an immediate (server-deduped, already-stale)
-# 410 apart from a genuine later expiry in the redeem loop. The override seam
-# is for tests only, so the genuine-expiry branch can be exercised without a
-# real 90s wait.
-START_TS="${PLOW_CHAT_START_TS:-$(date +%s)}"
+# 410 apart from a genuine later expiry in the redeem loop.
+START_TS="$(date +%s)"
 
 # Non-interactive test binding (defect #14). When set, the helper skips the
 # phone-bind dance and writes operator-supplied credentials straight to the

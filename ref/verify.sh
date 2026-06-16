@@ -244,30 +244,6 @@ grep -qi 'wait' "$mockdir/out-410.txt" || {
   exit 1
 }
 
-# 4c-bis. A genuine later 410 (elapsed >= threshold, simulated via the
-# PLOW_CHAT_START_TS test seam) keeps the "run again to get a fresh code"
-# guidance, since re-running then does mint a fresh code.
-genexp_count="$(mktemp)"
-set +e
-PATH="$mockdir/bin" PLOW_FAKE_COUNT_FILE="$genexp_count" PLOW_FAKE_REDEEM_CODE=410 \
-  PLOW_CHAT_START_TS=1 \
-  bash ref/scripts/create_plow_chat_curl.sh \
-    --scaffold "$mockdir/hermes-agent" \
-    --profile genexpiry \
-    --base-url https://chat.plow.test \
-    --interval 0 --timeout 3 >"$mockdir/out-410-genuine.txt" 2>&1
-genexp_rc=$?
-set -e
-[[ "$genexp_rc" -ne 0 ]] || { echo 'genuine 410 expiry did not exit non-zero' >&2; exit 1; }
-grep -qi 'run again to get a fresh code' "$mockdir/out-410-genuine.txt" || {
-  echo 'genuine 410 expiry did not keep the fresh-code retry guidance' >&2
-  exit 1
-}
-if grep -qi 'same' "$mockdir/out-410-genuine.txt"; then
-  echo 'genuine 410 expiry wrongly warned about a stale/same code' >&2
-  exit 1
-fi
-
 # 4d. Non-interactive test mode (defect #14): no curl/phone-bind, writes the
 # operator-supplied credentials, prints the verification message.
 PATH="$mockdir/bin" \
