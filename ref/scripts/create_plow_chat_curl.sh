@@ -170,6 +170,11 @@ fi
 if [[ "$DISPLAY_NAME" != "Hermes user" ]]; then
   RETRY_CMD="${RETRY_CMD} --display-name '${DISPLAY_NAME}'"
 fi
+# Preserve --from-env in the retry so a preset-creds write failure reruns the
+# preset placement, not the live phone-bind (which --from-env exists to skip).
+if [[ -n "$FROM_ENV" ]]; then
+  RETRY_CMD="${RETRY_CMD} --from-env"
+fi
 
 command -v curl >/dev/null 2>&1 || {
   echo "Missing required command: curl" >&2
@@ -361,6 +366,21 @@ print_activation_success() {
   fi
 }
 
+# Single writer for the PLOW_CHAT_* contract, shared by all three credential
+# placement paths (live activation, --from-env, --test-mode): make the target
+# writable, write the four env keys (home channel = chat uid), record the audit,
+# and print the success message — one place to keep the contract right.
+place_credentials() {
+  local token="$1" chat_uid="$2" status="$3" owner_json="$4" channels_json="$5"
+  ensure_target_writable
+  write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
+  write_env_var "PLOW_CHAT_CHAT_UID" "$chat_uid"
+  write_env_var "PLOW_CHAT_TOKEN" "$token"
+  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$chat_uid"
+  write_activation_audit "$token" "$chat_uid" "$owner_json" "$channels_json" "$status"
+  print_activation_success "$chat_uid"
+}
+
 # POST the redeem payload, capturing both the response body and the HTTP status
 # code WITHOUT -f so a non-2xx (e.g. 410 expired) does not abort the script with
 # an opaque `curl: (22)` (defect #13). Sets REDEEM_JSON and REDEEM_HTTP_CODE.
@@ -396,13 +416,7 @@ if [[ -n "$TEST_MODE" ]]; then
     exit 2
   fi
   echo "TEST MODE: skipping Plow phone-bind activation (testing only)."
-  ensure_target_writable
-  write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
-  write_env_var "PLOW_CHAT_CHAT_UID" "$TEST_CHAT_UID"
-  write_env_var "PLOW_CHAT_TOKEN" "$TEST_TOKEN"
-  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$TEST_CHAT_UID"
-  write_activation_audit "$TEST_TOKEN" "$TEST_CHAT_UID" '{}' '{}' "test-mode"
-  print_activation_success "$TEST_CHAT_UID"
+  place_credentials "$TEST_TOKEN" "$TEST_CHAT_UID" "test-mode" '{}' '{}'
   exit 0
 fi
 
@@ -414,17 +428,11 @@ if [[ -n "$FROM_ENV" ]]; then
   if [[ -z "$FROM_ENV_TOKEN" || -z "$FROM_ENV_CHAT_UID" ]]; then
     echo "ERROR: --from-env requires PLOW_CHAT_TOKEN and PLOW_CHAT_CHAT_UID in the environment." >&2
     echo "       Export both (from a prior phone-bind) and re-run, e.g.:" >&2
-    echo "         PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx ${RETRY_CMD} --from-env" >&2
+    echo "         PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx ${RETRY_CMD}" >&2
     exit 2
   fi
   echo "Placing preset Plow chat credentials (skipping phone-bind activation)."
-  ensure_target_writable
-  write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
-  write_env_var "PLOW_CHAT_CHAT_UID" "$FROM_ENV_CHAT_UID"
-  write_env_var "PLOW_CHAT_TOKEN" "$FROM_ENV_TOKEN"
-  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$FROM_ENV_CHAT_UID"
-  write_activation_audit "$FROM_ENV_TOKEN" "$FROM_ENV_CHAT_UID" '{}' '{}' "preset"
-  print_activation_success "$FROM_ENV_CHAT_UID"
+  place_credentials "$FROM_ENV_TOKEN" "$FROM_ENV_CHAT_UID" "preset" '{}' '{}'
   exit 0
 fi
 
@@ -512,14 +520,8 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
     CHANNELS_JSON="$(get_with_token "${BASE_URL}/v1/me/channels")"
     # Re-apply permissions right before writing: the container may have churned
     # data/ ownership during the poll window (defect #16).
-    ensure_target_writable
-    write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
-    write_env_var "PLOW_CHAT_CHAT_UID" "$CHAT_UID"
-    write_env_var "PLOW_CHAT_TOKEN" "$TOKEN"
-    write_env_var "PLOW_CHAT_HOME_CHANNEL" "$CHAT_UID"
-    write_activation_audit "$TOKEN" "$CHAT_UID" "$OWNER_IDENTITY_JSON" "$CHANNELS_JSON" "verified"
     echo "Verified: chat is active."
-    print_activation_success "$CHAT_UID"
+    place_credentials "$TOKEN" "$CHAT_UID" "verified" "$OWNER_IDENTITY_JSON" "$CHANNELS_JSON"
     exit 0
   fi
   sleep "$POLL_INTERVAL"
