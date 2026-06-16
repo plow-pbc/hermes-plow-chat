@@ -61,7 +61,7 @@ Options:
                          file before any on-Pi scaffold exists.
   --from-env             Place already-obtained creds and skip the phone-bind.
                          Reads PLOW_CHAT_TOKEN + PLOW_CHAT_CHAT_UID (and optional
-                         PLOW_CHAT_BASE_URL, PLOW_CHAT_HOME_CHANNEL) from the env.
+                         PLOW_CHAT_BASE_URL) from the env; home channel = chat uid.
                          A real, supported operator path (records status:"preset").
   --base-url URL         Plow API base URL, default https://api.plow.co
   --display-name NAME    Session display name, default "Hermes user"

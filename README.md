@@ -155,8 +155,8 @@ ref/scripts/create_plow_chat_curl.sh \
 
 When the phone-bind already ran up front, place those creds into the on-Pi
 scaffold at install time with `--from-env`, which reads `PLOW_CHAT_TOKEN` and
-`PLOW_CHAT_CHAT_UID` from the environment (plus optional `PLOW_CHAT_BASE_URL`
-and `PLOW_CHAT_HOME_CHANNEL`) and skips the phone-bind dance entirely:
+`PLOW_CHAT_CHAT_UID` from the environment (plus optional `PLOW_CHAT_BASE_URL`;
+the home channel is set to the chat uid) and skips the phone-bind dance entirely:
 
 ```bash
 PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx \
