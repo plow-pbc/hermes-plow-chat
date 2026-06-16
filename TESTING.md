@@ -78,9 +78,11 @@ Expected Hermes evidence:
 
 If the poll times out, start activation again. Common causes are the code
 expiring, texting from the wrong messaging identity, or texting the wrong line.
-If the code expires mid-poll, Plow returns HTTP 410 and the helper prints
-`Activation code expired.` plus the exact re-run command, then exits non-zero —
-just run the command again for a fresh code.
+If the code expires mid-poll, Plow returns HTTP 410 and the helper exits
+non-zero. An immediate 410 means the server handed back an already-expired/
+deduped code, so re-running returns the same stale code — wait several minutes
+for the line to clear, then re-run. A genuine later expiry just needs the
+command run again for a fresh code.
 
 ## Per-profile activation
 

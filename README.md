@@ -129,11 +129,17 @@ PLOW_CHAT_HOME_CHANNEL=cht_<opaque-chat-id>  # same value as PLOW_CHAT_CHAT_UID
 
 ### If the activation code expires
 
-The displayed code is single-use and time-limited. If it expires before the
-text arrives, Plow's redeem endpoint returns HTTP 410; the helper detects this,
-prints `Activation code expired.` plus the exact command to re-run for a fresh
-code, and exits non-zero (75) instead of surfacing a raw `curl: (22)` error.
-Just run the same command again.
+The displayed code is single-use and time-limited. If it expires, Plow's redeem
+endpoint returns HTTP 410; the helper detects this and exits non-zero (75)
+instead of surfacing a raw `curl: (22)` error. The guidance depends on *when*
+the 410 arrives:
+
+- **Immediately** (within ~90s of starting): the server handed back an
+  already-expired/deduped activation instead of a fresh code, so re-running
+  right away returns the *same* stale code and loops. Wait several minutes for
+  the line's activation to clear, then re-run.
+- **Later** (after you had time to text the code): a genuine expiry — just run
+  the same command again for a fresh code.
 
 ### Non-interactive test mode (testing/CI only)
 
