@@ -25,12 +25,14 @@ ENV_FILE_EXPLICIT="${PLOW_CHAT_ENV_FILE:-}"
 
 # --from-env: place already-obtained creds (from a real prior phone-bind) and
 # skip the phone-bind dance entirely. A first-class operator path, distinct from
-# --test-mode: reads PLOW_CHAT_TOKEN/PLOW_CHAT_CHAT_UID (+ optional
-# PLOW_CHAT_BASE_URL, PLOW_CHAT_HOME_CHANNEL) and records status:"preset".
+# --from-env: reads PLOW_CHAT_TOKEN/PLOW_CHAT_CHAT_UID (+ optional
+# PLOW_CHAT_BASE_URL) and records status:"preset". Home channel = chat uid
+# (same as the live and test paths — no separate override knob).
 FROM_ENV=""
 FROM_ENV_TOKEN="${PLOW_CHAT_TOKEN:-}"
 FROM_ENV_CHAT_UID="${PLOW_CHAT_CHAT_UID:-}"
-FROM_ENV_HOME_CHANNEL="${PLOW_CHAT_HOME_CHANNEL:-}"
+# Whether the best-effort activation audit actually landed (gates the success line).
+AUDIT_WRITTEN=0
 
 # Initialized up-front so they are always defined under `set -u`, even on the
 # test-mode path where the live activation block never runs.
@@ -82,7 +84,6 @@ Environment overrides:
   PLOW_CHAT_ENV_FILE             (same as --env-file)
   PLOW_CHAT_TOKEN                (with --from-env)
   PLOW_CHAT_CHAT_UID             (with --from-env)
-  PLOW_CHAT_HOME_CHANNEL         (with --from-env, default = chat uid)
   PLOW_CHAT_TEST_CHAT_UID        (with --test-mode)
   PLOW_CHAT_TEST_TOKEN           (with --test-mode)
 
@@ -153,11 +154,18 @@ else
 fi
 
 # Exact command to re-run after an expiry / write failure (defects #13, #15, #16).
-RETRY_CMD="bash ref/scripts/create_plow_chat_curl.sh --scaffold ${SCAFFOLD_DIR}"
-if [[ -n "$PROFILE" ]]; then
-  RETRY_CMD="${RETRY_CMD} --profile ${PROFILE}"
-elif [[ -n "$DATA_DIR_EXPLICIT" ]]; then
-  RETRY_CMD="${RETRY_CMD} --data-dir ${DATA_DIR}"
+# When --env-file won the target, the retry MUST target the same env file — else a
+# retry would send fresh credentials to the scaffold-shaped default, not the
+# requested inputs file (contract-drift).
+if [[ -n "$ENV_FILE_EXPLICIT" ]]; then
+  RETRY_CMD="bash ref/scripts/create_plow_chat_curl.sh --env-file ${ENV_FILE_EXPLICIT}"
+else
+  RETRY_CMD="bash ref/scripts/create_plow_chat_curl.sh --scaffold ${SCAFFOLD_DIR}"
+  if [[ -n "$PROFILE" ]]; then
+    RETRY_CMD="${RETRY_CMD} --profile ${PROFILE}"
+  elif [[ -n "$DATA_DIR_EXPLICIT" ]]; then
+    RETRY_CMD="${RETRY_CMD} --data-dir ${DATA_DIR}"
+  fi
 fi
 if [[ "$DISPLAY_NAME" != "Hermes user" ]]; then
   RETRY_CMD="${RETRY_CMD} --display-name '${DISPLAY_NAME}'"
@@ -330,12 +338,14 @@ EOF
     # PLOW_CHAT_* creds — the deliverable — already landed in ENV_FILE.
     if [[ -n "$ENV_FILE_EXPLICIT" ]]; then
       echo "WARN: could not write activation audit ${ACTIVATION_AUDIT_FILE}; continuing." >&2
+      AUDIT_WRITTEN=0
       return 0
     fi
     echo "ERROR: failed to write activation audit ${ACTIVATION_AUDIT_FILE}." >&2
     exit 73
   fi
   chmod 600 "$ACTIVATION_AUDIT_FILE" 2>/dev/null || true
+  AUDIT_WRITTEN=1
 }
 
 # Print the verification message that lets an operator confirm Phase 4 succeeded
@@ -344,7 +354,11 @@ print_activation_success() {
   local chat_uid="$1"
   echo "Chat uid: ${chat_uid}"
   echo "Profile ${PROFILE_LABEL} activated. Wrote PLOW_CHAT_CHAT_UID + PLOW_CHAT_TOKEN to ${ENV_FILE}."
-  echo "Wrote redacted activation audit to ${ACTIVATION_AUDIT_FILE}"
+  if [[ "$AUDIT_WRITTEN" == 1 ]]; then
+    echo "Wrote redacted activation audit to ${ACTIVATION_AUDIT_FILE}"
+  else
+    echo "(activation audit not written — best-effort under --env-file; the PLOW_CHAT_* creds landed in ${ENV_FILE})"
+  fi
 }
 
 # POST the redeem payload, capturing both the response body and the HTTP status
@@ -403,13 +417,12 @@ if [[ -n "$FROM_ENV" ]]; then
     echo "         PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx ${RETRY_CMD} --from-env" >&2
     exit 2
   fi
-  HOME_CHANNEL="${FROM_ENV_HOME_CHANNEL:-$FROM_ENV_CHAT_UID}"
   echo "Placing preset Plow chat credentials (skipping phone-bind activation)."
   ensure_target_writable
   write_env_var "PLOW_CHAT_BASE_URL" "$BASE_URL"
   write_env_var "PLOW_CHAT_CHAT_UID" "$FROM_ENV_CHAT_UID"
   write_env_var "PLOW_CHAT_TOKEN" "$FROM_ENV_TOKEN"
-  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$HOME_CHANNEL"
+  write_env_var "PLOW_CHAT_HOME_CHANNEL" "$FROM_ENV_CHAT_UID"
   write_activation_audit "$FROM_ENV_TOKEN" "$FROM_ENV_CHAT_UID" '{}' '{}' "preset"
   print_activation_success "$FROM_ENV_CHAT_UID"
   exit 0
