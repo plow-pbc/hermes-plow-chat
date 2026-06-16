@@ -7,8 +7,17 @@ DATA_DIR="${HERMES_DATA_DIR:-}"
 DATA_DIR_EXPLICIT=""
 PROFILE="${PLOW_CHAT_PROFILE:-}"
 DISPLAY_NAME="${PLOW_CHAT_DISPLAY_NAME:-Hermes user}"
-TIMEOUT_SECONDS="${PLOW_CHAT_VERIFY_TIMEOUT:-900}"
+# Default poll window matches the server-side activation code TTL of 30 min
+# (ACTIVATION_CODE_TTL, cncorp/plow#926). A shorter window made the client give
+# up while the code was still valid; PLOW_CHAT_VERIFY_TIMEOUT still overrides.
+TIMEOUT_SECONDS="${PLOW_CHAT_VERIFY_TIMEOUT:-1800}"
 POLL_INTERVAL="${PLOW_CHAT_VERIFY_POLL_INTERVAL:-5}"
+
+# Wall-clock start, used to tell an immediate (server-deduped, already-stale)
+# 410 apart from a genuine later expiry in the redeem loop. The override seam
+# is for tests only, so the genuine-expiry branch can be exercised without a
+# real 90s wait.
+START_TS="${PLOW_CHAT_START_TS:-$(date +%s)}"
 
 # Non-interactive test binding (defect #14). When set, the helper skips the
 # phone-bind dance and writes operator-supplied credentials straight to the
@@ -40,7 +49,7 @@ Options:
   --data-dir PATH        Explicit Hermes data directory override (wins over --profile)
   --base-url URL         Plow API base URL, default https://api.plow.co
   --display-name NAME    Session display name, default "Hermes user"
-  --timeout SECONDS      Poll timeout, default 900
+  --timeout SECONDS      Poll timeout, default 1800
   --interval SECONDS     Poll interval, default 5
 
 Testing only (skips the phone-bind activation, see SEED.md):
@@ -363,10 +372,27 @@ while [[ "$(date +%s)" -lt "$deadline" ]]; do
   redeem_once
   case "$REDEEM_HTTP_CODE" in
     410)
-      # The activation secret/code expired before the text arrived.
-      echo "Activation code expired. The displayed code is single-use and time-limited." >&2
-      echo "Run again to get a fresh code:" >&2
-      echo "  ${RETRY_CMD}" >&2
+      # The activation code is gone. Distinguish two cases by how long we have
+      # been running: a 410 within STALE_EXPIRY_THRESHOLD seconds of starting
+      # means the server handed back an already-expired/cached activation (a
+      # known backend dedup condition, cncorp/plow#926) rather than minting a
+      # fresh one — re-running immediately returns the SAME stale code, so the
+      # operator must wait for the line's activation to clear. A later 410 is a
+      # genuine expiry after the human had real time to text the code.
+      STALE_EXPIRY_THRESHOLD=90
+      elapsed=$(( $(date +%s) - START_TS ))
+      if [[ "$elapsed" -lt "$STALE_EXPIRY_THRESHOLD" ]]; then
+        echo "Activation code expired almost immediately (${elapsed}s)." >&2
+        echo "The Plow API returned an already-expired/cached activation rather than a fresh" >&2
+        echo "code (a known backend dedup condition). Re-running now would return the SAME" >&2
+        echo "stale code and loop. Wait several minutes for this line's activation to clear," >&2
+        echo "then retry:" >&2
+        echo "  ${RETRY_CMD}" >&2
+      else
+        echo "Activation code expired. The displayed code is single-use and time-limited." >&2
+        echo "Run again to get a fresh code:" >&2
+        echo "  ${RETRY_CMD}" >&2
+      fi
       exit 75
       ;;
     2??)

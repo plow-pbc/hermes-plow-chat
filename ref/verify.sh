@@ -208,7 +208,10 @@ grep -q 'Profile daniel activated. Wrote PLOW_CHAT_CHAT_UID + PLOW_CHAT_TOKEN to
 }
 
 # 4c. Activation 410 expiry is actionable (defect #13): no raw curl error, a
-# human-readable expiry line, a retry command, and a non-zero exit.
+# human-readable expiry line, a retry command, and a non-zero exit. An
+# immediate 410 (elapsed < threshold) is a server-deduped already-stale
+# activation (cncorp/plow#926), so the message must say re-running returns the
+# SAME stale code and advise waiting — not "run again to get a fresh code".
 exp_count="$(mktemp)"
 set +e
 PATH="$mockdir/bin" PLOW_FAKE_COUNT_FILE="$exp_count" PLOW_FAKE_REDEEM_CODE=410 \
@@ -230,6 +233,38 @@ grep -q 'create_plow_chat_curl.sh --scaffold .* --profile expiry' "$mockdir/out-
 }
 if grep -qi 'curl: (22)' "$mockdir/out-410.txt"; then
   echo '410 expiry leaked the raw curl (22) error' >&2
+  exit 1
+fi
+grep -qi 'same' "$mockdir/out-410.txt" || {
+  echo 'immediate 410 did not warn that re-running returns the same stale code' >&2
+  exit 1
+}
+grep -qi 'wait' "$mockdir/out-410.txt" || {
+  echo 'immediate 410 did not advise waiting for the activation to clear' >&2
+  exit 1
+}
+
+# 4c-bis. A genuine later 410 (elapsed >= threshold, simulated via the
+# PLOW_CHAT_START_TS test seam) keeps the "run again to get a fresh code"
+# guidance, since re-running then does mint a fresh code.
+genexp_count="$(mktemp)"
+set +e
+PATH="$mockdir/bin" PLOW_FAKE_COUNT_FILE="$genexp_count" PLOW_FAKE_REDEEM_CODE=410 \
+  PLOW_CHAT_START_TS=1 \
+  bash ref/scripts/create_plow_chat_curl.sh \
+    --scaffold "$mockdir/hermes-agent" \
+    --profile genexpiry \
+    --base-url https://chat.plow.test \
+    --interval 0 --timeout 3 >"$mockdir/out-410-genuine.txt" 2>&1
+genexp_rc=$?
+set -e
+[[ "$genexp_rc" -ne 0 ]] || { echo 'genuine 410 expiry did not exit non-zero' >&2; exit 1; }
+grep -qi 'run again to get a fresh code' "$mockdir/out-410-genuine.txt" || {
+  echo 'genuine 410 expiry did not keep the fresh-code retry guidance' >&2
+  exit 1
+}
+if grep -qi 'same' "$mockdir/out-410-genuine.txt"; then
+  echo 'genuine 410 expiry wrongly warned about a stale/same code' >&2
   exit 1
 fi
 
