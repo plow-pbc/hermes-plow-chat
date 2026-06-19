@@ -18,6 +18,23 @@ python3 /opt/data/skills/plow-connectors/plow_connector.py <connector> <action> 
 action takes a JSON body. The helper prints the JSON response and exits
 non-zero on an API error (read stderr).
 
+## Pagination
+
+List actions (`messages.list`) return one page plus a `meta.next_cursor` when
+more results exist. Pass `--paginate` before the connector to walk that opaque
+cursor to completion and emit one merged `{"status":"ok","data":[...]}` with
+every page concatenated:
+
+```bash
+python3 .../plow_connector.py --paginate gmail messages.list '{"query":"is:unread"}'   # walks all pages
+```
+
+The cursor is opaque — the helper echoes it back untouched and stops when the
+cursor is exhausted. A 50-page safety cap bounds the walk; hitting it means the
+set is larger than expected, so the helper **exits non-zero** rather than return
+a partial result as success. Without `--paginate` you get a single page (pass the
+previous response's `meta.next_cursor` as `"cursor"` to page by hand).
+
 ## First: check what's connected
 
 ```bash

@@ -32,9 +32,13 @@ def mod():
 
 
 @pytest.fixture
-def captured(monkeypatch, mod):
-    """Patch urlopen to capture the outgoing Request and return a canned body."""
-    seen = {}
+def http(monkeypatch, mod):
+    """Single urlopen seam for every test. Queue response bodies in `pages`
+    (an empty queue serves a canned `{"ok":true}`); each captured request is
+    appended to `sent` as {method, url, headers, body} with body parsed to a
+    dict (or None). Returns (pages, sent)."""
+    pages: list[str] = []
+    sent: list[dict] = []
 
     class _Resp:
         def __init__(self, body):
@@ -50,14 +54,16 @@ def captured(monkeypatch, mod):
             return False
 
     def fake_urlopen(req, timeout=None):
-        seen["method"] = req.method
-        seen["url"] = req.full_url
-        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
-        seen["body"] = req.data.decode() if req.data else None
-        return _Resp('{"ok":true}')
+        sent.append({
+            "method": req.method,
+            "url": req.full_url,
+            "headers": {k.lower(): v for k, v in req.header_items()},
+            "body": json.loads(req.data.decode()) if req.data else None,
+        })
+        return _Resp(pages.pop(0) if pages else '{"ok":true}')
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-    return seen
+    return pages, sent
 
 
 def _clear_env(monkeypatch):
@@ -97,43 +103,47 @@ def _clear_env(monkeypatch):
         ),
     ],
 )
-def test_request_shape(monkeypatch, mod, captured, env, args, expected):
+def test_request_shape(monkeypatch, mod, http, env, args, expected):
     _clear_env(monkeypatch)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
+    _, sent = http
 
     mod.call(*args)
+    req = sent[0]
 
     if "method" in expected:
-        assert captured["method"] == expected["method"]
+        assert req["method"] == expected["method"]
     if "url" in expected:
-        assert captured["url"] == expected["url"]
+        assert req["url"] == expected["url"]
     if "auth" in expected:
-        assert captured["headers"]["authorization"] == expected["auth"]
+        assert req["headers"]["authorization"] == expected["auth"]
     if "json" in expected:
-        assert json.loads(captured["body"]) == expected["json"]
+        assert req["body"] == expected["json"]
     if "body" in expected:
-        assert captured["body"] == expected["body"]
+        assert req["body"] == expected["body"]
     if "content_type" in expected:
-        assert captured["headers"].get("content-type") == expected["content_type"]
+        assert req["headers"].get("content-type") == expected["content_type"]
 
 
-def test_base_url_default_and_chat_override(monkeypatch, mod, captured):
+def test_base_url_default_and_chat_override(monkeypatch, mod, http):
     _clear_env(monkeypatch)
+    _, sent = http
     monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")
     mod.call("gmail", "status")
-    assert captured["url"] == "https://api.plow.co/v1/connectors/gmail/status"
+    assert sent[0]["url"] == "https://api.plow.co/v1/connectors/gmail/status"
 
     monkeypatch.setenv("PLOW_CHAT_BASE_URL", "https://example.test/")
     mod.call("gmail", "status")
-    assert captured["url"] == "https://example.test/v1/connectors/gmail/status"
+    assert sent[1]["url"] == "https://example.test/v1/connectors/gmail/status"
 
 
 @pytest.mark.parametrize("action", ["status", "messages.list", "calendar.events.list", "messages.modify-labels", "connect-code"])
-def test_real_actions_accepted(monkeypatch, mod, captured, action):
+def test_real_actions_accepted(monkeypatch, mod, http, action):
     monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")
+    _, sent = http
     mod.call("gmail", action)
-    assert captured["url"].endswith(f"/{action}")
+    assert sent[0]["url"].endswith(f"/{action}")
 
 
 @pytest.mark.parametrize("action", ["messages/list", "..", "a?b=1", "/v1/me", "messages..list", "", "status\n", "messages.list\n"])
@@ -161,6 +171,36 @@ def test_malformed_json_body_is_fatal(monkeypatch, mod):
     with pytest.raises(SystemExit) as exc:
         mod.main(["gmail", "messages.list", "{not valid json"])
     assert exc.value.code == 1
+
+
+def test_paginate_merges_pages_and_echoes_cursor(monkeypatch, mod, http):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")
+    pages, sent = http
+    pages.extend([
+        json.dumps({"status": "ok", "data": ["a"], "meta": {"next_cursor": "C2"}}),
+        json.dumps({"status": "ok", "data": ["b"], "meta": {"next_cursor": None}}),
+    ])
+
+    out = json.loads(mod.paginate("gmail", "messages.list", '{"query":"is:unread"}'))
+
+    assert out == {"status": "ok", "data": ["a", "b"]}
+    # First page omits the cursor; second page echoes the server's next_cursor.
+    assert "cursor" not in sent[0]["body"]
+    assert sent[0]["body"]["query"] == "is:unread"
+    assert sent[1]["body"]["cursor"] == "C2"
+
+
+def test_paginate_stops_at_max_pages_fails_loud(monkeypatch, mod, http):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "t")
+    pages, _ = http
+    # A cursor that never goes falsy across the whole queue — only the cap can stop it.
+    never_done = json.dumps({"data": ["x"], "meta": {"next_cursor": "more"}})
+    pages.extend([never_done] * mod.MAX_PAGES)
+
+    # Hitting the cap with the cursor still open must fail loud, not return a
+    # partial result as success.
+    with pytest.raises(SystemExit):
+        mod.paginate("gmail", "messages.list", "")
 
 
 def test_http_error_exits_nonzero(monkeypatch, mod):

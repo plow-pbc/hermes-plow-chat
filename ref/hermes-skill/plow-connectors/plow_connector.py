@@ -6,6 +6,9 @@ REST API. See `SKILL.md` for the action reference and examples.
 Auth reuses the gateway's user Bearer token (`PLOW_CONNECTOR_TOKEN` else
 `PLOW_CHAT_TOKEN`) against `PLOW_CHAT_BASE_URL` (default https://api.plow.co). A
 non-2xx response is fatal: status + body to stderr, non-zero exit.
+
+Pass `--paginate` before the connector to walk a list action's opaque
+`meta.next_cursor` to completion and emit one merged `{"status","data":[...]}`.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import urllib.request
 
 CONNECTORS = ("gmail", "slack")
 GET_ACTIONS = {"status"}
+MAX_PAGES = 50  # safety cap so an unbounded/looping cursor can't spin forever
 # A single connector action token (e.g. `status`, `messages.list`,
 # `calendar.events.list`, `connect-code`). Rejecting anything else stops a
 # prompted agent from smuggling `/`, `?`, or `..` into the URL path and reaching
@@ -33,7 +37,12 @@ def _env(*names: str, default: str | None = None) -> str | None:
     return default
 
 
-def call(connector: str, action: str, body: str = "") -> str:
+def _request(connector: str, action: str, payload: dict | None) -> str:
+    """Issue one connector request and return the raw response string.
+
+    Shared auth/env/URL plumbing for `call()` and `paginate()`. `payload` is the
+    already-parsed POST body (a dict), or None for a GET action.
+    """
     if connector not in CONNECTORS:
         raise SystemExit(f"unknown connector {connector!r}; expected one of {', '.join(CONNECTORS)}")
     if not ACTION_RE.fullmatch(action):  # fullmatch, not match: `$` would allow a trailing newline
@@ -48,8 +57,7 @@ def call(connector: str, action: str, body: str = "") -> str:
     headers = {"Authorization": f"Bearer {token}"}
     data = None
     if method == "POST":
-        payload = json.loads(body) if body.strip() else {}
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(payload or {}).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
     url = f"{base}/v1/connectors/{connector}/{action}"
@@ -58,13 +66,51 @@ def call(connector: str, action: str, body: str = "") -> str:
         return resp.read().decode("utf-8")
 
 
+def call(connector: str, action: str, body: str = "") -> str:
+    payload = json.loads(body) if body.strip() else {}
+    return _request(connector, action, payload)
+
+
+def paginate(connector: str, action: str, body: str = "") -> str:
+    """Walk the opaque cursor to completion and return one merged response.
+
+    Calls the same path as `call()` repeatedly, echoing `meta.next_cursor` back
+    as `body["cursor"]` (omitted on the first call), until the cursor is
+    exhausted or `MAX_PAGES` is reached. The cursor is opaque — never parsed.
+    Returns `{"status": "ok", "data": [<all pages concatenated>]}`.
+    """
+    payload = json.loads(body) if body.strip() else {}
+    accumulated: list = []
+    cursor: str | None = None
+    for _ in range(MAX_PAGES):
+        page_body = dict(payload)
+        if cursor:
+            page_body["cursor"] = cursor
+        resp = json.loads(_request(connector, action, page_body))
+        accumulated.extend(resp["data"])  # list-valued by contract; missing key fails loud
+        cursor = (resp.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+    else:  # loop exhausted without breaking — the cap stopped us before the cursor
+        # was exhausted. Fail loud rather than hand back a partial result as success:
+        # a --paginate caller asked for the complete set.
+        raise SystemExit(
+            f"paginate hit MAX_PAGES={MAX_PAGES} cap for {connector}/{action} with the "
+            f"cursor still open; refusing to return {len(accumulated)} partial results as success"
+        )
+    return json.dumps({"status": "ok", "data": accumulated})
+
+
 def main(argv: list[str]) -> None:
+    paginated = bool(argv) and argv[0] == "--paginate"
+    if paginated:
+        argv = argv[1:]
     if len(argv) < 2:
         raise SystemExit(__doc__)
     connector, action = argv[0], argv[1]
     body = argv[2] if len(argv) > 2 else ""
     try:
-        resp = call(connector, action, body)
+        resp = paginate(connector, action, body) if paginated else call(connector, action, body)
     except urllib.error.HTTPError as exc:  # fail loud — surface the API error verbatim
         detail = exc.read().decode("utf-8", "replace")[:1000]
         sys.stderr.write(f"HTTP {exc.code} {exc.reason}: {detail}\n")
