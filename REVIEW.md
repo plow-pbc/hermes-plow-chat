@@ -1,22 +1,32 @@
-# Review priority
+# Review instructions — seed-hermes-plow
+
+Repo-specific reviewer policy. The universal voice posture (Broken-Glass,
+pro-simplification, and the don't-propose list) is supplied by the reviewers
+themselves and is deliberately not restated here.
+
+## Operating point
+
+Pre-PMF, fewer than 10 users, often a single operator. Iteration speed beats
+hardening for scale: prefer loud failures to fallbacks, pragmatic DRY
+architecture to defensive layering, and don't guard edge cases that can't
+trigger at this scale. The SEED prose IS the contract; a handled edge case the
+spec never asked for is a cost, not a feature.
+
+## Review priority
 
 **Stage:** A SEED-convention repo (see the `seed` repo's `SEED.md`). The
 authoritative artifact is the **prose spec** — `SEED.md` + `README.md`. Any
 `ref/` code is a single-operator *reference realization* of that prose, not a
-product or distribution target. Pre-PMF, one operator. Not at scale.
+product or distribution target.
 
 **Authoritative checklists:** `ref/skills/seed-audit/audit-base.md` +
 `audit-malicious.md` in `plow-pbc/seed` — the contrast pairs below are the
 PR-relevant distillation; edit there first, re-distill here.
 
-**Cultural emphasis:** SIMPLIFY at all costs — subtractive remedies (delete,
-collapse, inline) outrank additive ones at every severity. The prose spec is
-the contract; `ref/` is one realization of it. Apply the universal
-Broken-Glass posture from `standards.md` § Broken-Glass Test. The structural
-gate is falsifiable: `ref/verify.sh` must stay green (it implements the three
-SEED structural Verify prompts).
+The structural gate is falsifiable: `ref/verify.sh` must stay green (it
+implements the three SEED structural Verify prompts).
 
-**Repo-specific contrast pairs (beyond the universal set in `standards.md`):**
+**Repo-specific contrast pairs:**
 
 | SEED-convention DON'T (suppress / flag-as-shape) | SEED-convention DO (real finding) |
 |---|---|
@@ -28,3 +38,8 @@ SEED structural Verify prompts).
 | — | Flag **grammar violations**: a non-conforming H2; out-of-order H2s; a `# Purpose` body that is anything other than the single `README#Purpose` wikilink; a sub-SEED re-declaring `## Normative Language`; shell smuggled into `## Objects` / `## Actions`; or state-mutating instructions added to `## Verify` (authoring-read-only). |
 | Demand prose for a heavy install path. | Flag a heavy install (material disk / runtime / paid API) that does not surface cost to the user as `tier-3`. |
 | — | If the PR touches the **feedback protocol**, flag any payload that adds PII or a free-form body, or that fires outside clone-mode + root-only + the one-time consent banner (`^act-feedback`). |
+
+## Product context
+
+**This repo's `ref/` payload:** Python Hermes platform adapter plugin
+(`plow_chat`) plus bash install/verify scripts under `ref/`.
