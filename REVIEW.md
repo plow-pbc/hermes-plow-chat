@@ -23,8 +23,8 @@ product or distribution target.
 `audit-malicious.md` in `plow-pbc/seed` — the contrast pairs below are the
 PR-relevant distillation; edit there first, re-distill here.
 
-The structural gate is falsifiable: `ref/verify.sh` must stay green (it
-implements the three SEED structural Verify prompts).
+`ref/verify.sh` must stay green; the authoritative prompts are in
+`SEED.md` `## Verify`.
 
 **Repo-specific contrast pairs:**
 
