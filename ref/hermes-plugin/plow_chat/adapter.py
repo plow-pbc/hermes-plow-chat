@@ -241,21 +241,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._seen_message_uids: set[str] = set()
         self._stop_event = asyncio.Event()
         self._welcome_sent = False
-        if self.groups:
-            # Half of the shared-group-session setting, and the smaller half: this
-            # one is the adapter's in-flight dispatch guard. The key the session is
-            # *persisted* under comes from gateway config
-            # (`group_sessions_per_user: false`). Both or neither — one alone is a
-            # bug either way, because the delivery still succeeds while the turn
-            # lands in a session nobody reads.
-            #
-            # Written back only here. Assigning config.extra unconditionally would
-            # mutate every group-less install — the ones this layer promises not to
-            # touch — and would raise on a frozen or slotted config object that
-            # never opted in.
-            if not writable:
-                config.extra = extra
-            extra["group_sessions_per_user"] = False
+        # Half of the shared-group-session setting, and the smaller half: this one
+        # is the adapter's in-flight dispatch guard. The key the session is
+        # *persisted* under comes from gateway config
+        # (`group_sessions_per_user: false`). Both or neither — one alone is a bug
+        # either way, because the delivery still succeeds while the turn lands in a
+        # session nobody reads.
+        if not writable:
+            config.extra = extra
+        extra["group_sessions_per_user"] = False
 
     @property
     def name(self) -> str:
@@ -301,15 +295,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_tasks = {
             uid: asyncio.create_task(self._websocket_loop(uid)) for uid in self.chat_uids
         }
-        if self.groups:
-            # Once, before returning: reach and authority both come from this call
-            # now, so a delivery aimed at a configured group in the first seconds
-            # after a restart would otherwise fail as an unknown destination.
-            try:
-                await self._reconcile_once()
-            except Exception as exc:
-                logger.warning("[plow_chat] initial reconcile failed: %s", exc)
-            self._reconcile_task = asyncio.create_task(self._reconcile())
+        # Once, before returning: reach and authority both come from this call, so
+        # a delivery aimed at a group in the first seconds after a restart would
+        # otherwise fail as an unknown destination.
+        try:
+            await self._reconcile_once()
+        except Exception as exc:
+            logger.warning("[plow_chat] initial reconcile failed: %s", exc)
+        self._reconcile_task = asyncio.create_task(self._reconcile())
         return True
 
     async def _teardown(self) -> None:
@@ -740,17 +733,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             raw_message=frame,
             message_id=msg_uid,
         )
-        # Both kwargs are passed only while the group layer is on. Two reasons:
-        # an install with no groups stays byte-identical to before this layer
-        # existed, and neither kwarg is handed to a gateway old enough not to
-        # accept it unless the operator asked for groups in the first place.
-        if self.groups:
-            # Vouched-for rooms only: named in the dotenv, or vouched for by the
-            # operator speaking there. A chat the *model* started is in neither,
-            # so an injected instruction cannot hand out this runtime's tools.
-            source_kwargs["role_authorized"] = authorized
-            if chat_type != "dm":
-                event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid))
+        # Vouched-for rooms only: named in the dotenv, or vouched for by the
+        # operator speaking there. A chat the *model* started is in neither, so an
+        # injected instruction cannot hand out this runtime's tools.
+        source_kwargs["role_authorized"] = authorized
+        if chat_type != "dm":
+            event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid))
         await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
 
     def _may_approve(self, chat_uid: str) -> bool:

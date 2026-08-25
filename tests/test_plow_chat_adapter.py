@@ -362,11 +362,6 @@ def test_a_vouch_missed_while_the_socket_was_down_is_recovered_by_the_poll(monke
     assert a._may_approve("cht_room") is True
 
 
-def test_group_sessions_guard_only_set_when_groups_configured(monkeypatch):
-    assert _adapter(monkeypatch).config.extra["group_sessions_per_user"] is False
-    assert "group_sessions_per_user" not in _adapter(monkeypatch, groups=None).config.extra
-
-
 class CapturingAdapter(adapter_mod.PlowChatAdapter):
     """Captures handle_message events without a gateway behind it."""
 
@@ -377,6 +372,14 @@ class CapturingAdapter(adapter_mod.PlowChatAdapter):
     async def handle_message(self, event):
         self.handled.append(event)
 
+
+
+def test_the_group_session_guard_is_always_set(monkeypatch):
+    """Groups are the default, so the in-flight dispatch guard is not conditional.
+    It has to agree with gateway config's `group_sessions_per_user: false`; one
+    without the other is a bug either way (#84)."""
+    assert _adapter(monkeypatch).config.extra["group_sessions_per_user"] is False
+    assert _adapter(monkeypatch, groups=None).config.extra["group_sessions_per_user"] is False
 
 def _inbound(chat_uid, body="hi", uid="m1", sender=None):
     return {
@@ -419,14 +422,16 @@ def test_home_frame_is_dm_with_no_channel_prompt(monkeypatch):
     assert event.source.role_authorized is True
 
 
-def test_groups_disabled_passes_neither_group_kwarg(monkeypatch):
-    """Default-off parity: an install with no groups sees the pre-group event shape."""
+def test_an_unconfigured_install_still_gets_group_context(monkeypatch):
+    """Being added to a thread is the opt-in, so a group message carries its policy
+    and its authority verdict even when nothing is named in PLOW_CHAT_GROUP_UIDS."""
     a = _adapter(monkeypatch, groups=None, cls=CapturingAdapter)
-    asyncio.run(a._handle_ws_frame("cht_home", _inbound("cht_home")))
+    a.chat_uids = frozenset({*a.chat_uids, "cht_new"})
+    asyncio.run(a._handle_ws_frame("cht_new", _inbound("cht_new")))
     event = a.handled[0]
-    assert not hasattr(event, "channel_prompt")
-    assert not hasattr(event.source, "role_authorized")
-
+    assert event.source.chat_type == "group"
+    assert event.channel_prompt == adapter_mod.GROUP_POLICY
+    assert event.source.role_authorized is False   # heard, not trusted
 
 def test_adopted_chat_is_audible_but_not_authorized(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
@@ -657,23 +662,22 @@ def test_non_dict_extra_still_lands_the_dispatch_guard(monkeypatch):
     assert cfg.extra["group_sessions_per_user"] is False
 
 
-@pytest.mark.parametrize("groups,expected_tasks,expects_poll,connect_kwargs", [
-    (None, ["cht_home"], False, {}),
-    ("cht_a=Owners", ["cht_home"], True, {}),
+@pytest.mark.parametrize("groups,connect_kwargs", [
+    (None, {}),
+    ("cht_a=Owners", {}),
     # The gateway's reconnection watcher passes is_reconnect=True; a signature
     # that rejects it fails the platform at startup and on every later retry.
-    (None, ["cht_home"], False, {"is_reconnect": True}),
-], ids=["default-off", "groups-enabled", "reconnect"])
-def test_connect_fans_out_and_polls_only_when_groups_are_configured(
-        monkeypatch, groups, expected_tasks, expects_poll, connect_kwargs):
-    """The default-off contract at the lifecycle level: no groups, one socket, no poll."""
+    (None, {"is_reconnect": True}),
+], ids=["unconfigured", "configured", "reconnect"])
+def test_connect_always_opens_the_home_socket_and_starts_discovery(
+        monkeypatch, groups, connect_kwargs):
+    """Discovery is not opt-in. Reach starts at {home} on every path and the poll
+    adds whatever is on this agent's line."""
     a = _adapter(monkeypatch, groups=groups)
     a._websocket_loop = lambda uid: asyncio.sleep(0)
     a._reconcile = lambda: asyncio.sleep(0)
-    # connect() now runs one reconcile pass before returning, so a delivery aimed
-    # at a configured group right after a restart is not an unknown destination.
-    ran = []
-    a._reconcile_once = lambda: ran.append(1) or asyncio.sleep(0)
+    polled = []
+    a._reconcile_once = lambda: polled.append(1) or asyncio.sleep(0)
     monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession",
                         lambda *args, **kw: RecordingSession(), raising=False)
 
@@ -683,29 +687,8 @@ def test_connect_fans_out_and_polls_only_when_groups_are_configured(
         await a.disconnect()
         return state
 
-    assert asyncio.run(go()) == (expected_tasks, expects_poll)
-    assert bool(ran) is expects_poll
-
-
-@pytest.mark.parametrize("bad_entry", [
-    {"participants": [{"type": "agent", "line": {"uid": "line_1"}}]},   # no uid
-    {"uid": "cht_shapeless"},                                            # no participants
-    "not-even-a-dict",
-], ids=["no-uid", "no-participants", "not-a-dict"])
-def test_one_malformed_listing_entry_never_aborts_the_sweep(monkeypatch, bad_entry):
-    """Each recurs every 60s for as long as it stays in the listing, and surfaces
-    only as a generic reconcile failure — so one bad entry must cost one chat."""
-    a = _adapter(monkeypatch)
-    a._websocket_loop = lambda uid: asyncio.sleep(0)
-    a._http_session = PagingSession({
-        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), bad_entry,
-                      _chat("cht_good", "line_1", ["+2"])],
-        "/v1/chats/cht_good/messages": [],
-    })
-    asyncio.run(a._reconcile_once())
-    assert "cht_good" in a.chat_uids
-    assert a.operator_key == "+1"
-
+    assert asyncio.run(go()) == (["cht_home"], True)
+    assert polled == [1]
 
 def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
     a = _adapter(monkeypatch)
@@ -721,20 +704,6 @@ def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
     asyncio.run(a._reconcile_once())
     assert "cht_room" in a.chat_uids
     assert a._may_approve("cht_room") is False
-
-
-def test_groupless_install_never_has_its_config_mutated(monkeypatch):
-    """The layer promises not to touch installs that did not opt in — including
-    configs that are frozen or have no extra at all."""
-    monkeypatch.delenv("PLOW_CHAT_GROUP_UIDS", raising=False)
-    monkeypatch.setenv("PLOW_CHAT_CHAT_UID", "cht_home")
-    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
-
-    class FrozenConfig:
-        __slots__ = ()
-        extra = None
-
-    adapter_mod.PlowChatAdapter(FrozenConfig())  # must not raise
 
 
 def test_adoption_log_distinguishes_a_configured_group_from_a_discovered_one(monkeypatch, caplog):

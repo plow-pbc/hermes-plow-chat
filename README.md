@@ -210,8 +210,9 @@ welcome message from Hermes through the normal Plow message endpoint. Set
 
 ## Runtime behavior
 
-- `PLOW_CHAT_CHAT_UID` is the home chat — the one this plugin instance always
-  handles, and the only one unless the optional group layer below is enabled.
+- `PLOW_CHAT_CHAT_UID` is the home chat — the DM this plugin instance is bound
+  to. It is not the only chat handled: group threads on the same Plow line are
+  joined by default (see *Plow group chats* below).
 - `PLOW_CHAT_TOKEN` stays in the profile's `.env` (scaffold `data/.env`, or
   `data/profiles/<name>/.env` for a named profile); do not commit it or log it.
 - The activation Bearer token is a user credential, not just a chat secret.
@@ -224,11 +225,15 @@ welcome message from Hermes through the normal Plow message endpoint. Set
 - Rich Markdown is flattened to plain text because the backing channel is
   iMessage/SMS-style.
 
-## Plow group chats (optional)
+## Plow group chats
 
-**Off by default.** With `PLOW_CHAT_GROUP_UIDS` unset the adapter subscribes one
-chat, runs no poll, and behaves exactly as it did before this layer existed. Set
-it and Hermes joins group threads on its own line:
+**On by default.** Add the agent's Plow line to a group thread from Messages and
+Hermes takes part — that is the opt-in, and it needs no configuration. It stays
+quiet unless addressed (see the policy below), and its members get no tool access
+until the room is vouched for.
+
+`PLOW_CHAT_GROUP_UIDS` is not an on/off switch. It names groups and authorizes
+their members:
 
 ```sh
 PLOW_CHAT_GROUP_UIDS=cht_owners=STR Owners,cht_cleaners=Cleaners
@@ -241,6 +246,9 @@ the label is supplied here; it is what the agent sees and what a send resolves.
 is no webhook — so the adapter polls `GET /v1/chats` every 60s and adopts any
 chat on its own line. Add the Plow line to a thread from Messages and Hermes is
 listening within a minute, with no config change and no restart.
+
+A chat that leaves this agent's line is dropped the same way: its socket is
+cancelled and any authority it had earned goes with it.
 
 **Reach is not authority.** Adopting a chat makes Hermes *hear* it. Its members
 can use Hermes' tools only if the chat is named in `PLOW_CHAT_GROUP_UIDS`, or the

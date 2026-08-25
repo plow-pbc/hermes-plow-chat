@@ -24,7 +24,7 @@ optional_env:
     secret: false
     password: false
   - name: PLOW_CHAT_GROUP_UIDS
-    description: "Optional group chats, comma-separated `<cht_ id>=<display name>`. Unset disables the group layer entirely."
+    description: "Names and authorizes group chats, comma-separated `<cht_ id>=<display name>`. Group chats are handled by default; this does not enable or disable discovery."
     prompt: "Plow group chats"
     secret: false
     password: false
