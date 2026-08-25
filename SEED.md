@@ -30,9 +30,19 @@ The named entities that exist on the Hermes side. For Plow Chat entities (chats,
 ### plow_chat Hermes platform
 
 - A Hermes gateway platform named `plow_chat`.
-- It maps a Plow chat to a Hermes session source with `platform='plow_chat'`, `chat_id=<chat.uid>`, `chat_type='dm'`, and member sender metadata as the user identity.
+- It maps a Plow chat to a Hermes session source with `platform='plow_chat'`, `chat_id=<chat.uid>`, and member sender metadata as the user identity. `chat_type` is `'dm'` for the home chat (`PLOW_CHAT_CHAT_UID`) and `'group'` for any other chat, which only exists when the OPTIONAL group layer below is enabled.
 - It sends plain text responses through Plow's message creation endpoint.
-- It receives user messages by minting short-lived WebSocket tickets and subscribing to `wss://api.plow.co/v1/ws?ticket=<ticket>`.
+- It receives user messages by minting short-lived WebSocket tickets and subscribing to `wss://api.plow.co/v1/ws?ticket=<ticket>`. A ticket is scoped to one chat, so the adapter holds one subscription per chat it listens to.
+
+### Group chats (OPTIONAL)
+
+- The group layer is OPTIONAL and inert by default. It is enabled when `PLOW_CHAT_GROUP_UIDS` parses to at least one `<cht_ id>=<display name>` entry. With it unset or empty the adapter MUST subscribe exactly one chat, MUST NOT poll, and MUST behave as specified above — including passing neither `role_authorized` nor `channel_prompt` to the gateway.
+- When enabled, the adapter MUST open one WebSocket subscription per chat it listens to, and MUST poll `GET /v1/chats` every 60 seconds to discover chats added to this agent's line after startup. Nothing pushes chat creation — a ws ticket is per-chat and there is no webhook — so listing is the only way to learn of one.
+- A chat's line is the `line.uid` of its `participants[]` entry whose `type` is `agent`. Only chats whose line matches the **home chat's** line are this agent's; a chat on another line belongs to a sibling agent and MUST NOT be adopted. `GET /v1/chats` is user-wide because the token is a user credential, so this scoping is what keeps one account's agents out of each other's threads.
+- **Adoption grants reach, never authority.** Both are earned from the poll, and neither may be asserted from configuration alone: a `PLOW_CHAT_GROUP_UIDS` entry is a claim about a chat, so until the poll has seen that chat on this agent's line it MUST NOT be subscribed or authorized. Once seen on this line, a chat's members are tool-authorized if the chat is named in `PLOW_CHAT_GROUP_UIDS`, or the operator has sent an inbound message in it. Authority MUST be re-evaluated on every poll until earned — a vouch that arrives while the subscription is down reaches no frame handler, and would otherwise be lost for the life of the process. Presence is not enough: an injected instruction can put the operator in a room with an attacker, but it cannot send a message *as* the operator.
+- The operator is matched by `provider_key`, taken from the home chat's member participant. A home chat with anything other than exactly one member participant is ambiguous: the implementation MUST leave the operator unset and log an error rather than choose positionally, which disables operator-derived authorization until it is resolved. Chats named in `PLOW_CHAT_GROUP_UIDS` are unaffected — their authority comes from the configuration plus the line check.
+- `PLOW_CHAT_GROUP_UIDS` entries MUST be `<cht_ id>=<display name>`; the id MUST begin `cht_`, MUST NOT equal `PLOW_CHAT_CHAT_UID`, and neither ids nor display names may repeat. A malformed entry MUST fail loudly and name the offending entry.
+- A per-group standing prompt MAY be supplied in the platform's `extra.group_prompts`, keyed by display name — never by chat id, so the declarative half survives a restore onto an account whose uids all differ. It appends to the group policy; it MUST NOT replace it. A key naming no configured group MUST be logged and skipped rather than fatal, because on a fresh restore the dotenv half is still blank.
 
 ### Direct-mounted plugin
 

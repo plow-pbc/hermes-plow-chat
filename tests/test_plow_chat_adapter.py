@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
@@ -97,7 +98,7 @@ def test_chat_active_sends_default_welcome(monkeypatch):
     monkeypatch.delenv("PLOW_CHAT_WELCOME_MESSAGE", raising=False)
     adapter = RecordingAdapter(monkeypatch)
 
-    asyncio.run(adapter._handle_ws_frame({"type": "chat_active"}))
+    asyncio.run(adapter._handle_ws_frame("cht_test", {"type": "chat_active"}))
 
     assert adapter.sent == [
         (
@@ -140,7 +141,7 @@ def test_inbound_message_auto_approves_verified_sender(monkeypatch):
         },
     }
 
-    asyncio.run(adapter._handle_ws_frame(frame))
+    asyncio.run(adapter._handle_ws_frame("cht_test", frame))
 
     assert approved == [("plow_chat", "cp_member", "Patrick")]
     assert adapter.handled[0].source.user_id == "cp_member"
@@ -200,7 +201,7 @@ def test_ws_ticket_is_scoped_to_chat_and_uses_bearer(monkeypatch):
     session = RecordingSession({"ticket": "wst_test"})
     adapter._http_session = session
 
-    ticket = asyncio.run(adapter._mint_ws_ticket())
+    ticket = asyncio.run(adapter._mint_ws_ticket("cht_test"))
 
     assert ticket == "wst_test"
     assert session.posts == [
@@ -236,6 +237,589 @@ def test_activation_welcome_latch(monkeypatch, send_success, frames, expected_se
     adapter.send_success = send_success
 
     for frame in frames:
-        asyncio.run(adapter._handle_ws_frame({"type": frame}))
+        asyncio.run(adapter._handle_ws_frame("cht_test", {"type": frame}))
 
     assert adapter.sent == expected_sent
+
+
+# --- group support -----------------------------------------------------------
+
+
+def _cfg(extra=None):
+    """A fresh config per test: DummyConfig.extra is class-level and the adapter
+    writes group_sessions_per_user into it, which would leak between tests."""
+    return types.SimpleNamespace(
+        extra={"chat_uid": "cht_home", "token": "token_test", **(extra or {})}
+    )
+
+
+def test_groups_absent_yields_empty_mapping(monkeypatch):
+    monkeypatch.delenv("PLOW_CHAT_GROUP_UIDS", raising=False)
+    assert adapter_mod._groups({}, "cht_home") == {}
+
+
+def test_groups_parses_uid_equals_name(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_a=Owners,cht_b=Cleaners")
+    assert adapter_mod._groups({}, "cht_home") == {
+        "cht_a": {"name": "Owners", "prompt": None},
+        "cht_b": {"name": "Cleaners", "prompt": None},
+    }
+
+
+@pytest.mark.parametrize(
+    "value,message",
+    [
+        ("cht_a", "<cht_ id>=<display name>"),
+        ("cht_a=", "<cht_ id>=<display name>"),
+        ("bogus=Owners", "must be a group cht_ ID"),
+        ("cht_home=Owners", "must be a group cht_ ID"),
+        ("cht_a=Owners,cht_a=Other", "repeats chat id"),
+        ("cht_a=Owners,cht_b=Owners", "repeats display name"),
+    ],
+)
+def test_groups_rejects_malformed_entries(monkeypatch, value, message):
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", value)
+    with pytest.raises(ValueError) as exc:
+        adapter_mod._groups({}, "cht_home")
+    assert message in str(exc.value)
+
+
+def test_group_prompt_appends_to_policy_and_orphan_warns(monkeypatch, caplog):
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_a=Owners")
+    groups = adapter_mod._groups(
+        {"group_prompts": {"Owners": "Be candid.", "Ghost": "x"}}, "cht_home"
+    )
+    assert adapter_mod._channel_prompt(groups["cht_a"]) == (
+        adapter_mod.GROUP_POLICY + "\n\nBe candid."
+    )
+    assert adapter_mod._channel_prompt(None) == adapter_mod.GROUP_POLICY
+    assert "names no configured group" in caplog.text
+
+
+def _adapter(monkeypatch, groups="cht_a=Owners", extra=None, cls=None):
+    """An adapter built from config (not env), with the group layer set explicitly."""
+    monkeypatch.delenv("PLOW_CHAT_CHAT_UID", raising=False)
+    monkeypatch.delenv("PLOW_CHAT_TOKEN", raising=False)
+    if groups is None:
+        monkeypatch.delenv("PLOW_CHAT_GROUP_UIDS", raising=False)
+    else:
+        monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", groups)
+    return (cls or adapter_mod.PlowChatAdapter)(_cfg(extra))
+
+
+def test_no_groups_means_single_chat_and_dm_label(monkeypatch):
+    a = _adapter(monkeypatch, groups=None)
+    assert a.chat_uids == frozenset({"cht_home"})
+    assert a.groups == {}
+    assert a.operator_vouched == set()
+    assert a._label("cht_home") == ("Plow Chat", "dm")
+
+
+def test_configured_group_is_not_reachable_until_the_poll_confirms_its_line(monkeypatch):
+    """A dotenv entry is a claim about a chat, not proof of one."""
+    a = _adapter(monkeypatch)
+    assert a.chat_uids == frozenset({"cht_home"})
+    assert a.operator_vouched == set()
+    # Naming still works off the configuration — only reach and authority wait.
+    assert a._label("cht_a") == ("Owners", "group")
+    assert a._label("cht_zz") == ("cht_zz", "group")
+
+
+@pytest.mark.parametrize("line,reachable,warned", [
+    ("line_1", True, False),
+    ("line_2", False, True),
+], ids=["own-line", "sibling-line"])
+def test_configured_group_requires_the_home_line(monkeypatch, caplog, line, reachable, warned):
+    """A configured uid on a sibling agent's line used to be subscribed AND
+    authorized before any line check ran."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_a", line, ["+2"])],
+    })
+    asyncio.run(a._reconcile_once())
+    assert ("cht_a" in a.chat_uids) is reachable
+    assert a._may_approve("cht_a") is reachable
+    assert ("not on this agent's line" in caplog.text) is warned
+
+
+def test_a_vouch_missed_while_the_socket_was_down_is_recovered_by_the_poll(monkeypatch):
+    """Authority is re-decided every pass until earned, so a vouch that reached no
+    frame handler is not lost for the life of the process."""
+    a = _adapter(monkeypatch, groups="cht_other=Other")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    quiet = {"/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+             "/v1/chats/cht_room/messages": []}
+    a._http_session = PagingSession(quiet)
+    asyncio.run(a._reconcile_once())
+    assert "cht_room" in a.chat_uids and a._may_approve("cht_room") is False
+    # The operator speaks while the socket is down; only the poll can see it.
+    a._http_session = PagingSession({
+        **quiet,
+        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"provider_key": "+1"}}],
+    })
+    asyncio.run(a._reconcile_once())
+    assert a._may_approve("cht_room") is True
+
+
+def test_group_sessions_guard_only_set_when_groups_configured(monkeypatch):
+    assert _adapter(monkeypatch).config.extra["group_sessions_per_user"] is False
+    assert "group_sessions_per_user" not in _adapter(monkeypatch, groups=None).config.extra
+
+
+class CapturingAdapter(adapter_mod.PlowChatAdapter):
+    """Captures handle_message events without a gateway behind it."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.handled = []
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
+def _inbound(chat_uid, body="hi", uid="m1", sender=None):
+    return {
+        "type": "message_received",
+        "message": {
+            "uid": uid,
+            "direction": "inbound",
+            "chat_uid": chat_uid,
+            "body": body,
+            "sender": sender or {"uid": "u1", "display_name": "Sam"},
+        },
+    }
+
+
+def test_frame_naming_another_chat_is_ignored(monkeypatch):
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_other")))
+    assert a.handled == []
+
+
+def test_group_frame_carries_group_type_and_channel_prompt(monkeypatch):
+    a = _adapter(monkeypatch, extra={"group_prompts": {"Owners": "Be candid."}},
+                 cls=CapturingAdapter)
+    a.chat_uids = frozenset({*a.chat_uids, "cht_a"})
+    a.operator_vouched.add("cht_a")
+    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a")))
+    event = a.handled[0]
+    assert event.source.chat_type == "group"
+    assert event.source.chat_name == "Owners"
+    assert event.channel_prompt == adapter_mod.GROUP_POLICY + "\n\nBe candid."
+    assert event.source.role_authorized is True
+
+
+def test_home_frame_is_dm_with_no_channel_prompt(monkeypatch):
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    asyncio.run(a._handle_ws_frame("cht_home", _inbound("cht_home")))
+    event = a.handled[0]
+    assert event.source.chat_type == "dm"
+    assert not hasattr(event, "channel_prompt")
+    assert event.source.role_authorized is True
+
+
+def test_groups_disabled_passes_neither_group_kwarg(monkeypatch):
+    """Default-off parity: an install with no groups sees the pre-group event shape."""
+    a = _adapter(monkeypatch, groups=None, cls=CapturingAdapter)
+    asyncio.run(a._handle_ws_frame("cht_home", _inbound("cht_home")))
+    event = a.handled[0]
+    assert not hasattr(event, "channel_prompt")
+    assert not hasattr(event.source, "role_authorized")
+
+
+def test_adopted_chat_is_audible_but_not_authorized(monkeypatch):
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a.chat_uids = frozenset({*a.chat_uids, "cht_new"})
+    asyncio.run(a._handle_ws_frame("cht_new", _inbound("cht_new")))
+    event = a.handled[0]
+    assert event.source.chat_type == "group"
+    assert event.source.role_authorized is False
+    assert event.channel_prompt == adapter_mod.GROUP_POLICY
+
+
+def test_operator_speaking_vouches_for_the_room(monkeypatch):
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a.operator_key = "+15550001111"
+    a.chat_uids = frozenset({*a.chat_uids, "cht_new"})
+    asyncio.run(a._handle_ws_frame(
+        "cht_new", _inbound("cht_new", sender={"uid": "u9", "provider_key": "+15550001111"})))
+    assert "cht_new" in a.operator_vouched
+    assert a.handled[0].source.role_authorized is True
+
+
+def test_agent_frame_without_provider_key_is_not_the_operator(monkeypatch):
+    """None == None would make the gateway's own traffic the operator's."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    assert a.operator_key is None
+    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", sender={"uid": "agent"})))
+    assert a._is_operator({"uid": "agent"}) is False
+
+
+def test_send_rejects_a_chat_outside_reach(monkeypatch):
+    a = _adapter(monkeypatch)
+    result = asyncio.run(adapter_mod.PlowChatAdapter.send(a, "cht_zz", "hi"))
+    assert result.success is False
+    assert "Unknown Plow Chat destination" in result.error
+
+
+class PagingSession:
+    """A stub whose GET answers from a {path: data} map, with optional has_more."""
+
+    def __init__(self, pages, has_more=False):
+        self.pages = pages
+        self.has_more = has_more
+        self.gets = []
+
+    def get(self, url, **kwargs):
+        self.gets.append((url, kwargs))
+        path = url.replace("https://api.plow.co", "")
+        return FakeResponse({"data": self.pages.get(path, []), "has_more": self.has_more})
+
+    async def close(self):
+        return None
+
+
+def _chat(uid, line, members):
+    return {"uid": uid, "participants": [
+        {"type": "agent", "line": {"uid": line}},
+        *[{"type": "member", "provider_key": k, "uid": f"u_{k}"} for k in members],
+    ]}
+
+
+def test_page_warns_when_a_page_is_unreachable(monkeypatch, caplog):
+    a = _adapter(monkeypatch)
+    a._http_session = PagingSession({"/v1/chats": [{"uid": "cht_x"}]}, has_more=True)
+    assert asyncio.run(a._page("/v1/chats")) == [{"uid": "cht_x"}]
+    assert "we cannot reach" in caplog.text
+
+
+def test_reconcile_adopts_only_chats_on_this_agents_line(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [
+            _chat("cht_home", "line_1", ["+1"]),
+            _chat("cht_mine", "line_1", ["+2"]),
+            _chat("cht_sibling", "line_2", ["+3"]),
+        ],
+        "/v1/chats/cht_mine/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_mine" in a.chat_uids
+    assert "cht_sibling" not in a.chat_uids
+    assert a.operator_key == "+1"
+
+
+def test_reconcile_authorizes_a_room_the_operator_has_spoken_in(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+        "/v1/chats/cht_room/messages": [
+            {"direction": "inbound", "sender": {"provider_key": "+1"}},
+        ],
+    })
+    asyncio.run(a._reconcile_once())
+    assert a._may_approve("cht_room") is True
+
+
+def test_reconcile_adopts_without_authorizing_a_room_the_operator_is_silent_in(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_quiet", "line_1", ["+9"])],
+        "/v1/chats/cht_quiet/messages": [
+            {"direction": "inbound", "sender": {"provider_key": "+9"}},
+        ],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_quiet" in a.chat_uids
+    assert a._may_approve("cht_quiet") is False
+
+
+def test_reconcile_stops_when_the_home_chat_is_missing(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._http_session = PagingSession({"/v1/chats": [_chat("cht_other", "line_9", ["+9"])]})
+    asyncio.run(a._reconcile_once())
+    assert a.operator_key is None
+    assert a.chat_uids == frozenset({"cht_home"})
+
+
+def test_adopt_chat_is_idempotent(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+
+    async def go():
+        return await a.adopt_chat("cht_new"), await a.adopt_chat("cht_new")
+
+    assert asyncio.run(go()) == (True, False)
+
+
+# --- review fixes: reach must not imply pairing, health, or authority --------
+
+
+class ApprovalRecordingAdapter(CapturingAdapter):
+    def __init__(self, config):
+        super().__init__(config)
+        self.approved = []
+
+    def _approve_plow_member(self, user_id, user_name=""):
+        self.approved.append(user_id)
+
+
+def test_unvouched_room_does_not_pair_its_members(monkeypatch):
+    """PairingStore is keyed by (platform, user), so approving in a room nobody
+    vouched for would pair that person with the whole gateway."""
+    a = _adapter(monkeypatch, cls=ApprovalRecordingAdapter)
+    a.chat_uids = frozenset({*a.chat_uids, "cht_model_made"})
+    asyncio.run(a._handle_ws_frame("cht_model_made", _inbound("cht_model_made")))
+    assert a.approved == []
+    assert a.handled[0].source.role_authorized is False
+
+
+def test_home_and_vouched_rooms_still_pair(monkeypatch):
+    a = _adapter(monkeypatch, cls=ApprovalRecordingAdapter)
+    a.chat_uids = frozenset({*a.chat_uids, "cht_a"})
+    a.operator_vouched.add("cht_a")
+    asyncio.run(a._handle_ws_frame("cht_home", _inbound("cht_home", uid="m1")))
+    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", uid="m2")))
+    assert a.approved == ["u1", "u1"]
+
+
+def test_participant_verified_is_gated_the_same_way(monkeypatch):
+    seen = []
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    monkeypatch.setattr(type(a), "_approve_sender_from_frame",
+                        lambda self, frame: seen.append(frame), raising=False)
+    a.chat_uids = frozenset({*a.chat_uids, "cht_model_made"})
+    asyncio.run(a._handle_ws_frame("cht_model_made", {"type": "participant_verified"}))
+    assert seen == []
+    asyncio.run(a._handle_ws_frame("cht_home", {"type": "participant_verified"}))
+    assert len(seen) == 1
+
+
+def test_adapter_health_follows_the_home_socket_only(monkeypatch):
+    """N sockets sharing one flag would track the worst chat, not reachability."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    asyncio.run(a._handle_ws_frame("cht_a", {"type": "connected"}))
+    assert a.is_connected is False
+    asyncio.run(a._handle_ws_frame("cht_home", {"type": "connected"}))
+    assert a.is_connected is True
+
+
+def test_one_unclassifiable_chat_does_not_abort_discovery(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [
+            _chat("cht_home", "line_1", ["+1"]),
+            {"uid": "cht_weird", "participants": [{"type": "member", "provider_key": "+8"}]},
+            _chat("cht_good", "line_1", ["+2"]),
+        ],
+        "/v1/chats/cht_good/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_good" in a.chat_uids
+    assert "cht_weird" not in a.chat_uids
+
+
+@pytest.mark.parametrize("members_per_poll,expected_operator", [
+    ([["+1", "+2"]], None),            # ambiguous from the very first poll
+    ([["+1"], ["+1", "+2"]], None),    # resolved, then becomes ambiguous
+    ([["+1"], ["+2"]], "+2"),          # resolved, then a different single member
+], ids=["ambiguous-first-poll", "goes-ambiguous", "changes-identity"])
+def test_operator_identity_across_polls(monkeypatch, caplog, members_per_poll, expected_operator):
+    """operator_key is the sole credential granting a room tool authority, so a
+    positional pick out of several members is a silent escalation — and a key that
+    stops holding must not keep vouching. Both first-poll and transition cases run
+    the same arrange/act, so they share one harness."""
+    caplog.set_level(logging.INFO)
+    a = _adapter(monkeypatch, groups="cht_x=Other")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    for members in members_per_poll:
+        a._http_session = PagingSession({"/v1/chats": [_chat("cht_home", "line_1", members)]})
+        asyncio.run(a._reconcile_once())
+    assert a.operator_key == expected_operator
+    if expected_operator is None:
+        # Reported on the first poll too, not only on a transition: None doubles as
+        # "unresolved", so an equality check alone stays silent on a fresh install.
+        assert "expected 1" in caplog.text
+        assert a._is_operator({"provider_key": "+1"}) is False
+
+
+def test_non_dict_extra_still_lands_the_dispatch_guard(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_a=Owners")
+    monkeypatch.setenv("PLOW_CHAT_CHAT_UID", "cht_home")
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    cfg = types.SimpleNamespace(extra=None)
+    adapter_mod.PlowChatAdapter(cfg)
+    assert cfg.extra["group_sessions_per_user"] is False
+
+
+@pytest.mark.parametrize("groups,expected_tasks,expects_poll,connect_kwargs", [
+    (None, ["cht_home"], False, {}),
+    ("cht_a=Owners", ["cht_home"], True, {}),
+    # The gateway's reconnection watcher passes is_reconnect=True; a signature
+    # that rejects it fails the platform at startup and on every later retry.
+    (None, ["cht_home"], False, {"is_reconnect": True}),
+], ids=["default-off", "groups-enabled", "reconnect"])
+def test_connect_fans_out_and_polls_only_when_groups_are_configured(
+        monkeypatch, groups, expected_tasks, expects_poll, connect_kwargs):
+    """The default-off contract at the lifecycle level: no groups, one socket, no poll."""
+    a = _adapter(monkeypatch, groups=groups)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._reconcile = lambda: asyncio.sleep(0)
+    # connect() now runs one reconcile pass before returning, so a delivery aimed
+    # at a configured group right after a restart is not an unknown destination.
+    ran = []
+    a._reconcile_once = lambda: ran.append(1) or asyncio.sleep(0)
+    monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession",
+                        lambda *args, **kw: RecordingSession(), raising=False)
+
+    async def go():
+        assert await a.connect(**connect_kwargs) is True
+        state = (sorted(a._ws_tasks), a._reconcile_task is not None)
+        await a.disconnect()
+        return state
+
+    assert asyncio.run(go()) == (expected_tasks, expects_poll)
+    assert bool(ran) is expects_poll
+
+
+@pytest.mark.parametrize("bad_entry", [
+    {"participants": [{"type": "agent", "line": {"uid": "line_1"}}]},   # no uid
+    {"uid": "cht_shapeless"},                                            # no participants
+    "not-even-a-dict",
+], ids=["no-uid", "no-participants", "not-a-dict"])
+def test_one_malformed_listing_entry_never_aborts_the_sweep(monkeypatch, bad_entry):
+    """Each recurs every 60s for as long as it stays in the listing, and surfaces
+    only as a generic reconcile failure — so one bad entry must cost one chat."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), bad_entry,
+                      _chat("cht_good", "line_1", ["+2"])],
+        "/v1/chats/cht_good/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_good" in a.chat_uids
+    assert a.operator_key == "+1"
+
+
+def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+        "/v1/chats/cht_room/messages": [
+            {"sender": {"provider_key": "+1"}},          # no direction
+            {"direction": "inbound"},                     # no sender
+            "not-a-dict",
+        ],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_room" in a.chat_uids
+    assert a._may_approve("cht_room") is False
+
+
+def test_groupless_install_never_has_its_config_mutated(monkeypatch):
+    """The layer promises not to touch installs that did not opt in — including
+    configs that are frozen or have no extra at all."""
+    monkeypatch.delenv("PLOW_CHAT_GROUP_UIDS", raising=False)
+    monkeypatch.setenv("PLOW_CHAT_CHAT_UID", "cht_home")
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+
+    class FrozenConfig:
+        __slots__ = ()
+        extra = None
+
+    adapter_mod.PlowChatAdapter(FrozenConfig())  # must not raise
+
+
+def test_adoption_log_distinguishes_a_configured_group_from_a_discovered_one(monkeypatch, caplog):
+    """Telling an operator to configure a group they already configured sends them
+    chasing a no-op."""
+    caplog.set_level(logging.INFO)
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    asyncio.run(a.adopt_chat("cht_a"))
+    assert "joined configured group cht_a (Owners)" in caplog.text
+    assert "add 'cht_a=" not in caplog.text
+    caplog.clear()
+    asyncio.run(a.adopt_chat("cht_stranger"))
+    assert "add 'cht_stranger=<display name>'" in caplog.text
+
+
+@pytest.mark.parametrize("history_explodes", [False, True],
+                         ids=["clean-poll", "history-read-fails"])
+def test_a_chat_that_leaves_our_line_loses_socket_reach_and_vouch(monkeypatch, history_explodes):
+    """Reconciliation owns removal, not just adoption — and settles reach before the
+    fallible history hydration, so another room's read failing cannot leave a
+    departed room dispatching."""
+    a = _adapter(monkeypatch, groups="cht_x=Other")
+    cancelled = []
+
+    class Tracked:
+        def __init__(self, uid): self.uid = uid; self.done = lambda: False
+        def cancel(self): cancelled.append(self.uid)
+
+    class ExplodingSession(PagingSession):
+        def get(self, url, **kwargs):
+            if "/messages" in url:
+                raise RuntimeError("Plow 504: gateway timeout")
+            return super().get(url, **kwargs)
+
+    a._websocket_loop = lambda uid: asyncio.sleep(3600)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"provider_key": "+1"}}],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_room" in a.chat_uids and a._may_approve("cht_room") is True
+    a._ws_tasks["cht_room"] = Tracked("cht_room")
+
+    # Next poll: the room is on a sibling agent's line. In one row a *different*
+    # chat's history read blows up partway through the same pass.
+    a._http_session = (ExplodingSession if history_explodes else PagingSession)({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]),
+                      _chat("cht_room", "line_2", ["+9"]),
+                      _chat("cht_new", "line_1", ["+4"])],
+        "/v1/chats/cht_new/messages": [],
+    })
+    if history_explodes:
+        with pytest.raises(RuntimeError):
+            asyncio.run(a._reconcile_once())
+    else:
+        asyncio.run(a._reconcile_once())
+
+    assert "cht_room" not in a.chat_uids          # reach dropped
+    assert "cht_room" not in a._ws_tasks          # socket removed
+    assert cancelled == ["cht_room"]              # ...and actually cancelled
+    assert a._may_approve("cht_room") is False    # vouch discarded with the room
+
+
+
+@pytest.mark.parametrize("truncated,keeps_reach", [
+    (False, False),   # complete listing without home: the anchor is gone
+    (True, True),     # truncated: home may simply be on a page we could not fetch
+], ids=["complete-listing", "truncated-listing"])
+def test_a_missing_home_chat_drops_authority_only_when_the_listing_is_complete(
+        monkeypatch, truncated, keeps_reach):
+    """The home chat is what establishes which line is ours. Without it nothing
+    proves a vouched room was ever on our line — but a page we could not read is
+    not proof it is gone."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_a", "line_1", ["+2"])],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_a" in a.chat_uids and a._may_approve("cht_a") is True and a.operator_key == "+1"
+
+    a._http_session = PagingSession({"/v1/chats": [_chat("cht_other", "line_9", ["+9"])]},
+                                    has_more=truncated)
+    asyncio.run(a._reconcile_once())
+    assert ("cht_a" in a.chat_uids) is keeps_reach
+    assert a._may_approve("cht_a") is keeps_reach
+    assert (a.operator_key == "+1") is keeps_reach

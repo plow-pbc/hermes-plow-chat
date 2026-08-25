@@ -210,7 +210,8 @@ welcome message from Hermes through the normal Plow message endpoint. Set
 
 ## Runtime behavior
 
-- `PLOW_CHAT_CHAT_UID` is the single Plow chat handled by this plugin instance.
+- `PLOW_CHAT_CHAT_UID` is the home chat — the one this plugin instance always
+  handles, and the only one unless the optional group layer below is enabled.
 - `PLOW_CHAT_TOKEN` stays in the profile's `.env` (scaffold `data/.env`, or
   `data/profiles/<name>/.env` for a named profile); do not commit it or log it.
 - The activation Bearer token is a user credential, not just a chat secret.
@@ -222,6 +223,48 @@ welcome message from Hermes through the normal Plow message endpoint. Set
   `plow_chat` pairing store so the first inbound message reaches Hermes.
 - Rich Markdown is flattened to plain text because the backing channel is
   iMessage/SMS-style.
+
+## Plow group chats (optional)
+
+**Off by default.** With `PLOW_CHAT_GROUP_UIDS` unset the adapter subscribes one
+chat, runs no poll, and behaves exactly as it did before this layer existed. Set
+it and Hermes joins group threads on its own line:
+
+```sh
+PLOW_CHAT_GROUP_UIDS=cht_owners=STR Owners,cht_cleaners=Cleaners
+```
+
+Each entry is `<cht_ id>=<display name>`. The Plow API carries no chat name, so
+the label is supplied here; it is what the agent sees and what a send resolves.
+
+**Discovery.** Nothing pushes chat creation — a ws ticket is per-chat and there
+is no webhook — so the adapter polls `GET /v1/chats` every 60s and adopts any
+chat on its own line. Add the Plow line to a thread from Messages and Hermes is
+listening within a minute, with no config change and no restart.
+
+**Reach is not authority.** Adopting a chat makes Hermes *hear* it. Its members
+can use Hermes' tools only if the chat is named in `PLOW_CHAT_GROUP_UIDS`, or the
+operator has spoken in it. Presence would not be enough on its own: an injected
+instruction can put the operator in a room with an attacker, but it cannot send a
+message *as* the operator, so speaking there is the one signal a model cannot
+manufacture.
+
+**Standing prompts.** What a group is *for* is declarative, so it lives in the
+plugin's config rather than the dotenv, keyed by display name:
+
+```yaml
+platforms:
+  plow_chat:
+    extra:
+      group_prompts:
+        STR Owners: |
+          The owners' thread. Operational candor is fine here.
+```
+
+It appends to the stay-quiet-unless-addressed policy rather than replacing it. A
+key naming no configured group is logged and skipped — on a fresh restore the
+dotenv half is still blank, and refusing to start there would break the recovery
+the tracked config exists to serve.
 
 ## Plow connectors (Gmail · Google Calendar · Slack)
 

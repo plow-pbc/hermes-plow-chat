@@ -23,6 +23,11 @@ optional_env:
     prompt: "Plow Chat base URL"
     secret: false
     password: false
+  - name: PLOW_CHAT_GROUP_UIDS
+    description: "Optional group chats, comma-separated `<cht_ id>=<display name>`. Unset disables the group layer entirely."
+    prompt: "Plow group chats"
+    secret: false
+    password: false
   - name: PLOW_CHAT_HOME_CHANNEL
     description: "Default delivery chat uid (defaults to PLOW_CHAT_CHAT_UID)"
     prompt: "Home chat uid"
