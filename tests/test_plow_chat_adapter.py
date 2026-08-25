@@ -1105,3 +1105,46 @@ def test_a_truncated_listing_evicts_only_what_it_positively_shows_off_line(
     asyncio.run(a._reconcile_once())
     assert ("cht_a" in a.chat_uids) is still_reachable
     assert a._may_approve("cht_a") is still_reachable
+
+
+def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, caplog):
+    """The ws ticket is a live credential and it travels in the URL.
+
+    aiohttp renders the whole request URL into the handshake error, so logging
+    that exception put a working ticket into the gateway log — once per retry,
+    on every backoff cycle of an outage. The status and reason stay, because
+    they are what make the failure diagnosable and they carry no secret.
+
+    The failure message below is the verbatim rendering aiohttp produced against
+    the live endpoint, reproduced rather than invented: the leak is a property
+    of how aiohttp stringifies its error, so a made-up message would stop
+    tracking the thing under test.
+    """
+    ticket = "tkt_live_value_do_not_log"
+    a = _adapter(monkeypatch)
+
+    def fail_handshake(url, **kwargs):
+        raise RuntimeError(
+            "403, message='Invalid response status', "
+            f"url='wss://api.plow.co/v1/ws?ticket={ticket}'"
+        )
+
+    a._http_session = types.SimpleNamespace(ws_connect=fail_handshake)
+
+    async def _mint(chat_uid):
+        return ticket
+
+    a._mint_ws_ticket = _mint
+
+    # One pass: stop the loop from inside the backoff it reaches after logging.
+    async def _sleep_once(_delay):
+        a._stop_event.set()
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep_once)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._websocket_loop("cht_home"))
+
+    assert "websocket loop error" in caplog.text, "the failure must still be reported"
+    assert ticket not in caplog.text, "the handshake error leaked a live ws ticket"
+    assert "403" in caplog.text, "the status is what makes this diagnosable"

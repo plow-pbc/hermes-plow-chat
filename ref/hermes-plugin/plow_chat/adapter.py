@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +52,25 @@ def _ws_url_for(base_url: str, ticket: str) -> str:
     parsed = urlparse(base_url)
     scheme = "wss" if parsed.scheme == "https" else "ws"
     return f"{scheme}://{parsed.netloc}/v1/ws?ticket={ticket}"
+
+
+# The ticket is a live credential and it travels in the URL above, which is the
+# one place it can reach a log: aiohttp renders the full request URL into
+# WSServerHandshakeError, so logging that exception writes the ticket out.
+# Measured against the real client — a refused handshake renders
+#   403, message='Invalid response status', url='wss://.../v1/ws?ticket=...'
+# while a DNS failure names only the host, so the leak is specific to the
+# handshake path rather than to error logging in general.
+_TICKET_IN_TEXT = re.compile(r"(ticket=)[^&\s'\"]+")
+
+
+def _redact_ticket(text: str) -> str:
+    """Mask any ws ticket that reached a string bound for a log.
+
+    Substitution rather than dropping the message: the status code and reason
+    are what make a handshake failure diagnosable, and they carry no secret.
+    """
+    return _TICKET_IN_TEXT.sub(r"\1<redacted>", text)
 
 
 def _flatten_message(content: str) -> str:
@@ -714,7 +734,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("[plow_chat] websocket loop error (%s): %s", chat_uid, exc)
+                logger.warning(
+                    "[plow_chat] websocket loop error (%s): %s",
+                    chat_uid,
+                    _redact_ticket("%s" % exc),
+                )
                 # Adapter-wide health follows the home chat only. With N sockets a
                 # shared flag tracks the worst chat, not reachability: one group
                 # deleted server-side would flap the adapter disconnected every
