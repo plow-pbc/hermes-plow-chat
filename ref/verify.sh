@@ -390,11 +390,19 @@ paths = [
 for path in paths:
     if not path.exists():
         continue
-    files = [path] if path.is_file() else [p for p in path.rglob('*') if p.is_file()]
+    files = [path] if path.is_file() else [
+        p for p in path.rglob('*')
+        # Build artifacts, not source. They mirror whatever the .py beside them
+        # says, so scanning them only ever double-reports that file.
+        if p.is_file() and '__pycache__' not in p.parts
+    ]
     for file in files:
-        text = file.read_text(errors='ignore')
-        if re.search(r'plow_[A-Za-z0-9_-]{16,}', text):
+        for m in re.finditer(r'plow_[A-Za-z0-9_-]{16,}', text := file.read_text(errors='ignore')):
+            # One exact exemption, not a token taxonomy: this is the tool's name.
+            if m.group(0) == 'plow_start_group_message':
+                continue
             bad.append(f'{file}: literal-looking session token')
+            break
         for m in re.finditer(r'Plow Activate: ([A-Z0-9]{5,})', text):
             if m.group(1) != 'ABCDE':
                 bad.append(f'{file}: literal-looking activation code')

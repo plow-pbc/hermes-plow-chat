@@ -1,7 +1,10 @@
 import asyncio
+import json
 import importlib.util
+import io
 import logging
 import sys
+import urllib.error
 import types
 from pathlib import Path
 
@@ -373,7 +376,6 @@ class CapturingAdapter(adapter_mod.PlowChatAdapter):
         self.handled.append(event)
 
 
-
 def test_the_group_session_guard_is_always_set(monkeypatch):
     """Groups are the default, so the in-flight dispatch guard is not conditional.
     It has to agree with gateway config's `group_sessions_per_user: false`; one
@@ -690,6 +692,264 @@ def test_connect_always_opens_the_home_socket_and_starts_discovery(
     assert asyncio.run(go()) == (["cht_home"], True)
     assert polled == [1]
 
+
+
+def _live_tool(monkeypatch, *, result=None, raises=None, record=None):
+    """Publish a live adapter whose start_group_thread is stubbed.
+
+    The tool now goes through the adapter's own seam, so there is no standalone
+    POST to patch: a disconnected gateway cannot send at all.
+    """
+    a = _adapter(monkeypatch)
+
+    async def stub(thread_handle, body):
+        if record is not None:
+            record.append((thread_handle, body))
+        if raises is not None:
+            raise raises
+        return dict(result or {})
+
+    a.start_group_thread = stub
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(adapter_mod, "_live", (a, loop))
+    import threading
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr(adapter_mod, "_LOOP_FOR_TEST", loop, raising=False)
+    return a, loop
+
+
+def test_group_message_dry_run_does_not_send(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("dry run must not reach the API"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi"}))
+    assert out["success"] is True and out["dry_run"] is True
+    assert out["would_send"]["recipient_count"] == 1
+
+
+def test_group_message_requires_confirm_to_send(monkeypatch):
+    """A caller that asked to send and forgot confirm must not read back as a
+    dry run it did not request."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("must not send without confirm"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False}))
+    assert out["success"] is False
+    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
+
+
+@pytest.mark.parametrize("recipients,message", [
+    ([], "at least one recipient"),
+    (["+1", "+1"], "duplicates"),
+    # The comma is the delimiter: one array element carrying two addresses would
+    # be approved as one recipient and delivered to two.
+    (["+15550001111,+15559999999"], "may not contain a comma"),
+])
+def test_group_message_rejects_bad_recipients(recipients, message):
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": recipients, "body": "hi"}))
+    assert out["success"] is False and message in out["error"]
+
+
+def test_group_message_reports_adoption_separately_from_delivery(monkeypatch):
+    """A thread nobody is listening to is the bug this tool shipped with, so
+    delivery must not read as reachability."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, result={
+        "chat_id": "cht_new", "message_id": "m1", "delivery_status": "sent",
+        "thread_handle": "+15550001111", "adoption": "not-on-this-agents-line"})
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is True
+    assert out["delivery_status"] == "sent"
+    assert out["adoption"] == "not-on-this-agents-line"
+
+
+@pytest.mark.parametrize("confirm", [False, "false", "no", "0", 0, None, "", "off"])
+def test_no_falsy_confirm_value_can_authorize_a_send(monkeypatch, confirm):
+    """bool("false") is True, and a model emits that string for a declared bool.
+    This is the only guard on the tool's one irreversible effect."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("must not send"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
+    assert out["success"] is False
+    assert "confirm" in out["error"]
+
+
+@pytest.mark.parametrize("dry_run", ["false", "no", "0", 0, "off"])
+def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(monkeypatch, dry_run):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    sent = []
+    _live_tool(monkeypatch, result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": dry_run, "confirm": True}))
+    assert out["success"] is True and "dry_run" not in out
+    assert len(sent) == 1
+
+
+class _TextResponse(FakeResponse):
+    """A response whose body is read with .text(), like the thread-creation POST."""
+
+    def __init__(self, text, status=200):
+        super().__init__(None, status)
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+
+class _PostRecordingSession(PagingSession):
+    """PagingSession plus an async post, for the thread-creation call.
+
+    start_group_thread opens its session with `async with`, so this doubles as an
+    async context manager returning itself.
+    """
+
+    def __init__(self, pages, body, status=200):
+        super().__init__(pages)
+        self.body = body
+        self.status = status
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        return _TextResponse(self.body, self.status)
+
+
+def test_start_group_thread_posts_the_documented_url_and_payload(monkeypatch):
+    """Pins the unversioned path. A live call to it returned 422 with a phone-number
+    complaint — a wrong path answers 404 — so /v1 here would be a regression. It also
+    pins that the call uses the adapter's own base URL and token."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    session = _PostRecordingSession(
+        {"/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_new", "line_1", ["+2"])]},
+        '{"chat_id":"cht_new","message_id":"m1","thread_handle":"+15550001111"}')
+    a._http_session = session
+    monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession",
+                        lambda *args, **kw: session, raising=False)
+
+    data = asyncio.run(a.start_group_thread("+15550001111", "hi"))
+    url, kwargs = session.posts[0]
+    assert url == "https://api.plow.co/channels/linq/send"
+    assert kwargs["json"] == {"thread_handle": "+15550001111", "text": "hi"}
+    assert kwargs["headers"] == {"Authorization": "Bearer token_test"}
+    assert data["adoption"] == "adopted"
+
+
+def test_a_created_thread_off_this_line_is_not_subscribed(monkeypatch):
+    """The tool must not bypass the home-line filter: a start-or-resume response
+    naming a sibling agent's thread would otherwise make this gateway listen there."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    session = _PostRecordingSession(
+        {"/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_sib", "line_2", ["+9"])]},
+        '{"chat_id":"cht_sib"}')
+    a._http_session = session
+    monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession",
+                        lambda *args, **kw: session, raising=False)
+
+    data = asyncio.run(a.start_group_thread("+15550001111", "hi"))
+    assert data["adoption"] == "not-on-this-agents-line"
+    assert "cht_sib" not in a.chat_uids
+def test_overlapping_reconciles_cannot_apply_out_of_order(monkeypatch):
+    """The 60s poll and the tool's post-send pass both reconcile. Interleaved, an
+    older /v1/chats snapshot applying second evicts a thread the newer one just
+    adopted — while the tool has already reported "adopted"."""
+    a = _adapter(monkeypatch, groups="cht_x=Other")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    order = []
+
+    class SlowSession(PagingSession):
+        def __init__(self, pages, tag):
+            super().__init__(pages)
+            self.tag = tag
+
+        def get(self, url, **kwargs):
+            order.append(f"{self.tag}:get")
+            return super().get(url, **kwargs)
+
+    stale = SlowSession({"/v1/chats": [_chat("cht_home", "line_1", ["+1"])]}, "stale")
+    fresh = SlowSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_new", "line_1", ["+2"])],
+        "/v1/chats/cht_new/messages": [],
+    }, "fresh")
+
+    async def go():
+        # Two passes racing: the fresh one adopts cht_new, the stale one would drop
+        # it. The lock makes the second see the first's result rather than a
+        # snapshot taken before it.
+        a._http_session = fresh
+        first = asyncio.create_task(a._reconcile_once())
+        await asyncio.sleep(0)
+        a._http_session = stale
+        second = asyncio.create_task(a._reconcile_once())
+        await asyncio.gather(first, second)
+
+    asyncio.run(go())
+    # Whichever ran second is authoritative, but they must not have interleaved:
+    # each pass's reads complete before the next begins.
+    assert order == ["fresh:get", "fresh:get", "stale:get"] or order[:2] == ["fresh:get", "fresh:get"]
+    assert a._reconcile_lock.locked() is False
+
+
+@pytest.mark.parametrize("junk", ["tru", "maybe"])
+def test_unparseable_dry_run_stays_a_dry_run(monkeypatch, junk):
+    """Unrecognised input must fall to the direction that does nothing, and for
+    dry_run that is True — otherwise a typo becomes the irreversible branch."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("must not send"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
+    assert out["success"] is True and out["dry_run"] is True
+
+
+@pytest.mark.parametrize("junk", ["tru", "maybe"])
+def test_unparseable_confirm_cannot_authorize(monkeypatch, junk):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("must not send"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": junk}))
+    assert out["success"] is False and "confirm" in out["error"]
+
+
+def test_the_schema_does_not_promise_adoption_it_cannot_guarantee():
+    """Delivery can succeed while adoption does not, so the description must send
+    the agent to the adoption field rather than asserting reachability."""
+    desc = adapter_mod.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
+    assert "ATTEMPTS" in desc
+    assert "adoption" in desc
+    assert "subscribes to the created thread immediately" not in desc
+
+
+
+
+@pytest.mark.parametrize("bad_entry", [
+    {"participants": [{"type": "agent", "line": {"uid": "line_1"}}]},   # no uid
+    {"uid": "cht_shapeless"},                                            # no participants
+    "not-even-a-dict",
+], ids=["no-uid", "no-participants", "not-a-dict"])
+def test_one_malformed_listing_entry_never_aborts_the_sweep(monkeypatch, bad_entry):
+    """Each recurs every 60s for as long as it stays in the listing, and surfaces
+    only as a generic reconcile failure — so one bad entry must cost one chat."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), bad_entry,
+                      _chat("cht_good", "line_1", ["+2"])],
+        "/v1/chats/cht_good/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_good" in a.chat_uids
+    assert a.operator_key == "+1"
+
 def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
     a = _adapter(monkeypatch)
     a._websocket_loop = lambda uid: asyncio.sleep(0)
@@ -705,7 +965,6 @@ def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
     assert "cht_room" in a.chat_uids
     assert a._may_approve("cht_room") is False
 
-
 def test_adoption_log_distinguishes_a_configured_group_from_a_discovered_one(monkeypatch, caplog):
     """Telling an operator to configure a group they already configured sends them
     chasing a no-op."""
@@ -718,7 +977,6 @@ def test_adoption_log_distinguishes_a_configured_group_from_a_discovered_one(mon
     caplog.clear()
     asyncio.run(a.adopt_chat("cht_stranger"))
     assert "add 'cht_stranger=<display name>'" in caplog.text
-
 
 @pytest.mark.parametrize("history_explodes", [False, True],
                          ids=["clean-poll", "history-read-fails"])
@@ -767,8 +1025,6 @@ def test_a_chat_that_leaves_our_line_loses_socket_reach_and_vouch(monkeypatch, h
     assert cancelled == ["cht_room"]              # ...and actually cancelled
     assert a._may_approve("cht_room") is False    # vouch discarded with the room
 
-
-
 @pytest.mark.parametrize("truncated,keeps_reach", [
     (False, False),   # complete listing without home: the anchor is gone
     (True, True),     # truncated: home may simply be on a page we could not fetch
@@ -792,3 +1048,60 @@ def test_a_missing_home_chat_drops_authority_only_when_the_listing_is_complete(
     assert ("cht_a" in a.chat_uids) is keeps_reach
     assert a._may_approve("cht_a") is keeps_reach
     assert (a.operator_key == "+1") is keeps_reach
+
+
+def test_a_failure_with_no_response_is_reported_as_unknown_not_failed(monkeypatch):
+    """A timeout says nothing about whether Plow committed the POST. Calling that
+    an ordinary failure invites a retry that texts real phones twice."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+
+    _live_tool(monkeypatch, raises=TimeoutError("timed out"))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False
+    assert out["delivery_unknown"] is True
+    assert "Do NOT retry" in out["error"]
+
+@pytest.mark.parametrize("code,ambiguous", [
+    (422, False),   # Plow itself declining: definitive, retry is safe
+    (400, False),
+    (502, True),    # a proxy speaking, possibly after Plow already accepted
+    (504, True),
+], ids=["422-definitive", "400-definitive", "502-ambiguous", "504-ambiguous"])
+def test_only_a_4xx_is_a_definitive_failure(monkeypatch, code, ambiguous):
+    """A 5xx is usually a gateway, not Plow, and can arrive after the POST was
+    committed — so it says as little about delivery as a timeout does."""
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+
+    _live_tool(monkeypatch, raises=adapter_mod._PlowSendError(code, '{"detail":"x"}'))
+    out = json.loads(adapter_mod._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False and out["status"] == code
+    assert out.get("delivery_unknown", False) is ambiguous
+    assert ("Do NOT retry" in out["error"]) is ambiguous
+
+
+@pytest.mark.parametrize("second_page,still_reachable", [
+    ([], True),                       # absent from a partial page: unproven, retained
+    ([("cht_a", "line_2")], False),   # visible on it, off our line: proven, evicted
+], ids=["absent-retained", "visible-off-line-evicted"])
+def test_a_truncated_listing_evicts_only_what_it_positively_shows_off_line(
+        monkeypatch, second_page, still_reachable):
+    """A page we cannot fully read must not read as "these chats are gone". But a
+    chat visible ON that page and not on our line has been positively classified —
+    retaining it keeps dispatching a sibling's room."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_a", "line_1", ["+2"])],
+    })
+    asyncio.run(a._reconcile_once())
+    assert "cht_a" in a.chat_uids
+
+    a._http_session = PagingSession(
+        {"/v1/chats": [_chat("cht_home", "line_1", ["+1"])]
+                      + [_chat(uid, line, ["+9"]) for uid, line in second_page]},
+        has_more=True)
+    asyncio.run(a._reconcile_once())
+    assert ("cht_a" in a.chat_uids) is still_reachable
+    assert a._may_approve("cht_a") is still_reachable

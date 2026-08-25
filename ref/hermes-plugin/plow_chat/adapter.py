@@ -10,9 +10,12 @@ against the exact Hermes version they run.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -24,10 +27,6 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 DEFAULT_BASE_URL = "https://api.plow.co"
 MAX_MESSAGE_LENGTH = 4_000
 DEFAULT_WELCOME_MESSAGE = "Hi — Plow Chat is connected to Hermes now. Reply here to start chatting."
-
-
-def _truthy(value: str | None) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _base_url_from_env_or_config(config) -> str:
@@ -83,6 +82,15 @@ except ImportError:
     logger.warning("[plow_chat] gateway.response_filters.SILENT_REPLY_TOKEN not "
                    "importable; group silence falls back to %r", SILENT_REPLY_TOKEN)
 
+class _PlowSendError(Exception):
+    """An HTTP error from the thread-creation POST, carrying the status."""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
 GROUP_POLICY = (
     "This is a shared group chat. Respond only when you reasonably infer, "
     "as a human participant would, that Hermes is directly or contextually "
@@ -94,6 +102,12 @@ GROUP_POLICY = (
 # call a minute against a list that changes a few times a year; the cost of
 # shortening it is quota, of lengthening it somebody repeating themselves.
 RECONCILE_SECONDS = 60
+
+# The connected adapter and the loop its listener tasks run on. The group-message
+# tool handler is synchronous, and the registry's sync->async bridge hands a
+# coroutine a throwaway loop on a throwaway thread — a task created there dies
+# with the handler. Adoption hops back to this loop instead.
+_live: "tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None" = None
 
 
 def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
@@ -240,6 +254,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._reconcile_task: Optional[asyncio.Task] = None
         self._seen_message_uids: set[str] = set()
         self._stop_event = asyncio.Event()
+        # The 60s poll and the tool's post-send pass both reconcile. Without this
+        # they interleave, and an older /v1/chats snapshot applying second evicts a
+        # thread the newer one just adopted — while the tool has already reported
+        # "adopted", so replies are silently missed until the next poll.
+        self._reconcile_lock = asyncio.Lock()
         self._welcome_sent = False
         # Half of the shared-group-session setting, and the smaller half: this one
         # is the adapter's in-flight dispatch guard. The key the session is
@@ -287,11 +306,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         # earned — and the operator may have changed while the adapter was
         # offline. The poll below re-earns both before any group socket exists.
         await self._reset_poll_state()
+        # Published after the teardown, so a concurrent tool call cannot adopt a
+        # chat into an adapter that is mid-rebuild.
+        global _live
+        _live = (self, asyncio.get_running_loop())
         self._http_session = aiohttp.ClientSession()
         self._stop_event.clear()
         # One socket per chat: a ws ticket is scoped to a single chat, so reach is
-        # the number of sockets. On a reconnect chat_uids already carries the
-        # groups the poll validated onto this line, and they need sockets too.
+        # the number of sockets. Reach is {home} at this point on every path — the
+        # poll below is what adds the rest, and it adds their sockets with them.
         self._ws_tasks = {
             uid: asyncio.create_task(self._websocket_loop(uid)) for uid in self.chat_uids
         }
@@ -306,12 +329,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         return True
 
     async def _teardown(self) -> None:
-        """Stop every listener and release the session.
+        """Stop every listener, unpublish the adapter, and release the session.
+
+        `_live` is cleared HERE rather than in disconnect(), because reconnect
+        tears down too: leaving the adapter published across a teardown lets a
+        concurrent tool call adopt a thread onto listeners that are being
+        cancelled, and report `adopted` for a subscription that will not exist.
 
         Shared with the reconnect path, which has to do exactly this before it
         rebuilds — otherwise it orphans the old listeners while `chat_uids` still
         claims their chats, and `adopt_chat` then declines to recreate them.
         """
+        global _live
+        _live = None
         self._stop_event.set()
         tasks = [*self._ws_tasks.values(), *filter(None, [self._reconcile_task])]
         for task in tasks:
@@ -379,6 +409,48 @@ class PlowChatAdapter(BasePlatformAdapter):
         finally:
             if close_session:
                 await session.close()
+
+    async def start_group_thread(self, thread_handle: str, body: str) -> dict:
+        """POST a new Plow/Linq thread, then reconcile so we listen to it.
+
+        On the adapter, and on its loop, so it uses the same base URL, token and
+        session as every other call — a standalone path here would send this one
+        request to production while a staging install's every other call went to
+        `extra.base_url`, with a live token.
+
+        Reconciles rather than adopting the returned id directly: the poll applies
+        the home-line filter, so a response naming a sibling agent's thread cannot
+        make this gateway listen there.
+        """
+        import aiohttp
+
+        # Unversioned on purpose. Every *documented* Plow endpoint is under /v1 and
+        # the docs describe no thread-creation call at all — but this one exists
+        # and routes: a live call reached it and came back 422 with a semantic
+        # complaint about the phone number, which a wrong path answers 404. Do not
+        # "correct" it to /v1 without a 2xx from the versioned path.
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{self.base_url}/channels/linq/send",
+                json={"thread_handle": thread_handle, "text": body},
+                headers={"Authorization": f"Bearer {self.token}"},
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                data = json.loads(text or "{}")
+
+        chat_id = data.get("chat_id")
+        if not chat_id:
+            data["adoption"] = "no-chat-id-in-response"
+            return data
+        try:
+            await self._reconcile_once()
+        except Exception as exc:
+            data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
+            return data
+        data["adoption"] = "adopted" if chat_id in self.chat_uids else "not-on-this-agents-line"
+        return data
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Plow Chat currently exposes no typing endpoint.
@@ -481,113 +553,114 @@ class PlowChatAdapter(BasePlatformAdapter):
         return True
 
     async def _reconcile_once(self) -> None:
-        # Classified once, before anything indexes it. Reading chat["uid"] across
-        # the whole listing to find home would abort the sweep on one entry
-        # missing the field — the very failure this loop is hardened against.
-        listing = await self._page_full("/v1/chats")
-        chats = []
-        for chat in listing["data"]:
-            if isinstance(chat, dict) and chat.get("uid"):
-                chats.append(chat)
-            else:
-                logger.warning("[plow_chat] skipping listing entry with no uid")
-        home = [chat for chat in chats if chat["uid"] == self.chat_uid]
-        if not home:
-            # The home chat anchors both halves of this: which line is ours, and who
-            # the operator is. Without it every chat on the account looks like one
-            # of ours, so we never *widen* reach here.
-            if listing.get("has_more"):
-                # It may simply be on a page we could not fetch. Carry on unchanged
-                # rather than tear down a working agent over an incomplete view.
-                logger.warning("[plow_chat] home chat %s not on this page; listing is "
-                               "truncated, so leaving reach as it is", self.chat_uid)
+        async with self._reconcile_lock:
+            # Classified once, before anything indexes it. Reading chat["uid"] across
+            # the whole listing to find home would abort the sweep on one entry
+            # missing the field — the very failure this loop is hardened against.
+            listing = await self._page_full("/v1/chats")
+            chats = []
+            for chat in listing["data"]:
+                if isinstance(chat, dict) and chat.get("uid"):
+                    chats.append(chat)
+                else:
+                    logger.warning("[plow_chat] skipping listing entry with no uid")
+            home = [chat for chat in chats if chat["uid"] == self.chat_uid]
+            if not home:
+                # The home chat anchors both halves of this: which line is ours, and who
+                # the operator is. Without it every chat on the account looks like one
+                # of ours, so we never *widen* reach here.
+                if listing.get("has_more"):
+                    # It may simply be on a page we could not fetch. Carry on unchanged
+                    # rather than tear down a working agent over an incomplete view.
+                    logger.warning("[plow_chat] home chat %s not on this page; listing is "
+                                   "truncated, so leaving reach as it is", self.chat_uid)
+                    return
+                # A complete listing without it means the anchor is genuinely gone.
+                # Returning early used to leave every earned vouch and socket standing,
+                # so members kept gateway-wide pairing and tool authority with nothing
+                # establishing the line they were granted on.
+                logger.error("[plow_chat] home chat %s is absent from a complete listing; "
+                             "dropping all group reach and authority", self.chat_uid)
+                await self._reset_poll_state()
                 return
-            # A complete listing without it means the anchor is genuinely gone.
-            # Returning early used to leave every earned vouch and socket standing,
-            # so members kept gateway-wide pairing and tool authority with nothing
-            # establishing the line they were granted on.
-            logger.error("[plow_chat] home chat %s is absent from a complete listing; "
-                         "dropping all group reach and authority", self.chat_uid)
-            await self._reset_poll_state()
-            return
-        # GET /v1/chats is user-wide — the token is a user credential — so the home
-        # chat's line is what says which of these threads are ours to answer in.
-        home_line = _agent_line(home[0])
-        # One odd chat must cost one chat, not the sweep. _agent_line returns None
-        # for anything it cannot classify; letting that raise inside the
-        # comprehension would abort discovery for the life of the process, and the
-        # symptom — one thread silently never answering — reads like anything else.
-        mine = []
-        for chat in chats:
-            line = _agent_line(chat)
-            if line is None:
-                logger.warning("[plow_chat] skipping unclassifiable chat %s",
-                               chat.get("uid", "<no uid>"))
-            elif line == home_line:
-                mine.append(chat)
-        # Positional, so pin the shape rather than guess. operator_key is the sole
-        # credential that grants tool authority to a room; picking arbitrarily out
-        # of a multi-member home chat is a silent authority escalation.
-        home_members = _members(home[0])
-        # None when the home chat is ambiguous: choosing positionally out of several
-        # members would let an arbitrary participant vouch rooms.
-        next_operator = home_members[0]["provider_key"] if len(home_members) == 1 else None
-        if next_operator != self.operator_key or not self._operator_resolved:
-            self._operator_resolved = True
-            # Grants do not outlive the identity that made them. `authorized` only
-            # ever grows, so clearing the key alone left rooms vouched by an
-            # identity that no longer holds — members kept tool authority and
-            # pairing approval from an operator that is gone. Configured groups
-            # keep theirs: that authority comes from the dotenv plus the line
-            # check, never from the operator.
-            revoked = set(self.operator_vouched)
-            self.operator_vouched.clear()
-            if revoked:
-                logger.warning("[plow_chat] operator identity changed; revoked "
-                               "operator-vouched authority for %s", sorted(revoked))
-            self.operator_key = next_operator
-            if next_operator is None:
-                logger.error("[plow_chat] home chat has %d member participants, expected 1; "
-                             "operator cleared, so operator-derived authorization is off",
-                             len(home_members))
-        # Reach is settled FIRST, before any vouch hydration. The hydration below
-        # does network reads that can fail, and a failure there used to abort the
-        # pass before removal ever ran — so a departed room kept its socket and its
-        # authority because reading some *other* room's history timed out.
-        wanted = {chat["uid"] for chat in mine}
-        if listing.get("has_more"):
-            # Only the ids this page could not speak to. A chat that IS on this page
-            # and not on our line has been positively classified as a sibling's —
-            # unioning it back would keep dispatching a room we can see is not ours.
-            # Absent from the page is the only case where "gone" is unproven.
-            visible = {chat["uid"] for chat in chats}
-            wanted |= self.chat_uids - visible
-        await self._set_reach(wanted)
+            # GET /v1/chats is user-wide — the token is a user credential — so the home
+            # chat's line is what says which of these threads are ours to answer in.
+            home_line = _agent_line(home[0])
+            # One odd chat must cost one chat, not the sweep. _agent_line returns None
+            # for anything it cannot classify; letting that raise inside the
+            # comprehension would abort discovery for the life of the process, and the
+            # symptom — one thread silently never answering — reads like anything else.
+            mine = []
+            for chat in chats:
+                line = _agent_line(chat)
+                if line is None:
+                    logger.warning("[plow_chat] skipping unclassifiable chat %s",
+                                   chat.get("uid", "<no uid>"))
+                elif line == home_line:
+                    mine.append(chat)
+            # Positional, so pin the shape rather than guess. operator_key is the sole
+            # credential that grants tool authority to a room; picking arbitrarily out
+            # of a multi-member home chat is a silent authority escalation.
+            home_members = _members(home[0])
+            # None when the home chat is ambiguous: choosing positionally out of several
+            # members would let an arbitrary participant vouch rooms.
+            next_operator = home_members[0]["provider_key"] if len(home_members) == 1 else None
+            if next_operator != self.operator_key or not self._operator_resolved:
+                self._operator_resolved = True
+                # Grants do not outlive the identity that made them. `authorized` only
+                # ever grows, so clearing the key alone left rooms vouched by an
+                # identity that no longer holds — members kept tool authority and
+                # pairing approval from an operator that is gone. Configured groups
+                # keep theirs: that authority comes from the dotenv plus the line
+                # check, never from the operator.
+                revoked = set(self.operator_vouched)
+                self.operator_vouched.clear()
+                if revoked:
+                    logger.warning("[plow_chat] operator identity changed; revoked "
+                                   "operator-vouched authority for %s", sorted(revoked))
+                self.operator_key = next_operator
+                if next_operator is None:
+                    logger.error("[plow_chat] home chat has %d member participants, expected 1; "
+                                 "operator cleared, so operator-derived authorization is off",
+                                 len(home_members))
+            # Reach is settled FIRST, before any vouch hydration. The hydration below
+            # does network reads that can fail, and a failure there used to abort the
+            # pass before removal ever ran — so a departed room kept its socket and its
+            # authority because reading some *other* room's history timed out.
+            wanted = {chat["uid"] for chat in mine}
+            if listing.get("has_more"):
+                # Only the ids this page could not speak to. A chat that IS on this page
+                # and not on our line has been positively classified as a sibling's —
+                # unioning it back would keep dispatching a room we can see is not ours.
+                # Absent from the page is the only case where "gone" is unproven.
+                visible = {chat["uid"] for chat in chats}
+                wanted |= self.chat_uids - visible
+            await self._set_reach(wanted)
 
-        # Now hydrate authority for what survived. A revoked room is no longer in
-        # operator_vouched, so this re-reads its history against the new identity
-        # and re-earns the vouch in the same pass when the new operator has in fact
-        # spoken there.
-        for chat_uid in sorted(self.chat_uids):
-            # A configured group needs no vouch: being in chat_uids means the line
-            # check passed, and that plus self.groups *is* its authority.
-            if (chat_uid == self.chat_uid or chat_uid in self.groups
-                    or chat_uid in self.operator_vouched):
-                continue
-            # Decided every pass until earned. A vouch that landed while the socket
-            # was down reached no frame handler, so a room the operator spoke in
-            # would otherwise stay behind the gate for the life of the process.
-            if any(self._is_operator(msg.get("sender") or {})
-                   for msg in await self._page(f"/v1/chats/{chat_uid}/messages")
-                   if isinstance(msg, dict) and msg.get("direction") == "inbound"):
-                self.operator_vouched.add(chat_uid)
-        # A configured id we never saw on our line is a stale or mistyped dotenv
-        # entry naming a sibling agent's chat. Say so rather than silently never
-        # joining a group the operator believes is configured.
-        stranded = sorted(set(self.groups) - {chat["uid"] for chat in mine})
-        if stranded:
-            logger.warning("[plow_chat] configured group(s) not on this agent's line, "
-                           "so not joined: %s", stranded)
+            # Now hydrate authority for what survived. A revoked room is no longer in
+            # operator_vouched, so this re-reads its history against the new identity
+            # and re-earns the vouch in the same pass when the new operator has in fact
+            # spoken there.
+            for chat_uid in sorted(self.chat_uids):
+                # A configured group needs no vouch: being in chat_uids means the line
+                # check passed, and that plus self.groups *is* its authority.
+                if (chat_uid == self.chat_uid or chat_uid in self.groups
+                        or chat_uid in self.operator_vouched):
+                    continue
+                # Decided every pass until earned. A vouch that landed while the socket
+                # was down reached no frame handler, so a room the operator spoke in
+                # would otherwise stay behind the gate for the life of the process.
+                if any(self._is_operator(msg.get("sender") or {})
+                       for msg in await self._page(f"/v1/chats/{chat_uid}/messages")
+                       if isinstance(msg, dict) and msg.get("direction") == "inbound"):
+                    self.operator_vouched.add(chat_uid)
+            # A configured id we never saw on our line is a stale or mistyped dotenv
+            # entry naming a sibling agent's chat. Say so rather than silently never
+            # joining a group the operator believes is configured.
+            stranded = sorted(set(self.groups) - {chat["uid"] for chat in mine})
+            if stranded:
+                logger.warning("[plow_chat] configured group(s) not on this agent's line, "
+                               "so not joined: %s", stranded)
 
     async def _reconcile(self) -> None:
         """Adopt the chats nobody configured — polled, because nothing pushes them.
@@ -832,6 +905,222 @@ class PlowChatAdapter(BasePlatformAdapter):
             logger.debug("[plow_chat] pairing auto-approval failed", exc_info=True)
 
 
+def _flag(value: Any, *, default: bool, safe: bool) -> bool:
+    """A tool argument read as a boolean, tolerating the strings models emit.
+
+    Absent means `default`. A real bool is itself. A recognised truthy or falsy
+    word is what it says. Anything else resolves to `safe` — the direction that
+    does nothing for *this* flag, which is not the same value for both: an
+    unrecognised `confirm` must not authorize a send (safe=False), and an
+    unrecognised `dry_run` must not become one (safe=True). Collapsing both to
+    False would make a typo in dry_run the irreversible direction.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return safe
+
+
+def _normalize_thread_handle(recipients: list[str] | None) -> str:
+    """Build the Plow/Linq recipient handle.
+
+    For a new iMessage group the handle is the comma-separated list of participant
+    addresses. The value is kept out of logs because phone numbers are PII.
+    """
+    cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
+    if not cleaned:
+        raise ValueError("Provide at least one recipient")
+    # The comma is the delimiter, so a recipient containing one is not a recipient
+    # — it is two, smuggled through as a single array element. The dry run would
+    # count it as one and report one, and the confirmed send would then reach an
+    # address the operator never approved. Reject rather than split: an element
+    # with a comma in it is malformed either way.
+    if any("," in r for r in cleaned):
+        raise ValueError("A recipient may not contain a comma — pass one address per entry")
+    if len(cleaned) != len(set(cleaned)):
+        raise ValueError("Recipients include duplicates")
+    return ",".join(cleaned)
+
+
+def _normalize_thread_handle(recipients: list[str] | None) -> str:
+    """Build the Plow/Linq recipient handle.
+
+    For a new iMessage group the handle is the comma-separated list of participant
+    addresses. The value is kept out of logs because phone numbers are PII.
+    """
+    cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
+    if not cleaned:
+        raise ValueError("Provide at least one recipient")
+    # The comma is the delimiter, so a recipient containing one is not a recipient
+    # — it is two, smuggled through as a single array element. The dry run would
+    # count it as one and report one, and the confirmed send would then reach an
+    # address the operator never approved. Reject rather than split: an element
+    # with a comma in it is malformed either way.
+    if any("," in r for r in cleaned):
+        raise ValueError("A recipient may not contain a comma — pass one address per entry")
+    if len(cleaned) != len(set(cleaned)):
+        raise ValueError("Recipients include duplicates")
+    return ",".join(cleaned)
+
+
+def _linq_base_url() -> str:
+    """The same base URL the adapter itself resolved, when one is connected.
+
+    Reading only the environment would send this one call to production while a
+    staging install's every other call went to `extra.base_url` — with a live
+    token. The live adapter already holds the resolved value, so ask it.
+    """
+    if _live is not None:
+        return _live[0].base_url
+    return (os.getenv("PLOW_CHAT_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+
+
+def _post_linq_send(payload: dict, token: str) -> dict:
+    # Unversioned on purpose. Every *documented* Plow endpoint is under /v1, and
+    # the docs describe no thread-creation call at all — but this one exists and
+    # routes: a live call reached it and came back 422 with a semantic complaint
+    # ("Phone number must include country code"), which a wrong path answers 404.
+    # Do not "correct" it to /v1 without a 2xx from the versioned path.
+    req = urllib.request.Request(
+        f"{_linq_base_url()}/channels/linq/send",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace") or "{}")
+
+
+def _plow_start_group_message(args: dict, **_kwargs) -> str:
+    """Start or resume a Plow/iMessage thread by sending the first message.
+
+    Side-effect safe by default: dry_run=True returns the action summary without
+    calling the Plow API. The model must pass confirm=True and dry_run=False after
+    the user explicitly approves the recipients and body.
+    """
+    recipients = args.get("recipients") or []
+    body = (args.get("body") or "").strip()
+    # Both flags are coerced, not taken as-is. A model routinely emits the string
+    # "false" for a declared boolean, and bool("false") is True — so a raw read
+    # would let {"dry_run": false, "confirm": "false"} put a real message in front
+    # of model-chosen phone numbers while the model believed it had declined.
+    # This is the only guard on the tool's one irreversible effect.
+    dry_run = _flag(args.get("dry_run"), default=True, safe=True)
+    confirm = _flag(args.get("confirm"), default=False, safe=False)
+    try:
+        thread_handle = _normalize_thread_handle(recipients)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    if not body:
+        return json.dumps({"success": False, "error": "body is required"})
+    # A caller that asked to send and forgot confirm sent nothing, and must not
+    # read back as a dry run it did not request: "success": true on an unasked dry
+    # run is how the agent comes to report an undelivered message as sent.
+    if not dry_run and not confirm:
+        return json.dumps({"success": False,
+                           "error": "confirm=true is required to send; nothing was sent"})
+    if dry_run:
+        return json.dumps({
+            "success": True,
+            "dry_run": True,
+            "would_send": {
+                "recipient_count": len([r for r in recipients if str(r).strip()]),
+                "body": body,
+            },
+            "next_step": "Call again with dry_run=false and confirm=true only after "
+                         "explicit user approval.",
+        })
+
+    # The tool only exists on a running gateway, and a thread nobody can listen
+    # to is not worth creating — so there is no disconnected mode to maintain.
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    try:
+        data = asyncio.run_coroutine_threadsafe(
+            adapter.start_group_thread(thread_handle, body), loop).result(timeout=45)
+    except _PlowSendError as exc:
+        if exc.status >= 500:
+            # A 5xx is usually a proxy or gateway speaking, not Plow — it can
+            # arrive after Plow already committed the POST, so it says as little
+            # about delivery as a timeout does. Only a 4xx is Plow itself
+            # declining, and only that is safe to call a definitive failure.
+            return json.dumps({
+                "success": False,
+                "status": exc.status,
+                "delivery_unknown": True,
+                "error": f"{exc.detail} — a {exc.status} can arrive after the message "
+                         f"was accepted. Do NOT retry; check the thread.",
+            })
+        return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except Exception as exc:
+        # No answer. A timeout or dropped connection says nothing about whether
+        # Plow committed the POST, so reporting an ordinary failure invites a
+        # retry that sends the approved message twice to real phones. Name the
+        # ambiguity instead and refuse to imply it is safe to try again.
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"{exc} — the request failed without a response, so the message "
+                     f"may or may not have been sent. Do NOT retry; check the thread.",
+        })
+    # Reported rather than assumed: a thread nobody is listening to is the bug this
+    # tool shipped with, so delivery must not read as reachability.
+    return json.dumps({
+        "success": True,
+        "thread_handle": data.get("thread_handle"),
+        "message_id": data.get("message_id"),
+        "chat_id": data.get("chat_id"),
+        "delivery_status": data.get("delivery_status"),
+        "adoption": data.get("adoption"),
+    })
+
+
+PLOW_START_GROUP_MESSAGE_SCHEMA = {
+    "name": "plow_start_group_message",
+    "description": (
+        "Start a new Plow/iMessage group or DM by sending a message to phone "
+        "numbers/iMessage handles — one address per array entry. The gateway "
+        "ATTEMPTS to subscribe to the created thread; the result's `adoption` "
+        "field says whether it succeeded, and delivery can succeed while adoption "
+        "does not. Read `adoption` and tell the user plainly when it is anything "
+        "other than `adopted` — replies in that thread will not reach Hermes until "
+        "the next discovery poll, if ever. Defaults to dry-run; only send with "
+        "explicit user approval using dry_run=false and confirm=true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "recipients": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Phone numbers or iMessage email handles to include.",
+            },
+            "body": {"type": "string", "description": "Message text to send."},
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return what would be sent without sending.",
+                "default": True,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+        },
+        "required": ["recipients", "body"],
+        "additionalProperties": False,
+    },
+}
+
+
 def check_requirements() -> bool:
     try:
         import aiohttp  # noqa: F401
@@ -897,4 +1186,15 @@ def register(ctx):
             "You are chatting via Plow Chat over an iMessage/SMS-style thread. "
             "Use concise plain text. Avoid relying on rich markdown rendering."
         ),
+    )
+    # Registered unconditionally, like the platform itself: group chats are handled
+    # by default, so gating the tool that starts one on a config nobody has to set
+    # would leave it permanently unreachable on a stock install.
+    ctx.register_tool(
+        name="plow_start_group_message",
+        toolset="plow_chat",
+        schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
+        handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_CHAT_TOKEN")),
+        requires_env=["PLOW_CHAT_TOKEN"],
     )

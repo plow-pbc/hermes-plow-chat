@@ -252,10 +252,11 @@ cancelled and any authority it had earned goes with it.
 
 **Reach is not authority.** Adopting a chat makes Hermes *hear* it. Its members
 can use Hermes' tools only if the chat is named in `PLOW_CHAT_GROUP_UIDS`, or the
-operator has spoken in it. Presence would not be enough on its own: an injected
-instruction can put the operator in a room with an attacker, but it cannot send a
-message *as* the operator, so speaking there is the one signal a model cannot
-manufacture.
+operator has spoken in it. That matters because `plow_start_group_message` below
+lets the model open a thread with anyone it likes: without this split, an injected
+instruction could create a room and hand its occupants the runtime's whole tool
+surface. The model cannot send a message *as* the operator, so the operator
+speaking is the one signal it cannot manufacture.
 
 **Standing prompts.** What a group is *for* is declarative, so it lives in the
 plugin's config rather than the dotenv, keyed by display name:
@@ -273,6 +274,11 @@ It appends to the stay-quiet-unless-addressed policy rather than replacing it. A
 key naming no configured group is logged and skipped — on a fresh restore the
 dotenv half is still blank, and refusing to start there would break the recovery
 the tracked config exists to serve.
+
+**Starting a thread.** The plugin also registers a
+`plow_start_group_message` tool. It is dry-run by default and refuses to send
+without `confirm=true`, and it reports thread adoption separately from delivery —
+a message delivered into a thread nobody is subscribed to is not reachable.
 
 ## Plow connectors (Gmail · Google Calendar · Slack)
 
