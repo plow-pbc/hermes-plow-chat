@@ -461,8 +461,14 @@ def test_group_frame_carries_group_type_and_channel_prompt(monkeypatch):
     event = a.handled[0]
     assert event.source.chat_type == "group"
     assert event.source.chat_name == "Owners"
+    # The wiring, not just the helper: without this, dropping `sender` at the
+    # dispatch call site leaves the speaker fact out of production while every
+    # _speaker_line unit test stays green. Ordering is asserted too, because the
+    # docstring claims the per-turn fact sits last, closest to the message.
+    speaker = adapter_mod._speaker_line({"uid": "u1", "display_name": "Sam"})
     assert event.channel_prompt.startswith(adapter_mod.GROUP_POLICY)
-    assert "Be candid." in event.channel_prompt
+    assert speaker in event.channel_prompt
+    assert event.channel_prompt.index("Be candid.") < event.channel_prompt.index(speaker)
     assert event.source.role_authorized is True
 
 
