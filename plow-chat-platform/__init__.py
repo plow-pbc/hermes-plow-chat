@@ -20,8 +20,6 @@ import logging
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -975,55 +973,6 @@ def _normalize_thread_handle(recipients: list[str] | None) -> str:
     if len(cleaned) != len(set(cleaned)):
         raise ValueError("Recipients include duplicates")
     return ",".join(cleaned)
-
-
-def _normalize_thread_handle(recipients: list[str] | None) -> str:
-    """Build the Plow/Linq recipient handle.
-
-    For a new iMessage group the handle is the comma-separated list of participant
-    addresses. The value is kept out of logs because phone numbers are PII.
-    """
-    cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
-    if not cleaned:
-        raise ValueError("Provide at least one recipient")
-    # The comma is the delimiter, so a recipient containing one is not a recipient
-    # — it is two, smuggled through as a single array element. The dry run would
-    # count it as one and report one, and the confirmed send would then reach an
-    # address the operator never approved. Reject rather than split: an element
-    # with a comma in it is malformed either way.
-    if any("," in r for r in cleaned):
-        raise ValueError("A recipient may not contain a comma — pass one address per entry")
-    if len(cleaned) != len(set(cleaned)):
-        raise ValueError("Recipients include duplicates")
-    return ",".join(cleaned)
-
-
-def _linq_base_url() -> str:
-    """The same base URL the adapter itself resolved, when one is connected.
-
-    Reading only the environment would send this one call to production while a
-    staging install's every other call went to `extra.base_url` — with a live
-    token. The live adapter already holds the resolved value, so ask it.
-    """
-    if _live is not None:
-        return _live[0].base_url
-    return (os.getenv("PLOW_CHAT_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-
-
-def _post_linq_send(payload: dict, token: str) -> dict:
-    # Unversioned on purpose. Every *documented* Plow endpoint is under /v1, and
-    # the docs describe no thread-creation call at all — but this one exists and
-    # routes: a live call reached it and came back 422 with a semantic complaint
-    # ("Phone number must include country code"), which a wrong path answers 404.
-    # Do not "correct" it to /v1 without a 2xx from the versioned path.
-    req = urllib.request.Request(
-        f"{_linq_base_url()}/channels/linq/send",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace") or "{}")
 
 
 def _plow_start_group_message(args: dict, **_kwargs) -> str:
