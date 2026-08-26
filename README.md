@@ -17,7 +17,7 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 
 > **Ordering.** That contract needs `agent-mgr`'s `install-plugin` to install
 > this *directory*, which it does only from
-> [`plow-pbc/agent-mgr#5`](https://github.com/plow-pbc/agent-mgr/pull/5) onward.
+> [`plow-pbc/agent-mgr#10`](https://github.com/plow-pbc/agent-mgr/pull/10) onward.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
