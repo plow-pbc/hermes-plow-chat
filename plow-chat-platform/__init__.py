@@ -135,10 +135,14 @@ _DISCLOSURE = (
 # Claiming a relay that did not happen was a real regression on the OpenClaw
 # side: the agent said it had passed a message along, in a thread where everyone
 # had already received it, and there is no such tool.
+# Scoped to *this* message, not to sending in general: `plow_start_group_message`
+# genuinely sends, so an absolute rule would have the agent deny or misreport a
+# legitimate use of its own tool.
 _NO_RELAY = (
-    "You cannot relay or forward messages. Everyone here already received the "
-    "message you are reading. Never say you have passed something along, let "
-    "someone know, or sent a message — those would be false."
+    "Everyone here already received the message you are reading, so there is "
+    "nothing to relay or forward. Never say you have passed it along or let "
+    "someone know about it — that would be false. Reporting a message you "
+    "actually sent with a tool is a different thing, and stays truthful."
 )
 
 # Composed from named blocks so a test can assert which rules a turn carries
@@ -214,7 +218,16 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
 
 
 def _speaker_line(sender: dict) -> str:
-    """Who is talking, and whether they own this agent.
+    """Whether the speaker owns this agent — deliberately not who they are.
+
+    The name is already on the event as `source.user_name`, normalized once in
+    `_dispatch`. Repeating it here would be a second identity seam with its own
+    fallbacks, and it would put provider-supplied text into the channel prompt,
+    which the model weighs above the message body. Today only a handle could
+    arrive — Plow sets a participant's `display_name` to the handle because Linq
+    has no name field — but names are a planned addition, and this is the line
+    they would be injected into. So the prompt carries the fact and the event
+    carries the name.
 
     `role` is the Chat API's own answer (plow-pbc/plow#1381), resolved there
     against the account's canonical handle — so this does not re-derive
@@ -222,14 +235,13 @@ def _speaker_line(sender: dict) -> str:
     the roster spelling and the webhook payload. An absent `role` — an API
     predating the field — reads as not-owner: absent data must never elevate.
     """
-    who = sender.get("display_name") or sender.get("provider_key") or "someone"
     if sender.get("role") == "owner":
-        return f"The message below is from {who}, who owns this agent."
-    return (f"The message below is from {who}, who is a member of this chat and "
-            "does not own this agent.")
+        return "The message below is from the owner of this agent."
+    return ("The message below is from a member of this chat who does not own "
+            "this agent.")
 
 
-def _channel_prompt(group: dict | None, sender: dict | None = None) -> str:
+def _channel_prompt(group: dict | None, sender: dict) -> str:
     """GROUP_POLICY always leads; a configured group's prompt appends, never replaces.
 
     An adopted chat has no configured prompt, so it gets the bare policy — it is a
@@ -242,8 +254,7 @@ def _channel_prompt(group: dict | None, sender: dict | None = None) -> str:
     parts = [GROUP_POLICY]
     if group is not None and group["prompt"]:
         parts.append(group["prompt"])
-    if sender is not None:
-        parts.append(_speaker_line(sender))
+    parts.append(_speaker_line(sender))
     return "\n\n".join(parts)
 
 
