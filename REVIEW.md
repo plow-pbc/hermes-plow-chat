@@ -1,4 +1,4 @@
-# Review instructions — seed-hermes-plow
+# Review instructions — hermes-plow-chat
 
 Repo-specific reviewer policy. The universal voice posture (Broken-Glass,
 pro-simplification, and the don't-propose list) is supplied by the reviewers
@@ -9,37 +9,37 @@ themselves and is deliberately not restated here.
 Pre-PMF, fewer than 10 users, often a single operator. Iteration speed beats
 hardening for scale: prefer loud failures to fallbacks, pragmatic DRY
 architecture to defensive layering, and don't guard edge cases that can't
-trigger at this scale. The SEED prose IS the contract; a handled edge case the
-spec never asked for is a cost, not a feature.
+trigger at this scale.
+
+## What this repo is
+
+**One Hermes platform plugin, and it is production.** `plow-chat-platform/` is
+installed verbatim into every agent in the fleet by `plow-pbc/agent-mgr`, which
+pins this repo by SHA. There is no reference/product distinction here any more —
+this repo used to be a SEED, where `ref/` code was explicitly a single-operator
+reference realization of a prose spec. That framing is retired along with the
+`ref/` layout. The adapter is the shipped artifact.
+
+`just test` is the gate. `README.md` is the only prose contract.
 
 ## Review priority
 
-**Stage:** A SEED-convention repo (see the `seed` repo's `SEED.md`). The
-authoritative artifact is the **prose spec** — `SEED.md` + `README.md`. Any
-`ref/` code is a single-operator *reference realization* of that prose, not a
-product or distribution target.
-
-**Authoritative checklists:** `ref/skills/seed-audit/audit-base.md` +
-`audit-malicious.md` in `plow-pbc/seed` — the contrast pairs below are the
-PR-relevant distillation; edit there first, re-distill here.
-
-`ref/verify.sh` must stay green; the authoritative prompts are in
-`SEED.md` `## Verify`.
-
-**Repo-specific contrast pairs:**
-
-| SEED-convention DON'T (suppress / flag-as-shape) | SEED-convention DO (real finding) |
+| DON'T (suppress / flag-as-shape) | DO (real finding) |
 |---|---|
-| Flag `ref/` code for missing abstractions, scale-hardening, extra flags, or defensive edge cases. `ref/` is a single-operator reference impl, not a product. | Flag a `ref/` change that breaks `ref/verify.sh` or makes a prose `## Verify` prompt no longer pass. |
-| Treat prose-only edits (Objects/Actions wording) as low-value churn. | Flag **prose↔ref drift**: `ref/scripts/install_direct_mount.sh` diverging from `## Dependencies`, or `verify.sh` behavior diverging from the `## Verify` prompts — the canonical SEED regression. |
-| Suggest "approve all" / batched shell to speed an install script. | Flag any `ref/` install/verify shell that **batches or auto-approves** — violates `tier-2` per-block confirm (`^act-trust`). |
-| — | Flag any **literal secret** in `SEED.md`/`README.md`, or a probe that surfaces secret values (`env`/`printenv`, `cat` of credential files, `git remote -v`, `docker compose config`) — `^act-author-secrets` / `^act-author-probes`. Presence/name-only probes are the conforming form. |
-| — | Flag a clone URL (in spec text or `ref/` shell) carrying **userinfo / query / fragment** — `^act-install-clone-url` argv-leakage rule. |
-| — | Flag **grammar violations**: a non-conforming H2; out-of-order H2s; a `# Purpose` body that is anything other than the single `README#Purpose` wikilink; a sub-SEED re-declaring `## Normative Language`; shell smuggled into `## Objects` / `## Actions`; or state-mutating instructions added to `## Verify` (authoring-read-only). |
-| Demand prose for a heavy install path. | Flag a heavy install (material disk / runtime / paid API) that does not surface cost to the user as `tier-3`. |
-| — | If the PR touches the **feedback protocol**, flag any payload that adds PII or a free-form body, or that fires outside clone-mode + root-only + the one-time consent banner (`^act-feedback`). |
+| Demand scale-hardening, extra flags, or defensive edge cases for a three-agent fleet. | Flag anything that can leave a **running agent with no working phone line** — a partial install, an unhandled reconnect path, a config the gateway reads only at boot. |
+| Re-flag the missing checkpoint / history backfill. | Flag a **new** silent-loss path: an inbound message that can be dropped without a log line. |
+| Treat README wording edits as churn. | Flag **README↔code drift** on the env-var contract in particular. `plugin.yaml` is the authority; the README table is a summary and the two must agree. |
+| — | Flag any **literal secret**, or a probe that surfaces secret values (`env`/`printenv`, `cat` of credential files). This adapter holds the chat token. |
+| — | Flag a change that alters the **plugin id** `plow-chat-platform`, or the installed file set, without a matching change in `agent-mgr`. Every agent's `config.yaml` names that id, and `agent-mgr`'s installer names that directory. |
+| — | Flag **echoing a ticket, token or full frame** into logs. The ws ticket is single-use and short-lived, which is not the same as harmless. |
 
 ## Product context
 
-**This repo's `ref/` payload:** Python Hermes platform adapter plugin
-(`plow_chat`) plus bash install/verify scripts under `ref/`.
+A Python Hermes platform adapter (`plow_chat`) plus its manifest. The suite
+stubs the `gateway.*` modules Hermes supplies at runtime, so it needs no Hermes
+install and touches no network.
+
+There is a **second implementation of this same plugin id** in `plow-pbc/plow`
+(`cloud-agents/hermes/plugins/plow_chat/`), serving Plow's multi-tenant cloud
+agents with a different env contract. Convergence is the goal; a PR here that
+narrows or widens the gap should say which it does.
