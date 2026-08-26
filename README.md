@@ -1,317 +1,104 @@
-# seed-hermes-plow — Plow on Hermes
+# hermes-plow-chat
 
-## Purpose
+The **Plow Chat platform plugin for Hermes** — an agent's phone line. Inbound
+arrives over a WebSocket the plugin dials out on; outbound and cron delivery go
+back through the chat REST API.
 
-This seed runs **Plow on Hermes**. It bundles two capabilities for a
-Docker-backed Hermes Agent:
-
-1. the **`plow_chat` messaging gateway** — REST + WSS to the Plow Chat API, so
-   the owner messages Hermes over their Plow line (specified below); and
-2. the **`plow-connectors` skill** — lets the agent use the owner's
-   Plow-connected **Gmail, Google Calendar, and Slack** accounts with the same
-   credentials, no separate setup (see *Plow connectors* near the end).
-
-It is the superset "Plow capabilities on Hermes" seed. The rest of this document
-specifies the messaging gateway.
-
-This SEED provides the Hermes gateway platform plugin named `plow_chat`. It
-wires Hermes to the [Plow Chat](https://github.com/plow-pbc/seed-plow-chat)
-API: Hermes sends replies through `POST /v1/chats/{chat_uid}/messages` and
-receives user replies from Plow's WebSocket stream.
-
-The target install model is direct mount into a seed-hermes Docker scaffold.
-The host places this repository's plugin files under
-`./hermes-agent/data/plugins/plow-chat-platform/`, pre-enables the manifest name
-in `./hermes-agent/data/config.yaml`, writes `PLOW_CHAT_*` to
-`./hermes-agent/data/.env`, and then starts the Hermes container. The host does
-not run `hermes plugins install`, clone git repositories, or depend on Python.
-
-## Required plugin files
-
-The mounted plugin directory must contain this exact file set:
-
-```text
-hermes-agent/data/plugins/plow-chat-platform/
-  plugin.yaml
-  __init__.py
-  ref/hermes-plugin/plow_chat/adapter.py
+```
+plugin.yaml     the manifest -- registers the platform id `plow-chat-platform`
+__init__.py     the adapter; Hermes loads a plugin from the directory root
+tests/          the adapter suite
 ```
 
-`plugin.yaml` is the manifest Hermes discovers. `__init__.py` loads
-`ref/hermes-plugin/plow_chat/adapter.py` and raises `ImportError` during boot if
-the adapter is missing, so preserving that layout is required.
+## Who consumes this
 
-## Direct-mount install
-
-From the parent folder that contains the seed-hermes scaffold at
-`./hermes-agent/`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/plow-pbc/seed-hermes-plow/main/ref/scripts/install_direct_mount.sh \
-  -o /tmp/install_plow_chat.sh
-bash /tmp/install_plow_chat.sh --scaffold ./hermes-agent
-```
-
-Pin a published source with `PLOW_CHAT_PLUGIN_REF=<branch-or-sha>`. When running
-from a local checkout, avoid network fetches by copying from the checkout:
-
-```bash
-PLOW_CHAT_PLUGIN_LOCAL_DIR=. ref/scripts/install_direct_mount.sh --scaffold ./hermes-agent
-```
-
-The resulting `hermes-agent/data/config.yaml` must include the manifest name:
-
-```yaml
-plugins:
-  enabled:
-    - plow-chat-platform
-  disabled: []
-terminal:
-  cwd: /opt/data/workspace
-```
-
-## Create and verify a Plow chat
-
-Use the curl-only host helper to start Plow activation with `provision_chat=true`,
-capture the returned session token and chat uid after verification, and write
-`PLOW_CHAT_*` to the target profile's `.env` before first container boot:
-
-```bash
-# Default profile (writes hermes-agent/data/.env):
-ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent
-```
-
-### Per-profile activation
-
-A multi-profile install (e.g. an owner profile `daniel` plus a team-listener
-profile `daniel-team`) keeps each profile's credentials in its own env file
-under `data/profiles/<name>/.env`. Pass `--profile <name>` and the helper
-resolves the target automatically:
-
-```bash
-ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel
-ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel-team
-```
-
-`--profile <name>` is equivalent to `--data-dir ./hermes-agent/data/profiles/<name>`;
-use `--data-dir` directly when the profile lives outside the scaffold's
-`data/profiles/` tree. Run the helper once per profile before first boot.
-
-The script asks Plow to assign an available line and prints the instruction the
-user needs: `Text Plow Activate: ABCDE from iMessage to +1...`. It does not
-print the session token. It also writes a redacted `.activation.json` audit
-file (in the same profile dir) with the activation secret removed and only the
-token last four retained. Start Hermes with `docker compose up` after the
-script writes `.env`, so the container boots once with the Plow Chat platform
-enabled.
-
-### Confirming activation succeeded
-
-On success the helper prints a verification line naming the profile and the
-exact env file it wrote, so you can confirm Phase 4 worked without opening the
-file by hand:
-
-```text
-Verified: chat is active.
-Chat uid: cht_...
-Profile daniel activated. Wrote PLOW_CHAT_CHAT_UID + PLOW_CHAT_TOKEN to ./hermes-agent/data/profiles/daniel/.env.
-Wrote redacted activation audit to ./hermes-agent/data/profiles/daniel/.activation.json
-```
-
-The resulting profile `.env` contains these values (mode `600`):
-
-```bash
-PLOW_CHAT_BASE_URL=https://api.plow.co
-PLOW_CHAT_CHAT_UID=cht_<opaque-chat-id>      # the provisioned Plow chat uid
-PLOW_CHAT_TOKEN=<opaque-bearer-token>        # user Bearer credential — never commit/log
-PLOW_CHAT_HOME_CHANNEL=cht_<opaque-chat-id>  # same value as PLOW_CHAT_CHAT_UID
-```
-
-### If the activation code expires
-
-The displayed code is single-use and time-limited. If it expires, Plow's redeem
-endpoint returns HTTP 410; the helper detects this and exits non-zero (75)
-instead of surfacing a raw `curl: (22)` error. The guidance depends on *when*
-the 410 arrives:
-
-- **Immediately** (within ~90s of starting): the server handed back an
-  already-expired/deduped activation instead of a fresh code, so re-running
-  right away returns the *same* stale code and loops. Wait several minutes for
-  the line's activation to clear, then re-run.
-- **Later** (after you had time to text the code): a genuine expiry — just run
-  the same command again for a fresh code.
-
-### Up-front activation (one-shot installs)
-
-To make a parent umbrella install one-shot, the phone-bind MAY run up front in
-the operator's preflight prepare-script instead of mid-install. Pass
-`--env-file <path>` to write the verified `PLOW_CHAT_*` creds to exactly that
-file — typically the openseed inputs file — rather than a scaffold
-`data/.env` that does not exist yet (the scaffold is provisioned later, on the
-Pi). With `--env-file` the helper does not require a scaffold/data dir; it only
-ensures the file's parent directory is writable, and the `.activation.json`
-audit beside it is best-effort.
-
-```bash
-ref/scripts/create_plow_chat_curl.sh \
-  --env-file ~/.config/seed/seed-life-dashboard-hermes.env
-```
-
-### Placing already-obtained creds (`--from-env`)
-
-When the phone-bind already ran up front, place those creds into the on-Pi
-scaffold at install time with `--from-env`, which reads `PLOW_CHAT_TOKEN` and
-`PLOW_CHAT_CHAT_UID` from the environment (plus optional `PLOW_CHAT_BASE_URL`;
-the home channel is set to the chat uid) and skips the phone-bind dance entirely:
-
-```bash
-PLOW_CHAT_TOKEN=tok_xxx PLOW_CHAT_CHAT_UID=cht_xxx \
-  ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel --from-env
-```
-
-Unlike `--test-mode` below, this is a **real, supported** operator path: the
-creds come from an actual prior phone-bind. The audit records
-`"status": "preset"` (token last four only). If `PLOW_CHAT_TOKEN` or
-`PLOW_CHAT_CHAT_UID` is missing, the helper exits non-zero with an actionable
-error.
-
-### Non-interactive test mode (testing/CI only)
-
-Phase 4 normally requires a human texting the activation code from the target
-iPhone, which cannot complete in a headless DinD/CI environment. For test
-validation only, `--test-mode` skips the phone-bind dance and writes
-operator-supplied credentials straight to the profile `.env`:
-
-```bash
-ref/scripts/create_plow_chat_curl.sh --scaffold ./hermes-agent --profile daniel \
-  --test-mode --test-chat-uid cht_known --test-token tok_known
-```
-
-This is **not** a real activation — it never contacts Plow and the audit file
-records `"status": "test-mode"`. Never use it for a real operator install.
-
-The redeem request shape — the secret is piped via stdin, never argv — is:
-
-```bash
-printf '{"activation_secret":"%s"}' "$ACTIVATION_SECRET" | curl -sSL \
-  -H 'Content-Type: application/json' \
-  -d @- \
-  "https://api.plow.co/v1/auth/activate/redeem"
-```
-
-`create_plow_chat_curl.sh` runs the actual poll: it captures the HTTP status
-without aborting on non-2xx, so an expired `410` prints re-run guidance instead
-of an opaque `curl` transport error.
-
-If the adapter is connected when Plow emits `chat_active`, it sends exactly one
-welcome message from Hermes through the normal Plow message endpoint. Set
-`PLOW_CHAT_WELCOME_MESSAGE` to customize it or
-`PLOW_CHAT_AUTO_WELCOME=false` to disable it.
-
-## Runtime behavior
-
-- `PLOW_CHAT_CHAT_UID` is the home chat — the DM this plugin instance is bound
-  to. It is not the only chat handled: group threads on the same Plow line are
-  joined by default (see *Plow group chats* below).
-- `PLOW_CHAT_TOKEN` stays in the profile's `.env` (scaffold `data/.env`, or
-  `data/profiles/<name>/.env` for a named profile); do not commit it or log it.
-- The activation Bearer token is a user credential, not just a chat secret.
-  Keep the profile `.env` and `.activation.json` mode `600`.
-- The adapter sends the welcome on the first `chat_active` frame it sees.
-- Inbound WebSocket frames with `direction=outbound` are ignored so Hermes does
-  not answer itself.
-- The adapter best-effort approves verified Plow member ids in Hermes'
-  `plow_chat` pairing store so the first inbound message reaches Hermes.
-- Rich Markdown is flattened to plain text because the backing channel is
-  iMessage/SMS-style.
-
-## Plow group chats
-
-**On by default.** Add the agent's Plow line to a group thread from Messages and
-Hermes takes part — that is the opt-in, and it needs no configuration. It stays
-quiet unless addressed (see the policy below), and its members get no tool access
-until the room is vouched for.
-
-`PLOW_CHAT_GROUP_UIDS` is not an on/off switch. It names groups and authorizes
-their members:
+[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
+repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
 
 ```sh
-PLOW_CHAT_GROUP_UIDS=cht_owners=STR Owners,cht_cleaners=Cleaners
+agent-mgr install-plugin <name>     # or as part of `agent-mgr restore <name>`
 ```
 
-Each entry is `<cht_ id>=<display name>`. The Plow API carries no chat name, so
-the label is supplied here; it is what the agent sees and what a send resolves.
+It lands as two files in the agent's own home, and nothing else:
 
-**Discovery.** Nothing pushes chat creation — a ws ticket is per-chat and there
-is no webhook — so the adapter polls `GET /v1/chats` every 60s and adopts any
-chat on its own line. Add the Plow line to a thread from Messages and Hermes is
-listening within a minute, with no config change and no restart.
-
-A chat that leaves this agent's line is dropped the same way: its socket is
-cancelled and any authority it had earned goes with it.
-
-**Reach is not authority.** Adopting a chat makes Hermes *hear* it. Its members
-can use Hermes' tools only if the chat is named in `PLOW_CHAT_GROUP_UIDS`, or the
-operator has spoken in it. That matters because `plow_start_group_message` below
-lets the model open a thread with anyone it likes: without this split, an injected
-instruction could create a room and hand its occupants the runtime's whole tool
-surface. The model cannot send a message *as* the operator, so the operator
-speaking is the one signal it cannot manufacture.
-
-**Standing prompts.** What a group is *for* is declarative, so it lives in the
-plugin's config rather than the dotenv, keyed by display name:
-
-```yaml
-platforms:
-  plow_chat:
-    extra:
-      group_prompts:
-        STR Owners: |
-          The owners' thread. Operational candor is fine here.
+```
+~/.hermes-<name>/plugins/plow-chat-platform/
+  __init__.py
+  plugin.yaml
 ```
 
-It appends to the stay-quiet-unless-addressed policy rather than replacing it. A
-key naming no configured group is logged and skipped — on a fresh restore the
-dotenv half is still blank, and refusing to start there would break the recovery
-the tracked config exists to serve.
+**Pinned by SHA, never vendored.** A branch ref would silently re-point a running
+agent on the next push here, and this plugin holds the chat token. A vendored
+copy stops receiving fixes — `sams-admin-hermes-agent` proved that, carrying a
+v0.1.0 fork until it was archived.
 
-**Starting a thread.** The plugin also registers a
-`plow_start_group_message` tool. It is dry-run by default and refuses to send
-without `confirm=true`, and it reports thread adoption separately from delivery —
-a message delivered into a thread nobody is subscribed to is not reachable.
+## Configuration
 
-## Plow connectors (Gmail · Google Calendar · Slack)
+Read from the agent's own dotenv (`$AGENT_HOME/.env`), never from the image or a
+URL in git.
 
-Beyond messaging, this seed can give Hermes the owner's Plow-connected Google
-(Gmail + Google Calendar) and Slack accounts. The `plow-connectors` skill wraps
-the Plow connector REST API (`POST /v1/connectors/<connector>/<action>`, plus
-`GET .../status`) and reuses the gateway's existing `PLOW_CHAT_TOKEN` /
-`PLOW_CHAT_BASE_URL`, so there are no new credentials to manage.
+| var | required | meaning |
+|---|---|---|
+| `PLOW_CHAT_TOKEN` | yes | the session bearer token activation mints |
+| `PLOW_CHAT_CHAT_UID` | yes | the chat this agent serves, `cht_…` |
+| `PLOW_CHAT_BASE_URL` | no | API base, default `https://api.plow.co` |
+| `PLOW_CHAT_GROUP_UIDS` | no | group chats to join, `<cht_id>=<display name>`, comma-separated |
+| `PLOW_CHAT_HOME_CHANNEL` | no | delivery target for cron, defaults to `PLOW_CHAT_CHAT_UID` |
+| `PLOW_CHAT_WELCOME_MESSAGE` / `PLOW_CHAT_AUTO_WELCOME` | no | one-time message on `chat_active` |
+| `PLOW_CHAT_AUTO_APPROVE_PAIRING` | no | best-effort approval of verified Plow members |
 
-Install it into the scaffold (this does not start the container):
+`plugin.yaml` is the authority on this list; the table is a reader's summary.
 
-```bash
-ref/scripts/install_connectors.sh --scaffold ./hermes-agent
+## There is a second implementation, and it is not this one
+
+`plow-pbc/plow`'s `cloud-agents/hermes/plugins/plow_chat/` registers the **same
+plugin id** for Plow's multi-tenant cloud agents. Same wire path — `POST
+/v1/ws/ticket` → `WSS /v1/ws?ticket=` → `POST /v1/chats/{uid}/messages` — but a
+different env contract and a different feature set:
+
+| | this repo | plow tenant |
+|---|---|---|
+| token / chat env | `PLOW_CHAT_TOKEN` / `PLOW_CHAT_CHAT_UID` | `PLOW_AGENT_TOKEN` / `PLOW_HOME_CHANNEL` |
+| base env | `PLOW_CHAT_BASE_URL` | `PLOW_API_BASE`, **without** `/v1` |
+| group chats | yes | none |
+| persisted checkpoint, history backfill | **none** | yes |
+
+So `plugins.enabled: [plow-chat-platform]` means different things depending on
+which side installed it. **Convergence is the goal; this repo is not there yet.**
+Tracked in [`#15`](https://github.com/plow-pbc/seed-hermes-plow/issues/15) (this
+adapter drops inbound turns across a socket gap — the tenant's
+`_anchor`/`_backfill` is the solved prior art) and
+[`plow-pbc/plow#1394`](https://github.com/plow-pbc/plow/issues/1394).
+
+A merge is constrained in one direction: the group path here calls
+`GET /v1/chats`, which is user-wide, while a tenant deliberately holds a
+chat-scoped token that cannot enumerate chats. Unifying means one adapter with
+the reconcile path gated on token capability — not a file move.
+
+`plow-pbc/plow`'s `cloud-agents/hermes/HERMES_INTEGRATION.md` is the best
+reference for the underlying Hermes behaviour either implementation has to live
+with — cron `deliver` semantics, the literal-token trap, why a request/response
+shim cannot work.
+
+## Development
+
+```sh
+just test
 ```
 
-It copies the skill to `data/skills/plow-connectors/`. After the next
-`docker compose up`, the agent uses it via its shell, e.g.:
+The suite loads `__init__.py` by path and stubs the `gateway.*` modules Hermes
+supplies at runtime, so it needs no Hermes install and touches no network.
 
-```bash
-python3 /opt/data/skills/plow-connectors/plow_connector.py gmail status
-python3 /opt/data/skills/plow-connectors/plow_connector.py gmail messages.list '{"query":"is:unread","max_results":5}'
-python3 /opt/data/skills/plow-connectors/plow_connector.py slack channels.list '{"account":"T0..."}'
-```
+## Provenance
 
-If Google/Slack are connected to a **different** Plow account than the one that
-owns the chat line, point the connectors at it with `PLOW_CONNECTOR_TOKEN` in
-the resolved profile `.env` (`data/.env` for the default profile,
-`data/profiles/<name>/.env` for a named profile); it overrides `PLOW_CHAT_TOKEN`
-for connector calls only, leaving messaging on the chat account. A connector
-whose `status` reports `connected:false` simply is not
-linked to that account yet (linking is a one-time OAuth consent in Plow, out of
-scope for this seed).
+The history here is `plow-pbc/seed-hermes-plow`'s, carried over in full — this is
+where the adapter was written, including the group layer ported onto it in
+August 2026. That repo is **archived**: the SEED pattern it belonged to is
+retired, and its remaining artifacts (`plow-connectors`,
+`create_plow_chat_curl.sh`) stay frozen there at their pinned SHAs, which still
+resolve because archived public repos remain readable.
 
-## License
-
-MIT.
+What changed on the way over: the `ref/` layout is gone, and with it the ~30-line
+root shim that existed only to bridge it. The adapter sits where Hermes loads it,
+so an agent's installed plugin no longer carries a `ref/hermes-plugin/plow_chat/`
+directory inside its home.
