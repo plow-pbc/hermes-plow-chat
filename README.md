@@ -5,10 +5,16 @@ arrives over a WebSocket the plugin dials out on; outbound and cron delivery go
 back through the chat REST API.
 
 ```
-plugin.yaml     the manifest -- registers the platform id `plow-chat-platform`
-__init__.py     the adapter; Hermes loads a plugin from the directory root
-tests/          the adapter suite
+plow-chat-platform/     exactly what gets installed, and nothing else
+  plugin.yaml           the manifest -- registers the platform id
+  __init__.py           the adapter; Hermes loads it from the plugin root
+tests/                  the adapter suite
 ```
+
+The directory is named for the plugin id so the install is a directory copy:
+`agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
+into place. Nothing else in this repo — README, tests, justfile — reaches an
+agent.
 
 ## Who consumes this
 

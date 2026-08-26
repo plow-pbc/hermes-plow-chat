@@ -70,7 +70,7 @@ base_mod.MessageType = MessageType
 base_mod.SendResult = SendResult
 sys.modules["gateway.platforms.base"] = base_mod
 
-ADAPTER_PATH = Path(__file__).resolve().parents[1] / "ref" / "hermes-plugin" / "plow_chat" / "adapter.py"
+ADAPTER_PATH = Path(__file__).resolve().parents[1] / "plow-chat-platform" / "__init__.py"
 spec = importlib.util.spec_from_file_location("plow_chat_adapter_under_test", ADAPTER_PATH)
 adapter_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter_mod)

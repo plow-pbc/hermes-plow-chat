@@ -1,10 +1,15 @@
 """
-Reference Plow Chat platform adapter for Hermes Agent.
+The Plow Chat platform adapter for Hermes Agent.
 
-This is intentionally a small, readable seed implementation. It documents the
-shape of a Hermes platform adapter backed by the Plow Chat API. Production
-installs should add durable cursor persistence, richer setup UX, and tests
-against the exact Hermes version they run.
+This is the module Hermes loads from an installed plugin directory, and it is
+what `agent-mgr` installs into every agent in the fleet -- it is the phone line,
+not a sketch of one. Inbound arrives on a WebSocket this dials out on; outbound
+and cron delivery go back through the chat REST API. Covered by tests/.
+
+One known gap, tracked rather than hidden: there is no persisted checkpoint and
+no history backfill, so turns that arrive while the socket is down are not
+recovered. See plow-pbc/seed-hermes-plow#15 -- plow's own tenant adapter has the
+solved form.
 """
 
 from __future__ import annotations
