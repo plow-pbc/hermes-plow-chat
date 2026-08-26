@@ -11,10 +11,17 @@ plow-chat-platform/     exactly what gets installed, and nothing else
 tests/                  the adapter suite
 ```
 
-The directory is named for the plugin id so the install is a directory copy:
+The directory is named for the plugin id so the install can be a directory copy:
 `agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
-into place. Nothing else in this repo — README, tests, justfile — reaches an
-agent.
+into place. Nothing else here — README, tests, justfile — reaches an agent.
+
+> **Ordering.** That contract needs `agent-mgr`'s `install-plugin` to install
+> this *directory*, which it does only from
+> [`plow-pbc/agent-mgr#5`](https://github.com/plow-pbc/agent-mgr/pull/5) onward.
+> Before that change it copied two files from the repository **root**, so a
+> `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
+> `agent-mgr` installs an empty plugin directory — an agent with no phone line.
+> Land the `agent-mgr` side first, then bump the pin.
 
 ## Who consumes this
 
@@ -71,10 +78,12 @@ different env contract and a different feature set:
 
 So `plugins.enabled: [plow-chat-platform]` means different things depending on
 which side installed it. **Convergence is the goal; this repo is not there yet.**
-Tracked in [`#15`](https://github.com/plow-pbc/seed-hermes-plow/issues/15) (this
+Tracked in [`#2`](https://github.com/plow-pbc/hermes-plow-chat/issues/2) (this
 adapter drops inbound turns across a socket gap — the tenant's
 `_anchor`/`_backfill` is the solved prior art) and
-[`plow-pbc/plow#1394`](https://github.com/plow-pbc/plow/issues/1394).
+[`plow-pbc/plow#1394`](https://github.com/plow-pbc/plow/issues/1394). The first
+was `plow-pbc/seed-hermes-plow#15`; it moved here because an archived repo's
+issues are read-only.
 
 A merge is constrained in one direction: the group path here calls
 `GET /v1/chats`, which is user-wide, while a tenant deliberately holds a

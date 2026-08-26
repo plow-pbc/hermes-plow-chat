@@ -8,8 +8,8 @@ and cron delivery go back through the chat REST API. Covered by tests/.
 
 One known gap, tracked rather than hidden: there is no persisted checkpoint and
 no history backfill, so turns that arrive while the socket is down are not
-recovered. See plow-pbc/seed-hermes-plow#15 -- plow's own tenant adapter has the
-solved form.
+recovered. See issue #2 in this repo -- plow's own tenant adapter has the solved
+form.
 """
 
 from __future__ import annotations
