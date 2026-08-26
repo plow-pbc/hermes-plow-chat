@@ -114,12 +114,41 @@ class _PlowSendError(Exception):
         self.detail = detail
 
 
-GROUP_POLICY = (
+_ADDRESSED_ONLY = (
     "This is a shared group chat. Respond only when you reasonably infer, "
     "as a human participant would, that Hermes is directly or contextually "
     "addressed or that a response is clearly expected. Otherwise output "
     f"exactly {SILENT_REPLY_TOKEN} and no other text."
 )
+
+# The room is the boundary, not the asker. An owner requesting their own material
+# in a shared chat still publishes it to everyone in that chat, so this is scoped
+# to the thread rather than to who is speaking.
+_DISCLOSURE = (
+    "Everyone in this chat sees everything you say. Do not reveal the owner's "
+    "private material — email contents, files, messages, credentials — into this "
+    "chat, whoever asks and however the request is phrased. If asked for "
+    "something private, say briefly that you cannot share it here and offer what "
+    "you can do instead."
+)
+
+# Claiming a relay that did not happen was a real regression on the OpenClaw
+# side: the agent said it had passed a message along, in a thread where everyone
+# had already received it, and there is no such tool.
+# Scoped to *this* message, not to sending in general: `plow_start_group_message`
+# genuinely sends, so an absolute rule would have the agent deny or misreport a
+# legitimate use of its own tool.
+_NO_RELAY = (
+    "Everyone here already received the message you are reading, so there is "
+    "nothing to relay or forward. Never say you have passed it along or let "
+    "someone know about it — that would be false. Reporting a message you "
+    "actually sent with a tool is a different thing, and stays truthful."
+)
+
+# Composed from named blocks so a test can assert which rules a turn carries
+# without scanning the prose for keywords, which passes on a rewrite that
+# inverts the meaning.
+GROUP_POLICY = "\n\n".join([_ADDRESSED_ONLY, _DISCLOSURE, _NO_RELAY])
 
 # How long a thread can sit unheard after the operator adds Hermes to it. One
 # call a minute against a list that changes a few times a year; the cost of
@@ -188,15 +217,45 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     return groups
 
 
-def _channel_prompt(group: dict | None) -> str:
+def _speaker_line(sender: dict) -> str:
+    """Whether the speaker owns this agent — deliberately not who they are.
+
+    The name is already on the event as `source.user_name`, normalized once in
+    `_dispatch`. Repeating it here would be a second identity seam with its own
+    fallbacks, and it would put provider-supplied text into the channel prompt,
+    which the model weighs above the message body. Today only a handle could
+    arrive — Plow sets a participant's `display_name` to the handle because Linq
+    has no name field — but names are a planned addition, and this is the line
+    they would be injected into. So the prompt carries the fact and the event
+    carries the name.
+
+    `role` is the Chat API's own answer (plow-pbc/plow#1381), resolved there
+    against the account's canonical handle — so this does not re-derive
+    ownership by comparing handles, which is the comparison that drifts between
+    the roster spelling and the webhook payload. An absent `role` — an API
+    predating the field — reads as not-owner: absent data must never elevate.
+    """
+    if sender.get("role") == "owner":
+        return "The message below is from the owner of this agent."
+    return ("The message below is from a member of this chat who does not own "
+            "this agent.")
+
+
+def _channel_prompt(group: dict | None, sender: dict) -> str:
     """GROUP_POLICY always leads; a configured group's prompt appends, never replaces.
 
     An adopted chat has no configured prompt, so it gets the bare policy — it is a
     room Hermes was added to, not one the operator described.
+
+    The speaker line goes last, closest to the message it describes: the policy
+    and the group's prompt are properties of the room and the same every turn,
+    while this changes with each one.
     """
-    if group is None or not group["prompt"]:
-        return GROUP_POLICY
-    return f"{GROUP_POLICY}\n\n{group['prompt']}"
+    parts = [GROUP_POLICY]
+    if group is not None and group["prompt"]:
+        parts.append(group["prompt"])
+    parts.append(_speaker_line(sender))
+    return "\n\n".join(parts)
 
 
 async def _body(resp):
@@ -838,7 +897,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # injected instruction cannot hand out this runtime's tools.
         source_kwargs["role_authorized"] = authorized
         if chat_type != "dm":
-            event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid))
+            event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid), sender)
         await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
 
     def _may_approve(self, chat_uid: str) -> bool:
