@@ -299,6 +299,46 @@ def test_group_prompt_appends_to_policy_and_orphan_warns(monkeypatch, caplog):
     assert "names no configured group" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("sender", "owns"),
+    [
+        pytest.param({"display_name": "Sam", "role": "owner"}, True, id="owner"),
+        pytest.param({"display_name": "Kim", "role": "member"}, False, id="member"),
+        # An API predating plow#1381 sends no role at all. Absent data must read
+        # as not-owner; elevating on a missing field is the wrong direction.
+        pytest.param({"display_name": "Kim"}, False, id="role_absent"),
+    ],
+)
+def test_the_speaker_line_marks_only_a_declared_owner(sender, owns):
+    line = adapter_mod._speaker_line(sender)
+    assert sender["display_name"] in line
+    assert ("owns this agent" in line) is owns
+
+
+def test_the_speaker_line_falls_back_through_the_handles_it_has():
+    assert "+15550001111" in adapter_mod._speaker_line({"provider_key": "+15550001111"})
+    assert "someone" in adapter_mod._speaker_line({})
+
+
+def test_a_group_turn_carries_every_rule_and_the_speaker():
+    """Asserted by block identity, not by scanning the prose: a keyword search
+    passes on a rewrite that inverts the meaning, so it pins the wording while
+    leaving the contract untested."""
+    prompt = adapter_mod._channel_prompt(None, {"display_name": "Kim", "role": "member"})
+    for block in (adapter_mod._ADDRESSED_ONLY, adapter_mod._DISCLOSURE, adapter_mod._NO_RELAY):
+        assert block in prompt
+    assert "Kim" in prompt
+
+
+def test_disclosure_is_scoped_to_the_room_not_the_asker():
+    """The owner asking for their own material in a shared chat still publishes it
+    to everyone in that chat, so the rule cannot vary by speaker."""
+    owner_turn = adapter_mod._channel_prompt(None, {"display_name": "Sam", "role": "owner"})
+    member_turn = adapter_mod._channel_prompt(None, {"display_name": "Kim", "role": "member"})
+    assert adapter_mod._DISCLOSURE in owner_turn
+    assert adapter_mod._DISCLOSURE in member_turn
+
+
 def _adapter(monkeypatch, groups="cht_a=Owners", extra=None, cls=None):
     """An adapter built from config (not env), with the group layer set explicitly."""
     monkeypatch.delenv("PLOW_CHAT_CHAT_UID", raising=False)
@@ -411,7 +451,8 @@ def test_group_frame_carries_group_type_and_channel_prompt(monkeypatch):
     event = a.handled[0]
     assert event.source.chat_type == "group"
     assert event.source.chat_name == "Owners"
-    assert event.channel_prompt == adapter_mod.GROUP_POLICY + "\n\nBe candid."
+    assert event.channel_prompt.startswith(adapter_mod.GROUP_POLICY)
+    assert "Be candid." in event.channel_prompt
     assert event.source.role_authorized is True
 
 
@@ -432,7 +473,7 @@ def test_an_unconfigured_install_still_gets_group_context(monkeypatch):
     asyncio.run(a._handle_ws_frame("cht_new", _inbound("cht_new")))
     event = a.handled[0]
     assert event.source.chat_type == "group"
-    assert event.channel_prompt == adapter_mod.GROUP_POLICY
+    assert event.channel_prompt.startswith(adapter_mod.GROUP_POLICY)
     assert event.source.role_authorized is False   # heard, not trusted
 
 def test_adopted_chat_is_audible_but_not_authorized(monkeypatch):
@@ -442,7 +483,7 @@ def test_adopted_chat_is_audible_but_not_authorized(monkeypatch):
     event = a.handled[0]
     assert event.source.chat_type == "group"
     assert event.source.role_authorized is False
-    assert event.channel_prompt == adapter_mod.GROUP_POLICY
+    assert event.channel_prompt.startswith(adapter_mod.GROUP_POLICY)
 
 
 def test_operator_speaking_vouches_for_the_room(monkeypatch):
