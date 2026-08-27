@@ -150,17 +150,6 @@ _NO_RELAY = (
 # inverts the meaning.
 GROUP_POLICY = "\n\n".join([_ADDRESSED_ONLY, _DISCLOSURE, _NO_RELAY])
 
-# Named for the same reason the blocks above are: the tests that reach it assert it by
-# identity rather than scanning for a fragment. States what was observed rather than
-# enumerating causes — an owner-less roster, an API not serving `role`, and an owner
-# whose handle is absent all arrive here, and a list of them was wrong within three
-# commits. The prefix is inside, so no part of the record is left without an owner.
-_NO_OWNER_LOG = (
-    "[plow_chat] no owner handle among the home chat's %d member participant(s); if the "
-    "API is not serving `role`, no room can be vouched either. An operator change can no "
-    "longer be seen, so vouched authority will not be revoked"
-)
-
 # How long a thread can sit unheard after the operator adds Hermes to it. One
 # call a minute against a list that changes a few times a year; the cost of
 # shortening it is quota, of lengthening it somebody repeating themselves.
@@ -728,7 +717,13 @@ class PlowChatAdapter(BasePlatformAdapter):
                                    "operator-vouched authority for %s", sorted(revoked))
                 self.operator_key = next_operator
                 if next_operator is None:
-                    logger.error(_NO_OWNER_LOG, len(home_members))
+                    logger.error(
+                        "[plow_chat] no owner handle among the home chat's %d member "
+                        "participant(s); if the API is not serving `role`, no room can be "
+                        "vouched either. An operator change can no longer be seen, so "
+                        "vouched authority will not be revoked",
+                        len(home_members),
+                    )
             # Reach is settled FIRST, before any vouch hydration. The hydration below
             # does network reads that can fail, and a failure there used to abort the
             # pass before removal ever ran — so a departed room kept its socket and its

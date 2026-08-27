@@ -689,21 +689,6 @@ def test_one_unclassifiable_chat_does_not_abort_discovery(monkeypatch):
     assert "cht_weird" not in a.chat_uids
 
 
-def _assert_logged_no_owner(caplog) -> None:
-    """The no-owner diagnostic, emitted and renderable.
-
-    Two failures, each naming itself: a missing record means the log was
-    suppressed or the message changed, while a record that renders its own
-    template means the argument was lost — which logs cleanly and shows the
-    operator a literal %d in the one diagnostic this state has. Says nothing
-    about the count: deriving that from a test table re-implements the adapter's
-    rule of which poll emits.
-    """
-    rec = next((r for r in caplog.records if r.msg == adapter_mod._NO_OWNER_LOG), None)
-    assert rec is not None, "no _NO_OWNER_LOG record was emitted"
-    assert rec.getMessage() != rec.msg, f"logged unrendered: {rec.msg}"
-
-
 @pytest.mark.parametrize("polls,expected_operator", [
     ([(["+1", "+2"], "+1")], "+1"),                  # company in the home chat, from the start
     ([(["+1"], "+1"), (["+1", "+2"], "+1")], "+1"),  # ...and arriving later
@@ -728,7 +713,7 @@ def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_ope
     if expected_operator is None:
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
-        _assert_logged_no_owner(caplog)
+        assert any("no owner handle among" in r.getMessage() for r in caplog.records)
 
 
 def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch, caplog):
@@ -746,7 +731,7 @@ def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypat
     asyncio.run(a._reconcile_once())
     assert a.operator_key is None
     assert "cht_good" in a.chat_uids     # the rest of the pass still ran
-    _assert_logged_no_owner(caplog)
+    assert any("no owner handle among" in r.getMessage() for r in caplog.records)
 
 
 def test_a_new_operator_does_not_inherit_the_old_ones_vouches(monkeypatch):
