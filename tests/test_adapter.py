@@ -76,6 +76,17 @@ adapter_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter_mod)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_root(monkeypatch, tmp_path):
+    """Every adapter gets its own HERMES_HOME.
+
+    Autouse because the adapter reads its message cursor at construction: without
+    this a suite run in a directory holding a real `plow-chat-cursor.json` would
+    adopt it, and tests would pass or fail on the developer's filesystem.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+
 class DummyConfig:
     extra = {"chat_uid": "cht_test", "token": "token_test"}
 
@@ -1262,8 +1273,7 @@ def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, ca
 # --- durable cursor + backfill across a socket gap (#2) ---------------------
 
 
-def test_the_cursor_survives_a_restart(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_the_cursor_survives_a_restart(monkeypatch):
     a = _adapter(monkeypatch)
     a._checkpoint("cht_a", "msg_7")
 
@@ -1272,26 +1282,48 @@ def test_the_cursor_survives_a_restart(monkeypatch, tmp_path):
     assert revived._last_uids == {"cht_a": "msg_7"}
 
 
-def test_a_cursor_write_leaves_no_partial_file(monkeypatch, tmp_path):
-    """A truncated cursor would raise on every later start — the one failure an
-    unattended agent cannot recover from."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_a_failed_cursor_write_leaves_the_last_good_one_intact(monkeypatch, tmp_path):
+    """The rename is the commit point. A write that dies before it must leave
+    the previous map readable — a half-written cursor would raise on every
+    later start, which is the one failure an unattended agent cannot recover
+    from."""
     a = _adapter(monkeypatch)
-
     a._checkpoint("cht_a", "msg_1")
-    a._checkpoint("cht_b", "msg_2")
+    real_replace = adapter_mod.os.replace
 
-    assert not list(tmp_path.glob("*.tmp")), "temp file left behind"
-    assert json.loads((tmp_path / "plow-chat-cursor.json").read_text()) == {
-        "cht_a": "msg_1",
-        "cht_b": "msg_2",
-    }
+    def die(src, dst):
+        raise OSError("disk went away mid-rename")
+
+    adapter_mod.os.replace = die
+    try:
+        with pytest.raises(OSError):
+            a._checkpoint("cht_a", "msg_2")
+    finally:
+        adapter_mod.os.replace = real_replace
+
+    assert json.loads((tmp_path / "plow-chat-cursor.json").read_text()) == {"cht_a": "msg_1"}
+    assert _adapter(monkeypatch)._last_uids == {"cht_a": "msg_1"}, "and it still loads"
+
+
+@pytest.mark.parametrize("garbage", ['{"cht_a": 1}', "[]", "not json at all", ""])
+def test_an_unreadable_cursor_starts_empty_rather_than_stopping_the_agent(
+    monkeypatch, tmp_path, caplog, garbage
+):
+    """Losing a cursor costs one anchored chat. Raising here costs every message
+    the agent would ever handle, so the load path may not raise — but it must
+    say so, because an anchored chat skips whatever was pending in it."""
+    (tmp_path / "plow-chat-cursor.json").write_text(garbage)
+
+    with caplog.at_level(logging.WARNING):
+        a = _adapter(monkeypatch)
+
+    assert a._last_uids == {}
+    assert "could not read the message cursor" in caplog.text
 
 
 def test_the_cursor_advances_only_after_the_turn_is_dispatched(monkeypatch, tmp_path):
     """A turn the gateway refused has not been seen by the agent. Moving the
     cursor over it is exactly the loss this file exists to prevent."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     class Boom(adapter_mod.PlowChatAdapter):
         async def handle_message(self, event):
@@ -1303,10 +1335,13 @@ def test_the_cursor_advances_only_after_the_turn_is_dispatched(monkeypatch, tmp_
         asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a")))
 
     assert a._last_uids == {}, "an undelivered turn must stay replayable"
+    # Both halves or neither. Asserting only the cursor let the uid sit in the
+    # in-memory set, where the backfill would fetch this message and then drop
+    # it — replayable on paper, silently swallowed in fact.
+    assert "m1" not in a._seen_message_uids
 
 
-def test_a_dispatched_turn_checkpoints(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_a_dispatched_turn_checkpoints(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
 
     asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
@@ -1324,7 +1359,6 @@ def test_a_first_sight_chat_anchors_without_replaying_its_history(
     monkeypatch, tmp_path, history, expected
 ):
     """Adopting a chat must not fire its whole back catalogue at the agent."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": history})
 
@@ -1334,8 +1368,7 @@ def test_a_first_sight_chat_anchors_without_replaying_its_history(
     assert a.handled == []
 
 
-def test_backfill_replays_the_gap_oldest_first(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_backfill_replays_the_gap_oldest_first(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._checkpoint("cht_a", "msg_1")
     # The API answers newest-first.
@@ -1349,8 +1382,7 @@ def test_backfill_replays_the_gap_oldest_first(monkeypatch, tmp_path):
     assert a._last_uids["cht_a"] == "msg_3"
 
 
-def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._checkpoint("cht_a", "msg_1")
 
@@ -1372,11 +1404,10 @@ def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatc
     assert a._last_uids["cht_a"] == "msg_1", "the cursor must not move over an unread gap"
 
 
-def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch, tmp_path):
+def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
     """The cursor bounds the walk, not a page count. Stopping at the first page
     would drop the OLDEST missed messages while still advancing past them —
     the exact loss backfill exists to prevent."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._checkpoint("cht_a", "msg_0")
 
@@ -1410,13 +1441,12 @@ def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch, tmp_path):
     assert a._last_uids["cht_a"] == "msg_4"
 
 
-def test_reconnecting_backfills_before_serving_live_frames(monkeypatch, tmp_path):
+def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
     """The whole point: a socket that comes back must first ask what it missed.
 
     Ordering matters — backfill runs AFTER the socket is up, so anything landing
     mid-backfill arrives over the socket and the uid dedupe absorbs the overlap.
     """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     order = []
 

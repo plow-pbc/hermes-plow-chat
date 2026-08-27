@@ -817,7 +817,23 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # connect, not before: anything landing mid-backfill then
                     # arrives over the socket too, and the uid dedupe absorbs it.
                     # Before, and that same message falls in a second gap.
-                    await self._backfill(chat_uid)
+                    #
+                    # Never in front of it, though. A raise here would unwind out
+                    # of the socket before frame iteration starts, and a
+                    # deterministic failure — a 4xx, a history row without a uid —
+                    # would retry forever behind the backoff with the line dead
+                    # and the log saying only "websocket loop error". Losing a
+                    # replay costs a late answer; losing the socket costs every
+                    # answer. The cursor only moves on dispatch, so the next
+                    # reconnect retries this gap on its own.
+                    try:
+                        await self._backfill(chat_uid)
+                    except Exception as exc:
+                        logger.warning(
+                            "[plow_chat] backfill failed for %s, serving live frames "
+                            "anyway; the gap retries on the next reconnect: %s",
+                            chat_uid, exc,
+                        )
                     async for msg in ws:
                         if self._stop_event.is_set():
                             break
@@ -879,6 +895,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         anything arriving mid-backfill then comes over the socket, and the uid
         dedupe absorbs the overlap.
         """
+        # Deliberately not cleared when a chat leaves reach, unlike its vouch and
+        # its socket: a vouch is a grant that must not outlive the room, while a
+        # cursor is a fact about what this agent has already seen. Dropping it
+        # would make a chat that flaps out of a paged listing and back anchor
+        # again, skipping precisely the messages that arrived while it was gone.
         if chat_uid not in self._last_uids:
             await self._anchor(chat_uid)
             return
@@ -898,6 +919,17 @@ class PlowChatAdapter(BasePlatformAdapter):
             if reached or not page or not body.get("has_more"):
                 break
             cursor = page[-1]["uid"]
+        if missed and not reached:
+            # Two ways to get here and they look identical from the inside: a
+            # chat that anchored empty (correct — everything IS the gap), or a
+            # cursor the endpoint no longer returns, since it filters
+            # deleted_at IS NULL. The second replays the whole history, so say
+            # which walk this was rather than let it pass as routine.
+            logger.warning(
+                "[plow_chat] %s: walked %d message(s) to exhaustion without "
+                "meeting cursor %r — replaying all of them",
+                chat_uid, len(missed), self._last_uids.get(chat_uid),
+            )
         for message in reversed(missed):
             await self._handle_ws_frame(chat_uid, {"type": "message_received", "message": message})
         if missed:
@@ -910,12 +942,37 @@ class PlowChatAdapter(BasePlatformAdapter):
         rewritten on each checkpoint, so a partial write can never leave two
         chats disagreeing about which restart they belong to.
         """
-        return pathlib.Path(os.environ.get("HERMES_HOME", ".")) / "plow-chat-cursor.json"
+        return pathlib.Path(os.environ["HERMES_HOME"]) / "plow-chat-cursor.json"
 
     def _load_cursors(self) -> None:
-        path = self._cursor_path()
-        if path.exists():
-            self._last_uids = json.loads(path.read_text())
+        """Adopt the cursor map, or start empty and say so.
+
+        Never raises. This runs at construction, and an unreadable or malformed
+        file must not be the thing that stops an unattended agent from starting:
+        a lost cursor costs one anchored chat, a raise here costs every message.
+        Warned rather than swallowed, because the cost is real — an anchored
+        chat skips whatever was pending in it.
+
+        HERMES_HOME is indexed rather than defaulted for the reason
+        bin/hostex-poll.py indexes it: the image sets it, and defaulting to the
+        cwd would silently resolve to a different state root per working
+        directory, which reads as a clean start and replays nothing.
+        """
+        try:
+            path = self._cursor_path()
+            if not path.exists():
+                return
+            loaded = json.loads(path.read_text())
+            if not isinstance(loaded, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in loaded.items()
+            ):
+                raise ValueError(f"expected a map of chat uid to message uid, got {type(loaded).__name__}")
+            self._last_uids = loaded
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning(
+                "[plow_chat] could not read the message cursor, starting from an "
+                "anchor instead — anything pending in a chat is skipped: %s", exc
+            )
 
     def _checkpoint(self, chat_uid: str, uid: str) -> None:
         """Record the newest uid this agent has dispatched for one chat.
@@ -1016,7 +1073,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         source_kwargs["role_authorized"] = authorized
         if chat_type != "dm":
             event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid), sender)
-        await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
+        try:
+            await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
+        except BaseException:
+            # Both halves of the dedupe or neither. The uid went into the set
+            # before dispatch; leaving it there would let the backfill fetch this
+            # message and then drop it here, for the life of the process — the
+            # loss the cursor below exists to prevent, reintroduced in memory.
+            self._seen_message_uids.discard(msg_uid)
+            raise
         # After the dispatch, never before: a turn the gateway refused has not
         # been seen by the agent, and a cursor past it is a message nobody will
         # ever replay.
