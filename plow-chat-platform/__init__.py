@@ -742,9 +742,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 logger.info("[plow_chat] joined configured group %s (%s), members authorized",
                             added, group["name"])
             else:
+                # Not "to name it": a titled chat is already named from its own
+                # display_name by the time an operator reads this, so sending them
+                # to the dotenv would ask for the edit and restart this feature
+                # exists to remove. What the entry still buys is an exact name in
+                # place of the derived one, and authority for its members.
                 logger.info(
                     "[plow_chat] adopted %s; add '%s=<display name>' to "
-                    "PLOW_CHAT_GROUP_UIDS to name it and authorize its members",
+                    "PLOW_CHAT_GROUP_UIDS to override its name and authorize its members",
                     added, added)
         self.chat_uids = wanted
 

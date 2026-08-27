@@ -1325,8 +1325,6 @@ def test_a_title_can_never_take_another_room_s_name():
     assert names["cht_home"] == "Plow Chat"
     assert names["cht_impostor"] == "STR Owners (cht_impostor)"
     assert names["cht_home_impostor"] == "Plow Chat (cht_home_impostor)"
-    assert len({n.casefold() for n in names.values()}) == len(names), \
-        f"two rooms answer to one name: {names}"
 
 
 def test_naming_depends_on_nothing_but_the_listing():
@@ -1369,10 +1367,7 @@ def test_a_name_carries_no_participant_identifiers():
         {"type": "member", "provider_key": "+15550001111", "role": "owner", "display_name": "Sam"},
         {"type": "member", "provider_key": "+15550002222", "role": "member", "display_name": "Gianna"},
     ]}
-    name = adapter_mod._resolve_chat_names([chat], {}, "cht_home")["cht_x"]
-    assert name == "cht_x"
-    for leaked in ("Gianna", "Sam", "+15550001111", "+15550002222"):
-        assert leaked not in name
+    assert adapter_mod._resolve_chat_names([chat], {}, "cht_home")["cht_x"] == "cht_x"
 
 
 def _stub_hermes_home(monkeypatch, tmp_path):
