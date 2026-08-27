@@ -4,3 +4,6 @@ __pycache__/
 data/
 verify-report.json
 install-report.json
+
+# knightwatch materializes declared review siblings here during a review.
+.siblings/
