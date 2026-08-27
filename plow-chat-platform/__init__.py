@@ -361,7 +361,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # record, not two: an in-memory set beside a persisted position meant two
         # answers to "have I handled this", and every way they disagreed was a
         # message either dropped or answered twice.
-        self._seen: dict[str, list[str]] = {}
+        self._seen: dict[str, dict[str, None]] = {}
         # Resolved once, here, so there is exactly one answer to "where does
         # state live" and a missing setting is a startup failure with a name on
         # it. Read per call it was worse than useless: the load path caught the
@@ -909,10 +909,10 @@ class PlowChatAdapter(BasePlatformAdapter):
 
         Frames are not replayable and a dropped socket misses them outright, so
         the durable message record is the only recovery. Pages newest-first,
-        keeping what this agent has not already dispatched, and stops once a
-        whole page is familiar — everything older than a fully-seen page was
-        dispatched before it. Replayed oldest-first so the conversation returns
-        in order.
+        keeping what this agent has not already dispatched, and stopping at the
+        first message it recognises — everything below one is older than a turn
+        already taken. Replayed oldest-first so the conversation returns in
+        order.
 
         Asks the seen-set rather than a position, because a position is a guess
         that the endpoint can invalidate: it filters `deleted_at IS NULL`, so a
@@ -940,11 +940,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         for _ in range(MAX_BACKFILL_PAGES):
             body = await self._messages_page(chat_uid, cursor)
             page = body.get("data") or []
-            fresh = [m for m in page if m["uid"] not in self._seen[chat_uid]]
-            missed.extend(fresh)
-            # A page with nothing new on it is the floor: this agent was here
-            # already, so everything below it was dispatched earlier.
-            if not fresh or not page or not body.get("has_more"):
+            reached = False
+            for message in page:
+                # One familiar message is the floor: this agent was here, so
+                # everything below was dispatched earlier. Per message and not
+                # per page, because only dispatched *inbound* messages are ever
+                # recorded — the agent's own replies never are, so a page
+                # holding one can never be wholly familiar, and a page-shaped
+                # floor would never fire in a chat that has been answered.
+                if message["uid"] in self._seen[chat_uid]:
+                    reached = True
+                    break
+                missed.append(message)
+            if reached or not page or not body.get("has_more"):
                 break
             if page[-1]["uid"] == cursor:
                 # The page did not advance, so the next request is this one. A
@@ -997,14 +1005,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 return
             loaded = json.loads(path.read_text())
             if not isinstance(loaded, dict) or not all(
-                isinstance(k, str) and isinstance(v, list)
+                isinstance(k, str) and isinstance(v, dict)
                 and all(isinstance(u, str) for u in v)
                 for k, v in loaded.items()
             ):
                 raise ValueError(
                     f"expected a map of chat uid to message uids, got {type(loaded).__name__}"
                 )
-            self._seen = {k: list(v) for k, v in loaded.items()}
+            self._seen = {k: dict.fromkeys(v) for k, v in loaded.items()}
         except (OSError, ValueError) as exc:
             logger.warning(
                 "[plow_chat] could not read the seen-message record, starting from "
@@ -1022,15 +1030,22 @@ class PlowChatAdapter(BasePlatformAdapter):
         Written atomically — a truncated file would raise on every later start.
         A fixed tmp name is safe because one adapter owns this file.
         """
-        known = self._seen.setdefault(chat_uid, [])
-        # Prepended as a block, in the order given. Inserting one at a time at
-        # the front reverses them, and order is load-bearing here: the trim
-        # below drops the tail, which has to be the oldest.
-        known[:0] = [uid for uid in uids if uid not in known]
-        del known[SEEN_LIMIT:]
+        known = self._seen.setdefault(chat_uid, {})
+        # A mapping rather than a list: membership is asked once per page
+        # message on every walk and once per live frame, and a list makes each
+        # of those a scan of up to SEEN_LIMIT. Insertion order still carries the
+        # age, which is what the trim below needs, and it survives the JSON
+        # round trip as an object.
+        self._seen[chat_uid] = dict.fromkeys([*uids, *known])
+        for old_uid in list(self._seen[chat_uid])[SEEN_LIMIT:]:
+            del self._seen[chat_uid][old_uid]
         path = self._seen_path()
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(self._seen, indent=2, sort_keys=True))
+        # Written on every dispatch, so it stays compact: no indent, and no
+        # sort_keys, which would reorder the uids and destroy the age the trim
+        # reads. One write per message is the durability — a crash mid-backfill
+        # must not re-dispatch what it already delivered.
+        tmp.write_text(json.dumps(self._seen))
         os.replace(tmp, path)
 
     async def _handle_ws_frame(self, chat_uid: str, frame: dict[str, Any]) -> None:

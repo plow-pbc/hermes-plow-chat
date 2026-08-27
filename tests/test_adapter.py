@@ -1282,7 +1282,7 @@ def test_what_the_agent_has_answered_survives_a_restart(monkeypatch):
     a = _adapter(monkeypatch)
     a._mark_seen("cht_a", ["msg_7"])
 
-    assert _adapter(monkeypatch)._seen == {"cht_a": ["msg_7"]}
+    assert _adapter(monkeypatch)._seen == {"cht_a": {"msg_7": None}}
 
 
 def test_a_failed_write_leaves_the_last_good_record_intact(monkeypatch, tmp_path):
@@ -1303,8 +1303,8 @@ def test_a_failed_write_leaves_the_last_good_record_intact(monkeypatch, tmp_path
     finally:
         adapter_mod.os.replace = real_replace
 
-    assert json.loads((tmp_path / "plow-chat-seen.json").read_text()) == {"cht_a": ["msg_1"]}
-    assert _adapter(monkeypatch)._seen == {"cht_a": ["msg_1"]}, "and it still loads"
+    assert json.loads((tmp_path / "plow-chat-seen.json").read_text()) == {"cht_a": {"msg_1": None}}
+    assert _adapter(monkeypatch)._seen == {"cht_a": {"msg_1": None}}, "and it still loads"
 
 
 @pytest.mark.parametrize("garbage", ['{"cht_a": 1}', '{"cht_a": [2]}', "[]", "nope", ""])
@@ -1351,7 +1351,7 @@ def test_only_a_dispatched_turn_is_recorded_as_seen(monkeypatch):
 
     b = _adapter(monkeypatch, cls=CapturingAdapter)
     asyncio.run(b._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
-    assert b._seen == {"cht_a": ["msg_1"]}
+    assert list(b._seen["cht_a"]) == ["msg_1"]
 
 
 @pytest.mark.parametrize("history, expected", [
@@ -1369,7 +1369,7 @@ def test_a_first_sight_chat_anchors_without_replaying_its_history(
 
     asyncio.run(a._anchor("cht_a"))
 
-    assert a._seen == {"cht_a": expected}
+    assert list(a._seen.get("cht_a", {})) == expected
     assert a.handled == []
 
 
@@ -1384,7 +1384,7 @@ def test_backfill_replays_the_gap_oldest_first(monkeypatch):
     asyncio.run(a._backfill("cht_a"))
 
     assert [e.text for e in a.handled] == ["second", "third"]
-    assert a._seen["cht_a"][0] == "msg_3", "newest first"
+    assert list(a._seen["cht_a"])[0] == "msg_3", "newest first"
 
 
 def test_a_message_deleted_from_the_history_changes_nothing(monkeypatch):
@@ -1425,7 +1425,7 @@ def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatc
 
     with pytest.raises(RuntimeError, match="500"):
         asyncio.run(a._backfill("cht_a"))
-    assert a._seen["cht_a"] == ["msg_1"], "the record must not move over an unread gap"
+    assert list(a._seen["cht_a"]) == ["msg_1"], "the record must not move over an unread gap"
 
 
 def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
@@ -1461,11 +1461,13 @@ def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
     assert a._http_session.asked == [None, "msg_3", "msg_1"], "it must follow the cursor"
 
 
-def test_the_walk_stops_at_the_first_page_it_has_seen_before(monkeypatch):
-    """Everything below a fully-familiar page was dispatched before it, so
-    paging on would spend requests to rediscover what is already recorded."""
+def test_the_walk_stops_at_the_first_message_it_recognises(monkeypatch):
+    """Not the first fully-recognised page. Only dispatched inbound messages are
+    ever recorded — the agent's own replies never are — so a page carrying one
+    can never be wholly familiar, and a page-shaped floor would never fire in a
+    chat that has been answered."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._mark_seen("cht_a", ["msg_1", "msg_0"])
+    a._mark_seen("cht_a", ["msg_1"])
 
     class Counting:
         def __init__(self):
@@ -1473,8 +1475,12 @@ def test_the_walk_stops_at_the_first_page_it_has_seen_before(monkeypatch):
 
         def get(self, url, **kwargs):
             self.calls += 1
-            return FakeResponse({"data": [_msg("msg_1", "seen"), _msg("msg_0", "seen too")],
-                                 "has_more": True})
+            return FakeResponse({"data": [
+                _msg("msg_2", "new"),
+                {"uid": "out_1", "direction": "outbound", "chat_uid": "cht_a",
+                 "body": "the agent's own reply", "sender": {"type": "agent"}},
+                _msg("msg_1", "already answered"),
+            ], "has_more": True})
 
         async def close(self):
             return None
@@ -1483,8 +1489,39 @@ def test_the_walk_stops_at_the_first_page_it_has_seen_before(monkeypatch):
 
     asyncio.run(a._backfill("cht_a"))
 
-    assert a.handled == []
-    assert a._http_session.calls == 1, "a familiar page ends the walk"
+    assert [e.text for e in a.handled] == ["new"]
+    assert a._http_session.calls == 1, "one recognised message ends the walk"
+
+
+def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypatch):
+    """_anchor records one page. A page-shaped floor made the first backfill
+    after adoption page straight past it into pre-adoption history and dispatch
+    all of it — the flood _anchor exists to prevent, fired by the first new
+    message instead of by adoption."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    history = [_msg(f"old_{n}", f"old body {n}") for n in range(50)]
+    deeper = [_msg(f"ancient_{n}", f"ancient body {n}") for n in range(50)]
+
+    class Deep:
+        def get(self, url, **kwargs):
+            after = url.split("starting_after=")[1] if "starting_after=" in url else None
+            if after is None:
+                return FakeResponse({"data": newest[:], "has_more": True})
+            return FakeResponse({"data": deeper[:], "has_more": True})
+
+        async def close(self):
+            return None
+
+    newest = history[:]
+    a._http_session = Deep()
+    asyncio.run(a._anchor("cht_a"))
+    assert a.handled == [], "adoption dispatches nothing"
+
+    # One new message arrives on top of the page that was anchored.
+    newest = [_msg("brand_new", "the only thing that should replay")] + history[:49]
+    asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["the only thing that should replay"]
 
 
 def test_an_unbounded_wall_of_unseen_messages_stops_and_says_so(monkeypatch, caplog):
