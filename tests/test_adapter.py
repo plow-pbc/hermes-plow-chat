@@ -278,6 +278,11 @@ def test_groups_parses_uid_equals_name(monkeypatch):
         ("cht_home=Owners", "must be a group cht_ ID"),
         ("cht_a=Owners,cht_a=Other", "repeats chat id"),
         ("cht_a=Owners,cht_b=Owners", "repeats display name"),
+        # Both tiers _resolve_chat_names pins: a configured label may not collide
+        # with another one only by case, nor with the home chat's own name.
+        ("cht_a=Owners,cht_b=owners", "repeats display name"),
+        ("cht_a=Plow Chat", "reserved for the home chat"),
+        ("cht_a=plow chat", "reserved for the home chat"),
     ],
 )
 def test_groups_rejects_malformed_entries(monkeypatch, value, message):
@@ -1556,9 +1561,22 @@ def test_incumbency_survives_a_reconnect(monkeypatch, tmp_path):
     assert a.chat_names["cht_aaa"] != "Cleaning"
 
 
-def test_an_unreadable_registry_costs_incumbents_not_naming(monkeypatch, tmp_path):
+@pytest.mark.parametrize("contents,warns", [
+    (None, False),                                   # absent: the normal first run
+    ("{not json", True),                             # unparseable
+    ('{"plow_chat": ["not", "an", "object"]}', True),  # right key, wrong shape
+])
+def test_an_unreadable_registry_costs_incumbents_not_naming(monkeypatch, tmp_path,
+                                                            caplog, contents, warns):
     """Reading the durable record is best-effort: it decides who KEEPS a name, and
-    the pass that follows still assigns every chat one."""
+    the pass that follows still assigns every chat one. But `{}` means "no
+    incumbents", which reopens the capture window — so anything other than a
+    missing file has to say so, or a name moves with nothing explaining it."""
     path = _stub_hermes_home(monkeypatch, tmp_path)
-    path.write_text("{not json")
-    assert adapter_mod._read_channel_aliases() == {}
+    if contents is not None:
+        path.write_text(contents)
+
+    with caplog.at_level(logging.WARNING):
+        assert adapter_mod._read_channel_aliases() == {}
+
+    assert ("incumbency starts empty" in caplog.text) is warns

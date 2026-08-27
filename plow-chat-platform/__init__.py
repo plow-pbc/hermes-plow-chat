@@ -198,24 +198,37 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
         groups[uid] = {"name": name, "prompt": None}
 
     prompts = (extra or {}).get("group_prompts") or {}
-    named = {group["name"]: group for group in groups.values()}
+    # Case-insensitively, because that is how the resolver these names are handed
+    # to compares them: an exact-string check here passed "Owners,owners" and
+    # published two rooms under one resolver-visible name.
+    named = {group["name"].casefold(): group for group in groups.values()}
     # Two groups sharing a name defeats the point: the agent cannot tell them
     # apart, a send cannot resolve one, and a prompt keyed by that name would
     # silently reach only whichever was listed last.
     if len(named) != len(groups):
         names = [group["name"] for group in groups.values()]
-        repeated = sorted({name for name in names if names.count(name) > 1})
+        folded = [name.casefold() for name in names]
+        repeated = sorted({name for name in names if folded.count(name.casefold()) > 1})
         raise ValueError(f"PLOW_CHAT_GROUP_UIDS repeats display name(s) {repeated}")
+    # Configured labels and the home chat are both pinned in _resolve_chat_names,
+    # and a pinned name is assigned unmodified -- which is only safe while no two
+    # of them can collide. This is the half that check cannot do for itself.
+    reserved = sorted(group["name"] for group in groups.values()
+                      if group["name"].casefold() == HOME_CHAT_NAME.casefold())
+    if reserved:
+        raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {reserved[0]!r} is "
+                         f"reserved for the home chat")
     # Warned rather than raised: config carries the prompts while the labels live
     # in the untracked dotenv, so an orphan is the *normal* state on a fresh
     # restore. Raising would brick the gateway in the recovery path config exists
     # to serve.
-    orphaned = sorted(set(prompts) - set(named))
+    orphaned = sorted(name for name in prompts if name.casefold() not in named)
     if orphaned:
         logger.warning("[plow_chat] group_prompts names no configured group: %s", orphaned)
     for name, prompt in prompts.items():
-        if name in named:
-            named[name]["prompt"] = (prompt or "").strip() or None
+        group = named.get(name.casefold())
+        if group is not None:
+            group["prompt"] = (prompt or "").strip() or None
     return groups
 
 
@@ -427,9 +440,21 @@ def _read_channel_aliases() -> dict[str, str]:
     try:
         with open(_aliases_path(), encoding="utf-8") as fh:
             block = json.load(fh).get("plow_chat")
-        return {k: v for k, v in block.items() if isinstance(v, str)} if isinstance(block, dict) else {}
-    except Exception:
+    except FileNotFoundError:
+        return {}                       # the normal first-run case
+    except Exception as exc:
+        # Said out loud, unlike the missing file. `{}` here means "no incumbents",
+        # which reopens the capture window this read exists to close, and the only
+        # other symptom is a name quietly moving.
+        logger.warning("[plow_chat] could not read prior channel aliases (%s); "
+                       "incumbency starts empty this pass", exc)
         return {}
+    if not isinstance(block, dict):
+        if block is not None:
+            logger.warning("[plow_chat] prior channel aliases block is %s, not an object; "
+                           "incumbency starts empty this pass", type(block).__name__)
+        return {}
+    return {k: v for k, v in block.items() if isinstance(v, str)}
 
 
 def _write_channel_aliases(names: dict[str, str]) -> None:
