@@ -577,8 +577,9 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _page_full(self, path: str) -> dict:
         """One page of a Plow list, and a complaint if there is another.
 
-        Every list endpoint reports has_more and documents no way to ask for the
-        next page. Everything read here degrades silently past that boundary while
+        The list endpoints this reads report has_more and document no way to ask
+        for the next page. (`/v1/chats/{uid}/messages` is the exception — it
+        takes `starting_after`, which `_messages_page` below uses.) Everything read here degrades silently past that boundary while
         the poll still looks healthy — a chat never discovered, or a vouch that
         scrolled off, taking its room back behind the pairing gate. Say it rather
         than invent a cursor parameter the API does not have.
@@ -811,6 +812,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                 ws_url = _ws_url_for(self.base_url, ticket)
                 async with self._http_session.ws_connect(ws_url, heartbeat=30) as ws:
                     backoff = 1.0
+                    # Ask what we missed before trusting the live feed. After the
+                    # connect, not before: anything landing mid-backfill then
+                    # arrives over the socket too, and the uid dedupe absorbs it.
+                    # Before, and that same message falls in a second gap.
+                    await self._backfill(chat_uid)
                     async for msg in ws:
                         if self._stop_event.is_set():
                             break
@@ -835,6 +841,66 @@ class PlowChatAdapter(BasePlatformAdapter):
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+    async def _messages_page(self, chat_uid: str, after: Optional[str]) -> dict:
+        """One page of a chat's messages, newest-first.
+
+        Unlike the list endpoints `_page_full` serves, this one takes a real
+        cursor, so it pages properly rather than complaining about has_more.
+        `_body` raises on a non-2xx: an error page is not an empty page, and
+        reading a 500 as "nothing missed" moves the baseline past the gap.
+        """
+        url = f"{self.base_url}/v1/chats/{chat_uid}/messages?limit=50"
+        if after:
+            url += f"&starting_after={after}"
+        async with self._http_session.get(
+            url, headers={"Authorization": f"Bearer {self.token}"}
+        ) as resp:
+            return await _body(resp)
+
+    async def _anchor(self, chat_uid: str) -> None:
+        """Record where a first-seen chat starts, dispatching nothing.
+
+        An empty chat anchors with an empty cursor rather than no cursor: the
+        marker is what stops a restart anchoring a second time, over messages
+        that arrived in between.
+        """
+        page = (await self._messages_page(chat_uid, None)).get("data") or []
+        self._checkpoint(chat_uid, page[0]["uid"] if page else "")
+
+    async def _backfill(self, chat_uid: str) -> None:
+        """Dispatch whatever arrived while this chat had no socket.
+
+        Frames are not replayable and a dropped socket misses them outright, so
+        the durable message record is the only recovery. Paged newest-first on a
+        uid cursor back to the last uid dispatched, then replayed oldest-first so
+        the conversation returns in order. Runs AFTER the socket is connected:
+        anything arriving mid-backfill then comes over the socket, and the uid
+        dedupe absorbs the overlap.
+        """
+        if chat_uid not in self._last_uids:
+            await self._anchor(chat_uid)
+            return
+        missed: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            body = await self._messages_page(chat_uid, cursor)
+            page = body.get("data") or []
+            reached = False
+            for message in page:
+                if message["uid"] == self._last_uids.get(chat_uid):
+                    reached = True
+                    break
+                missed.append(message)
+            # Bounded by the cursor, not by a page count: stopping early would
+            # drop the OLDEST missed messages while still advancing past them.
+            if reached or not page or not body.get("has_more"):
+                break
+            cursor = page[-1]["uid"]
+        for message in reversed(missed):
+            await self._handle_ws_frame(chat_uid, {"type": "message_received", "message": message})
+        if missed:
+            logger.info("[plow_chat] backfilled %d missed message(s) in %s", len(missed), chat_uid)
 
     def _cursor_path(self) -> pathlib.Path:
         """One file for every chat, beside the rest of the agent's state.

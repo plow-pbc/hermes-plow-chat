@@ -537,7 +537,9 @@ class PagingSession:
 
     def get(self, url, **kwargs):
         self.gets.append((url, kwargs))
-        path = url.replace("https://api.plow.co", "")
+        # Keyed on the path alone; `self.gets` keeps the full url so a test can
+        # still assert on the query it sent.
+        path = url.replace("https://api.plow.co", "").split("?")[0]
         return FakeResponse({"data": self.pages.get(path, []), "has_more": self.has_more})
 
     async def close(self):
@@ -1306,3 +1308,155 @@ def test_a_dispatched_turn_checkpoints(monkeypatch, tmp_path):
     asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
 
     assert a._last_uids == {"cht_a": "msg_1"}
+
+
+def _msg(uid, body):
+    return {"uid": uid, "direction": "inbound", "chat_uid": "cht_a", "body": body,
+            "sender": {"uid": "u1", "display_name": "Sam"}}
+
+
+def test_a_first_sight_chat_anchors_without_replaying_its_history(monkeypatch, tmp_path):
+    """Adopting a chat must not fire its whole back catalogue at the agent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [_msg("msg_9", "newest")]})
+
+    asyncio.run(a._anchor("cht_a"))
+
+    assert a._last_uids == {"cht_a": "msg_9"}
+    assert a.handled == []
+
+
+def test_an_empty_chat_still_anchors(monkeypatch, tmp_path):
+    """Without a marker the next process re-anchors over everything that
+    arrived in between."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": []})
+
+    asyncio.run(a._anchor("cht_a"))
+
+    assert a._last_uids == {"cht_a": ""}
+
+
+def test_backfill_replays_the_gap_oldest_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._checkpoint("cht_a", "msg_1")
+    # The API answers newest-first.
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        _msg("msg_3", "third"), _msg("msg_2", "second"), _msg("msg_1", "first"),
+    ]})
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["second", "third"]
+    assert a._last_uids["cht_a"] == "msg_3"
+
+
+def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._checkpoint("cht_a", "msg_1")
+
+    class ErrorResponse(FakeResponse):
+        async def text(self):
+            return "upstream exploded"
+
+    class Failing:
+        def get(self, url, **kwargs):
+            return ErrorResponse({}, status=500)
+
+        async def close(self):
+            return None
+
+    a._http_session = Failing()
+
+    with pytest.raises(RuntimeError, match="500"):
+        asyncio.run(a._backfill("cht_a"))
+    assert a._last_uids["cht_a"] == "msg_1", "the cursor must not move over an unread gap"
+
+
+def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch, tmp_path):
+    """The cursor bounds the walk, not a page count. Stopping at the first page
+    would drop the OLDEST missed messages while still advancing past them —
+    the exact loss backfill exists to prevent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._checkpoint("cht_a", "msg_0")
+
+    pages = {
+        None: ([_msg("msg_4", "fourth"), _msg("msg_3", "third")], True),
+        "msg_3": ([_msg("msg_2", "second"), _msg("msg_1", "first")], True),
+        "msg_1": ([_msg("msg_0", "anchor")], False),
+    }
+
+    class CursorSession:
+        def __init__(self):
+            self.asked = []
+
+        def get(self, url, **kwargs):
+            after = None
+            if "starting_after=" in url:
+                after = url.split("starting_after=")[1]
+            self.asked.append(after)
+            data, has_more = pages[after]
+            return FakeResponse({"data": data, "has_more": has_more})
+
+        async def close(self):
+            return None
+
+    a._http_session = CursorSession()
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["first", "second", "third", "fourth"]
+    assert a._http_session.asked == [None, "msg_3", "msg_1"], "it must follow the cursor"
+    assert a._last_uids["cht_a"] == "msg_4"
+
+
+def test_reconnecting_backfills_before_serving_live_frames(monkeypatch, tmp_path):
+    """The whole point: a socket that comes back must first ask what it missed.
+
+    Ordering matters — backfill runs AFTER the socket is up, so anything landing
+    mid-backfill arrives over the socket and the uid dedupe absorbs the overlap.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    order = []
+
+    class Socket:
+        async def __aenter__(self):
+            order.append("connected")
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def __aiter__(self):
+            a._stop_event.set()
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    a._http_session = types.SimpleNamespace(ws_connect=lambda url, **kw: Socket())
+
+    async def _mint(chat_uid):
+        return "tkt"
+
+    a._mint_ws_ticket = _mint
+
+    async def _backfill(chat_uid):
+        order.append(f"backfilled:{chat_uid}")
+
+    a._backfill = _backfill
+
+    async def _sleep_once(_delay):
+        a._stop_event.set()
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep_once)
+
+    asyncio.run(a._websocket_loop("cht_home"))
+
+    assert order == ["connected", "backfilled:cht_home"]
