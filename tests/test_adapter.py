@@ -695,8 +695,9 @@ def test_one_unclassifiable_chat_does_not_abort_discovery(monkeypatch):
     ([(["+1"], "+1"), (["+2"], "+2")], "+2"),        # the account changed hands
     ([(["+1", "+2"], "+2")], "+2"),                  # ...and the owner is not the first row
     ([(["+9"], None)], None),                        # nobody here owns the account
+    ([(["+1", "+2"], "+1"), (["+9"], None)], None),  # owned, then the owner leaves
 ], ids=["company-first-poll", "company-later", "changes-identity", "owner-is-not-first",
-        "no-owner"])
+        "no-owner", "owner-leaves"])
 def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_operator):
     """A crowded home chat used to clear the operator, because the pick was positional
     and choosing among several members would have been a silent escalation. `role` is
@@ -713,7 +714,10 @@ def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_ope
     if expected_operator is None:
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
-        assert adapter_mod._NO_OWNER_LOG % len(polls[0][0]) in caplog.text
+        # The emitting poll is the first one that reports no owner — neither end of the
+        # list, so a row that starts owned and later loses one still anchors correctly.
+        no_owner = next(members for members, owner in polls if owner is None)
+        assert adapter_mod._NO_OWNER_LOG % len(no_owner) in caplog.text
 
 
 def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch, caplog):
