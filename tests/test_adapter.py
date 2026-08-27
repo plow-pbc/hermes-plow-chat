@@ -1275,25 +1275,22 @@ def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, ca
     assert "403" in caplog.text, "the status is what makes this diagnosable"
 
 
-# --- durable cursor + backfill across a socket gap (#2) ---------------------
+# --- durable seen-set + backfill across a socket gap (#2) ------------------
 
 
-def test_the_cursor_survives_a_restart(monkeypatch):
+def test_what_the_agent_has_answered_survives_a_restart(monkeypatch):
     a = _adapter(monkeypatch)
-    a._checkpoint("cht_a", "msg_7", EARLY)
+    a._mark_seen("cht_a", ["msg_7"])
 
-    revived = _adapter(monkeypatch)
-
-    assert revived._last_uids == {"cht_a": {"uid": "msg_7", "at": EARLY}}
+    assert _adapter(monkeypatch)._seen == {"cht_a": ["msg_7"]}
 
 
-def test_a_failed_cursor_write_leaves_the_last_good_one_intact(monkeypatch, tmp_path):
+def test_a_failed_write_leaves_the_last_good_record_intact(monkeypatch, tmp_path):
     """The rename is the commit point. A write that dies before it must leave
-    the previous map readable — a half-written cursor would raise on every
-    later start, which is the one failure an unattended agent cannot recover
-    from."""
+    the previous record readable — a half-written file would raise on every
+    later start, the one failure an unattended agent cannot recover from."""
     a = _adapter(monkeypatch)
-    a._checkpoint("cht_a", "msg_1", EARLY)
+    a._mark_seen("cht_a", ["msg_1"])
     real_replace = adapter_mod.os.replace
 
     def die(src, dst):
@@ -1302,35 +1299,44 @@ def test_a_failed_cursor_write_leaves_the_last_good_one_intact(monkeypatch, tmp_
     adapter_mod.os.replace = die
     try:
         with pytest.raises(OSError):
-            a._checkpoint("cht_a", "msg_2", EARLY)
+            a._mark_seen("cht_a", ["msg_2"])
     finally:
         adapter_mod.os.replace = real_replace
 
-    assert json.loads((tmp_path / "plow-chat-cursor.json").read_text()) == {
-        "cht_a": {"uid": "msg_1", "at": EARLY}}
-    assert _adapter(monkeypatch)._last_uids == {
-        "cht_a": {"uid": "msg_1", "at": EARLY}}, "and it still loads"
+    assert json.loads((tmp_path / "plow-chat-seen.json").read_text()) == {"cht_a": ["msg_1"]}
+    assert _adapter(monkeypatch)._seen == {"cht_a": ["msg_1"]}, "and it still loads"
 
 
-@pytest.mark.parametrize("garbage", ['{"cht_a": 1}', "[]", "not json at all", ""])
-def test_an_unreadable_cursor_starts_empty_rather_than_stopping_the_agent(
+@pytest.mark.parametrize("garbage", ['{"cht_a": 1}', '{"cht_a": [2]}', "[]", "nope", ""])
+def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
     monkeypatch, tmp_path, caplog, garbage
 ):
-    """Losing a cursor costs one anchored chat. Raising here costs every message
-    the agent would ever handle, so the load path may not raise — but it must
-    say so, because an anchored chat skips whatever was pending in it."""
-    (tmp_path / "plow-chat-cursor.json").write_text(garbage)
+    """Losing it costs one anchored chat. Raising here costs every message the
+    agent would ever handle, so the load path may not raise — but it must say
+    so, because an anchored chat skips whatever was pending in it."""
+    (tmp_path / "plow-chat-seen.json").write_text(garbage)
 
     with caplog.at_level(logging.WARNING):
         a = _adapter(monkeypatch)
 
-    assert a._last_uids == {}
-    assert "could not read the message cursor" in caplog.text
+    assert a._seen == {}
+    assert "could not read the seen-message record" in caplog.text
 
 
-def test_the_cursor_advances_only_after_the_turn_is_dispatched(monkeypatch, tmp_path):
-    """A turn the gateway refused has not been seen by the agent. Moving the
-    cursor over it is exactly the loss this file exists to prevent."""
+def test_a_missing_state_root_stops_the_agent_by_name(monkeypatch):
+    """Not a per-message KeyError. Read at each call site this warned benignly
+    at construction and then raised past handle_message on every inbound
+    message, tearing the socket down and re-backfilling once per turn."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    with pytest.raises(RuntimeError, match="HERMES_HOME"):
+        _adapter(monkeypatch)
+
+
+def test_only_a_dispatched_turn_is_recorded_as_seen(monkeypatch):
+    """A turn the gateway refused has not been seen by the agent. Recording it
+    is exactly the loss this file exists to prevent — and with one record there
+    is no second half that could disagree about it."""
 
     class Boom(adapter_mod.PlowChatAdapter):
         async def handle_message(self, event):
@@ -1341,29 +1347,21 @@ def test_the_cursor_advances_only_after_the_turn_is_dispatched(monkeypatch, tmp_
     with pytest.raises(RuntimeError):
         asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a")))
 
-    assert a._last_uids == {}, "an undelivered turn must stay replayable"
-    # Both halves or neither. Asserting only the cursor let the uid sit in the
-    # in-memory set, where the backfill would fetch this message and then drop
-    # it — replayable on paper, silently swallowed in fact.
-    assert "m1" not in a._seen_message_uids
+    assert a._seen == {}, "an undelivered turn must stay replayable"
+
+    b = _adapter(monkeypatch, cls=CapturingAdapter)
+    asyncio.run(b._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
+    assert b._seen == {"cht_a": ["msg_1"]}
 
 
-def test_a_dispatched_turn_checkpoints(monkeypatch):
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-
-    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
-
-    assert a._last_uids == {"cht_a": {"uid": "msg_1", "at": LATE}}
-
-
-@pytest.mark.parametrize("history, expected, expected_at", [
-    ([_msg("msg_9", "newest")], "msg_9", LATE),
-    # An empty chat still records that it anchored. Without the marker the next
-    # process re-anchors, over everything that arrived in between.
-    ([], "", ""),
+@pytest.mark.parametrize("history, expected", [
+    ([_msg("msg_9", "newest"), _msg("msg_8", "older")], ["msg_9", "msg_8"]),
+    # An empty chat still records that it anchored. Without the entry the next
+    # walk re-anchors, over everything that arrived in between.
+    ([], []),
 ])
 def test_a_first_sight_chat_anchors_without_replaying_its_history(
-    monkeypatch, history, expected, expected_at
+    monkeypatch, history, expected
 ):
     """Adopting a chat must not fire its whole back catalogue at the agent."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
@@ -1371,13 +1369,13 @@ def test_a_first_sight_chat_anchors_without_replaying_its_history(
 
     asyncio.run(a._anchor("cht_a"))
 
-    assert a._last_uids == {"cht_a": {"uid": expected, "at": expected_at}}
+    assert a._seen == {"cht_a": expected}
     assert a.handled == []
 
 
 def test_backfill_replays_the_gap_oldest_first(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_1", EARLY)
+    a._mark_seen("cht_a", ["msg_1"])
     # The API answers newest-first.
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
         _msg("msg_3", "third"), _msg("msg_2", "second"), _msg("msg_1", "first"),
@@ -1386,12 +1384,31 @@ def test_backfill_replays_the_gap_oldest_first(monkeypatch):
     asyncio.run(a._backfill("cht_a"))
 
     assert [e.text for e in a.handled] == ["second", "third"]
-    assert a._last_uids["cht_a"]["uid"] == "msg_3"
+    assert a._seen["cht_a"][0] == "msg_3", "newest first"
+
+
+def test_a_message_deleted_from_the_history_changes_nothing(monkeypatch):
+    """The endpoint filters deleted_at IS NULL. A position cursor pointing at a
+    deleted message stops matching and the walk runs past where the agent
+    actually stopped, re-answering everything below. Set membership has no such
+    failure: the deleted uid simply never comes back, and its neighbours still
+    answer for themselves."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_deleted", "msg_1"])
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        _msg("msg_2", "genuinely new"),
+        # msg_deleted would sit here; it is gone from the history.
+        _msg("msg_1", "already answered"),
+    ]})
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["genuinely new"], "no duplicate re-answering"
 
 
 def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_1", EARLY)
+    a._mark_seen("cht_a", ["msg_1"])
 
     class ErrorResponse(FakeResponse):
         async def text(self):
@@ -1408,15 +1425,14 @@ def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatc
 
     with pytest.raises(RuntimeError, match="500"):
         asyncio.run(a._backfill("cht_a"))
-    assert a._last_uids["cht_a"]["uid"] == "msg_1", "the cursor must not move over an unread gap"
+    assert a._seen["cht_a"] == ["msg_1"], "the record must not move over an unread gap"
 
 
 def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
-    """The cursor bounds the walk, not a page count. Stopping at the first page
-    would drop the OLDEST missed messages while still advancing past them —
-    the exact loss backfill exists to prevent."""
+    """A fully-seen page is the floor, not a page count. Stopping early would
+    drop the OLDEST missed messages while still recording the newest as seen."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_0", EARLY)
+    a._mark_seen("cht_a", ["msg_0"])
 
     pages = {
         None: ([_msg("msg_4", "fourth"), _msg("msg_3", "third")], True),
@@ -1429,9 +1445,7 @@ def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
             self.asked = []
 
         def get(self, url, **kwargs):
-            after = None
-            if "starting_after=" in url:
-                after = url.split("starting_after=")[1]
+            after = url.split("starting_after=")[1] if "starting_after=" in url else None
             self.asked.append(after)
             data, has_more = pages[after]
             return FakeResponse({"data": data, "has_more": has_more})
@@ -1445,15 +1459,87 @@ def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
 
     assert [e.text for e in a.handled] == ["first", "second", "third", "fourth"]
     assert a._http_session.asked == [None, "msg_3", "msg_1"], "it must follow the cursor"
-    assert a._last_uids["cht_a"]["uid"] == "msg_4"
+
+
+def test_the_walk_stops_at_the_first_page_it_has_seen_before(monkeypatch):
+    """Everything below a fully-familiar page was dispatched before it, so
+    paging on would spend requests to rediscover what is already recorded."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_1", "msg_0"])
+
+    class Counting:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            return FakeResponse({"data": [_msg("msg_1", "seen"), _msg("msg_0", "seen too")],
+                                 "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Counting()
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert a.handled == []
+    assert a._http_session.calls == 1, "a familiar page ends the walk"
+
+
+def test_an_unbounded_wall_of_unseen_messages_stops_and_says_so(monkeypatch, caplog):
+    """The backstop for a gap longer than anyone expects to recover. Anything
+    older is not replayed, and only the operator can tell a long outage from a
+    broken endpoint."""
+    monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_never_returned"])
+
+    class Endless:
+        def get(self, url, **kwargs):
+            after = url.split("starting_after=")[1] if "starting_after=" in url else None
+            n = int(after.rsplit("_", 1)[1]) if after else 0
+            return FakeResponse({"data": [_msg(f"m_{n + 1}", f"body_{n + 1}"),
+                                          _msg(f"m_{n + 2}", f"body_{n + 2}")],
+                                 "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Endless()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["body_4", "body_3", "body_2", "body_1"]
+    assert "not looking further back" in caplog.text
+
+
+def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
+    """`while True` here hung with the socket connected and no frame ever read —
+    no exception, no log, a dead line with no symptom."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_0"])
+
+    class Stuck:
+        def get(self, url, **kwargs):
+            after = url.split("starting_after=")[1] if "starting_after=" in url else None
+            body = [_msg("m_1", "new"), _msg("m_2", "also new")] if after is None else \
+                   [_msg("m_3", "still new"), _msg("m_2", "same tail forever")]
+            return FakeResponse({"data": body, "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Stuck()
+
+    with pytest.raises(RuntimeError, match="did not advance"):
+        asyncio.run(a._backfill("cht_a"))
 
 
 def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
-    """The whole point: a socket that comes back must first ask what it missed.
-
-    Ordering matters — backfill runs AFTER the socket is up, so anything landing
-    mid-backfill arrives over the socket and the uid dedupe absorbs the overlap.
-    """
+    """Backfill runs AFTER the socket is up, so anything landing mid-backfill
+    arrives over the socket and the same record absorbs the overlap."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     order = []
 
@@ -1494,78 +1580,9 @@ def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
     assert order == ["connected", "backfilled:cht_home"]
 
 
-def test_a_missing_state_root_stops_the_agent_by_name(monkeypatch):
-    """Not a per-message KeyError. Read at each call site this warned benignly at
-    construction and then raised past handle_message on every inbound message,
-    tearing the socket down and re-backfilling once per turn."""
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-
-    with pytest.raises(RuntimeError, match="HERMES_HOME"):
-        _adapter(monkeypatch)
-
-
-def test_an_unmeetable_cursor_bounds_the_fetch_but_never_the_replay(monkeypatch, caplog):
-    """The endpoint filters deleted_at IS NULL, so a swept cursor is never met
-    and the walk needs a backstop. That backstop bounds what is FETCHED — every
-    message it did fetch is one this agent has not seen, and dropping any of
-    them would checkpoint past real traffic, which is the loss backfill undoes."""
-    monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
-    monkeypatch.setattr(adapter_mod, "PAGE_SIZE", 2)
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_swept", EARLY)
-
-    class Endless:
-        """Newest-first, always another page, never holding the cursor."""
-
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            n = int(after.rsplit("_", 1)[1]) if after else 0
-            return FakeResponse({"data": [_msg(f"m_{n + 1}", f"body_{n + 1}"),
-                                          _msg(f"m_{n + 2}", f"body_{n + 2}")],
-                                 "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Endless()
-
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(a._backfill("cht_a"))
-
-    # Two pages of two, replayed oldest-first. Identity and order, not a count:
-    # a count passes just as well when the truncation keeps the wrong end.
-    assert [e.text for e in a.handled] == ["body_4", "body_3", "body_2", "body_1"]
-    # And the self-heal that makes the backstop survivable — the cursor now names
-    # the newest message, so the next reconnect meets it on page one instead of
-    # re-walking the cap every time the socket drops.
-    assert a._last_uids["cht_a"]["uid"] == "m_1"
-    assert len([r for r in caplog.records if r.levelno >= logging.WARNING]) == 1, \
-        "one outcome, one warning — two that disagree is what an operator reads during the incident"
-
-
-def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
-    """`while True` here hung with the socket connected and no frame ever read —
-    no exception, no log, a dead line with no symptom."""
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_0", EARLY)
-
-    class Stuck:
-        def get(self, url, **kwargs):
-            return FakeResponse({"data": [_msg("m_1", "same page forever")], "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Stuck()
-
-    with pytest.raises(RuntimeError, match="did not advance"):
-        asyncio.run(a._backfill("cht_a"))
-
-
 def test_a_failing_backfill_still_serves_live_frames(monkeypatch, caplog):
-    """The point of catching it. A deterministic backfill failure must not mute
-    the room — losing a replay costs a late answer, losing the socket costs
-    every answer."""
+    """Losing a replay costs a late answer; losing the socket costs every
+    answer. A deterministic backfill failure must not mute the room."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
 
     class Socket:
@@ -1616,28 +1633,3 @@ def test_a_failing_backfill_still_serves_live_frames(monkeypatch, caplog):
 
     assert [e.text for e in a.handled] == ["still listening"]
     assert "backfill failed" in caplog.text
-
-
-def test_a_swept_cursor_falls_back_to_its_timestamp_instead_of_re_answering(monkeypatch, caplog):
-    """The uid is exact but not durable — the endpoint filters deleted_at IS
-    NULL, so a deleted cursor message stops coming back and the walk runs past
-    where this agent actually stopped. Everything older than the cursor was
-    already dispatched, already answered, and already acted on, and this runtime
-    acts on what it reads. The timestamp is the coordinate that survives."""
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._checkpoint("cht_a", "msg_swept", "2026-08-27T12:00:00Z")
-
-    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
-        _msg("m_new", "after the gap", at="2026-08-27T13:00:00Z"),
-        # msg_swept would sit here; it is gone from the history.
-        _msg("m_old", "already answered", at="2026-08-27T11:00:00Z"),
-        _msg("m_older", "also already answered", at="2026-08-27T10:00:00Z"),
-    ]})
-
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(a._backfill("cht_a"))
-
-    assert [e.text for e in a.handled] == ["after the gap"], "duplicates must not be re-answered"
-    assert a._last_uids["cht_a"]["uid"] == "m_new"
-    assert "cursor message 'msg_swept' is gone" in caplog.text
-    assert "dropped 2 already-dispatched" in caplog.text

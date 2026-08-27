@@ -67,7 +67,7 @@ the Hermes image does, and the adapter refuses to construct without it:
 
 | var | set by | meaning |
 |---|---|---|
-| `HERMES_HOME` | the image (`/opt/data`) | state root. The adapter keeps `plow-chat-cursor.json` there — the newest message uid it has dispatched per chat, which is what a reconnect pages back to. Resolved once at construction and fatal if unset, rather than defaulted to the working directory: a cursor read from the wrong root reads as a clean start, and a clean start replays nothing. |
+| `HERMES_HOME` | the image (`/opt/data`) | state root. The adapter keeps `plow-chat-seen.json` there — the message uids it has dispatched per chat, which is what a reconnect asks before replaying. Resolved once at construction and fatal if unset, rather than defaulted to the working directory: a record read from the wrong root reads as a clean start, and a clean start replays nothing. |
 
 ## There is a second implementation, and it is not this one
 

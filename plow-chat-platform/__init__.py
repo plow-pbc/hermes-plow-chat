@@ -156,10 +156,11 @@ GROUP_POLICY = "\n\n".join([_ADDRESSED_ONLY, _DISCLOSURE, _NO_RELAY])
 # shortening it is quota, of lengthening it somebody repeating themselves.
 RECONCILE_SECONDS = 60
 PAGE_SIZE = 50
-# A backstop on the FETCH, for the cases the cursor cannot bound: a cursor the
-# endpoint stopped returning (it filters deleted_at IS NULL) would otherwise walk
-# a whole chat. It deliberately does not bound the replay — see _backfill.
+# A backstop on the walk, for a gap longer than anyone expects to recover.
 MAX_BACKFILL_PAGES = 10
+# Deliberately several pages past MAX_BACKFILL_PAGES * PAGE_SIZE, so trimming
+# the seen-set can never expose a message the next walk would call unseen.
+SEEN_LIMIT = 1000
 
 # The connected adapter and the loop its listener tasks run on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
@@ -356,11 +357,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._http_session = None
         self._ws_tasks: dict[str, asyncio.Task] = {}
         self._reconcile_task: Optional[asyncio.Task] = None
-        self._seen_message_uids: set[str] = set()
-        # The durable half of the dedupe above. The set stops a live frame and its
-        # backfill copy racing inside one process; this stops a restart replaying
-        # from the beginning of a chat, or from nothing at all.
-        self._last_uids: dict[str, dict[str, str]] = {}
+        # What this agent has already dispatched, per chat and durable. One
+        # record, not two: an in-memory set beside a persisted position meant two
+        # answers to "have I handled this", and every way they disagreed was a
+        # message either dropped or answered twice.
+        self._seen: dict[str, list[str]] = {}
         # Resolved once, here, so there is exactly one answer to "where does
         # state live" and a missing setting is a startup failure with a name on
         # it. Read per call it was worse than useless: the load path caught the
@@ -375,7 +376,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 "HERMES_HOME is unset; the Plow Chat adapter stores its message "
                 "cursor there and cannot tell a first run from a lost one without it"
             ) from None
-        self._load_cursors()
+        self._load_seen()
         self._stop_event = asyncio.Event()
         # The 60s poll and the tool's post-send pass both reconcile. Without this
         # they interleave, and an older /v1/chats snapshot applying second evicts a
@@ -895,32 +896,43 @@ class PlowChatAdapter(BasePlatformAdapter):
             return await _body(resp)
 
     async def _anchor(self, chat_uid: str) -> None:
-        """Record where a first-seen chat starts, dispatching nothing.
+        """Mark a first-seen chat's current history as seen, dispatching nothing.
 
-        An empty chat anchors with an empty cursor rather than no cursor: the
-        marker is what stops a restart anchoring a second time, over messages
-        that arrived in between.
+        Without this an adopted chat has an empty seen-set, so its entire back
+        catalogue reads as unseen and gets fired at the agent one turn at a time.
         """
         page = (await self._messages_page(chat_uid, None)).get("data") or []
-        newest = page[0] if page else {}
-        self._checkpoint(chat_uid, newest.get("uid", ""), newest.get("created_at", ""))
+        self._mark_seen(chat_uid, [m["uid"] for m in page])
 
     async def _backfill(self, chat_uid: str) -> None:
         """Dispatch whatever arrived while this chat had no socket.
 
         Frames are not replayable and a dropped socket misses them outright, so
-        the durable message record is the only recovery. Paged newest-first on a
-        uid cursor back to the last uid dispatched, then replayed oldest-first so
-        the conversation returns in order. Runs AFTER the socket is connected:
-        anything arriving mid-backfill then comes over the socket, and the uid
-        dedupe absorbs the overlap.
+        the durable message record is the only recovery. Pages newest-first,
+        keeping what this agent has not already dispatched, and stops once a
+        whole page is familiar — everything older than a fully-seen page was
+        dispatched before it. Replayed oldest-first so the conversation returns
+        in order.
+
+        Asks the seen-set rather than a position, because a position is a guess
+        that the endpoint can invalidate: it filters `deleted_at IS NULL`, so a
+        cursor message that gets deleted stops coming back and any walk hunting
+        for it runs straight past where this agent actually stopped. Set
+        membership has no such failure — a uid nobody returns is simply a uid
+        that never matches, and the messages around it still answer for
+        themselves. It also has no ordering, so nothing here depends on
+        timestamp resolution, tie-breaking, or a serializer's fractional
+        seconds.
+
+        Runs AFTER the socket is connected: anything arriving mid-backfill then
+        comes over the socket too, and the same set absorbs the overlap.
         """
         # Deliberately not cleared when a chat leaves reach, unlike its vouch and
-        # its socket: a vouch is a grant that must not outlive the room, while a
-        # cursor is a fact about what this agent has already seen. Dropping it
-        # would make a chat that flaps out of a paged listing and back anchor
-        # again, skipping precisely the messages that arrived while it was gone.
-        if chat_uid not in self._last_uids:
+        # its socket: a vouch is a grant that must not outlive the room, while
+        # what this agent has already answered is a fact that does not expire.
+        # Dropping it would make a chat that flaps out of a paged listing and
+        # back re-answer everything it had already handled.
+        if chat_uid not in self._seen:
             await self._anchor(chat_uid)
             return
         missed: list[dict] = []
@@ -928,18 +940,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         for _ in range(MAX_BACKFILL_PAGES):
             body = await self._messages_page(chat_uid, cursor)
             page = body.get("data") or []
-            reached = False
-            for message in page:
-                if message["uid"] == self._last_uids[chat_uid]["uid"]:
-                    reached = True
-                    break
-                missed.append(message)
-            # The uid is the intended bound, and on this path everything fetched
-            # is genuinely unseen. MAX_BACKFILL_PAGES below is the backstop for
-            # when the uid cannot be met — there the walk overshoots and the
-            # timestamp does the cutting instead, because a page cap would drop
-            # the oldest real traffic while still checkpointing past it.
-            if reached or not page or not body.get("has_more"):
+            fresh = [m for m in page if m["uid"] not in self._seen[chat_uid]]
+            missed.extend(fresh)
+            # A page with nothing new on it is the floor: this agent was here
+            # already, so everything below it was dispatched earlier.
+            if not fresh or not page or not body.get("has_more"):
                 break
             if page[-1]["uid"] == cursor:
                 # The page did not advance, so the next request is this one. A
@@ -951,50 +956,35 @@ class PlowChatAdapter(BasePlatformAdapter):
                     "refusing to spin"
                 )
             cursor = page[-1]["uid"]
-        if missed and not reached:
-            # The uid was never met, so the walk ran past wherever this agent
-            # actually stopped. The timestamp is the second coordinate and it
-            # survived whatever happened to the uid: anything at or before it was
-            # already dispatched, already answered, and — this runtime acting on
-            # what it reads — already acted on. Cut there. It is exact, so a
-            # genuine long gap loses nothing and a swept cursor sheds precisely
-            # the duplicates.
-            fenced = [m for m in missed if (m.get("created_at") or "") > self._last_uids[chat_uid]["at"]]
-            if len(fenced) < len(missed):
-                logger.warning(
-                    "[plow_chat] %s: cursor message %r is gone from the history; "
-                    "fell back to its timestamp and dropped %d already-dispatched "
-                    "message(s)",
-                    chat_uid, self._last_uids[chat_uid]["uid"], len(missed) - len(fenced),
-                )
-            else:
-                logger.warning(
-                    "[plow_chat] %s: replaying %d message(s) without having met "
-                    "cursor %r — the chat anchored empty, or the gap is longer "
-                    "than %d pages",
-                    chat_uid, len(fenced), self._last_uids[chat_uid]["uid"], MAX_BACKFILL_PAGES,
-                )
-            missed = fenced
+        else:
+            # Ran the backstop out without ever meeting a familiar page. Say so:
+            # anything older than this is not being replayed, and the operator
+            # is the one who can tell a long outage from a broken endpoint.
+            logger.warning(
+                "[plow_chat] %s: stopped after %d page(s) still finding unseen "
+                "messages; replaying %d and not looking further back",
+                chat_uid, MAX_BACKFILL_PAGES, len(missed),
+            )
         for message in reversed(missed):
             await self._handle_ws_frame(chat_uid, {"type": "message_received", "message": message})
         if missed:
             logger.info("[plow_chat] backfilled %d missed message(s) in %s", len(missed), chat_uid)
 
-    def _cursor_path(self) -> pathlib.Path:
+    def _seen_path(self) -> pathlib.Path:
         """One file for every chat, beside the rest of the agent's state.
 
         Keyed by chat uid rather than one file per chat: the whole map is
-        rewritten on each checkpoint, so a partial write can never leave two
-        chats disagreeing about which restart they belong to.
+        rewritten on each update, so a partial write can never leave two chats
+        disagreeing about which restart they belong to.
         """
-        return self._state_root / "plow-chat-cursor.json"
+        return self._state_root / "plow-chat-seen.json"
 
-    def _load_cursors(self) -> None:
-        """Adopt the cursor map, or start empty and say so.
+    def _load_seen(self) -> None:
+        """Adopt the seen-sets, or start empty and say so.
 
         Never raises. This runs at construction, and an unreadable or malformed
         file must not be the thing that stops an unattended agent from starting:
-        a lost cursor costs one anchored chat, a raise here costs every message.
+        losing it costs one anchored chat, a raise here costs every message.
         Warned rather than swallowed, because the cost is real — an anchored
         chat skips whatever was pending in it.
 
@@ -1002,42 +992,45 @@ class PlowChatAdapter(BasePlatformAdapter):
         raised at construction instead — see __init__.
         """
         try:
-            path = self._cursor_path()
+            path = self._seen_path()
             if not path.exists():
                 return
             loaded = json.loads(path.read_text())
             if not isinstance(loaded, dict) or not all(
-                isinstance(k, str) and isinstance(v, dict)
-                and isinstance(v.get("uid"), str) and isinstance(v.get("at"), str)
+                isinstance(k, str) and isinstance(v, list)
+                and all(isinstance(u, str) for u in v)
                 for k, v in loaded.items()
             ):
                 raise ValueError(
-                    "expected a map of chat uid to {uid, at}, got "
-                    f"{type(loaded).__name__}"
+                    f"expected a map of chat uid to message uids, got {type(loaded).__name__}"
                 )
-            self._last_uids = loaded
+            self._seen = {k: list(v) for k, v in loaded.items()}
         except (OSError, ValueError) as exc:
             logger.warning(
-                "[plow_chat] could not read the message cursor, starting from an "
-                "anchor instead — anything pending in a chat is skipped: %s", exc
+                "[plow_chat] could not read the seen-message record, starting from "
+                "an anchor instead — anything pending in a chat is skipped: %s", exc
             )
 
-    def _checkpoint(self, chat_uid: str, uid: str, created_at: str) -> None:
-        """Record the newest message this agent has dispatched for one chat.
+    def _mark_seen(self, chat_uid: str, uids: list[str]) -> None:
+        """Record that this agent has dealt with these messages, newest first.
 
-        Two coordinates, because one of them is not durable. The uid is exact
-        but the endpoint filters `deleted_at IS NULL`, so a deleted cursor
-        message simply stops coming back and the walk that looks for it
-        overshoots into messages already dispatched. The timestamp still bounds
-        those. Plow's stamps are ISO-8601 UTC, so they order as strings.
+        Bounded per chat: the set only has to reach back further than one
+        backfill walk can, and SEEN_LIMIT is several pages past
+        MAX_BACKFILL_PAGES so a trim can never expose a message the walk would
+        then call unseen.
 
-        Written atomically: a truncated cursor would raise on every later start.
+        Written atomically — a truncated file would raise on every later start.
         A fixed tmp name is safe because one adapter owns this file.
         """
-        self._last_uids[chat_uid] = {"uid": uid, "at": created_at}
-        path = self._cursor_path()
+        known = self._seen.setdefault(chat_uid, [])
+        # Prepended as a block, in the order given. Inserting one at a time at
+        # the front reverses them, and order is load-bearing here: the trim
+        # below drops the tail, which has to be the oldest.
+        known[:0] = [uid for uid in uids if uid not in known]
+        del known[SEEN_LIMIT:]
+        path = self._seen_path()
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(self._last_uids, indent=2, sort_keys=True))
+        tmp.write_text(json.dumps(self._seen, indent=2, sort_keys=True))
         os.replace(tmp, path)
 
     async def _handle_ws_frame(self, chat_uid: str, frame: dict[str, Any]) -> None:
@@ -1076,9 +1069,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         if (message.get("chat_uid") or chat_uid) != chat_uid:
             return
         msg_uid = message.get("uid") or str(int(time.time() * 1000))
-        if msg_uid in self._seen_message_uids:
+        if msg_uid in self._seen.get(chat_uid, []):
             return
-        self._seen_message_uids.add(msg_uid)
 
         sender = message.get("sender") or {}
         user_id = sender.get("uid") or sender.get("provider_key") or "member"
@@ -1127,19 +1119,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         source_kwargs["role_authorized"] = authorized
         if chat_type != "dm":
             event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid), sender)
-        try:
-            await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
-        except BaseException:
-            # Both halves of the dedupe or neither. The uid went into the set
-            # before dispatch; leaving it there would let the backfill fetch this
-            # message and then drop it here, for the life of the process — the
-            # loss the cursor below exists to prevent, reintroduced in memory.
-            self._seen_message_uids.discard(msg_uid)
-            raise
+        await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
         # After the dispatch, never before: a turn the gateway refused has not
-        # been seen by the agent, and a cursor past it is a message nobody will
-        # ever replay.
-        self._checkpoint(chat_uid, msg_uid, message.get("created_at") or "")
+        # been seen by the agent, and recording it here is a message nobody will
+        # ever replay. One record means there is no second half to keep in step.
+        self._mark_seen(chat_uid, [msg_uid])
 
     def _may_approve(self, chat_uid: str) -> bool:
         """Whether this chat's members may use tools and be paired.
