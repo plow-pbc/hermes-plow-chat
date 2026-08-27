@@ -713,7 +713,7 @@ def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_ope
     if expected_operator is None:
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
-        assert adapter_mod._NO_OWNER_LOG % len(polls[-1][0]) in caplog.text
+        assert adapter_mod._NO_OWNER_LOG % len(polls[0][0]) in caplog.text
 
 
 def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch, caplog):
@@ -731,7 +731,7 @@ def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypat
     asyncio.run(a._reconcile_once())
     assert a.operator_key is None
     assert "cht_good" in a.chat_uids     # the rest of the pass still ran
-    # Reaches the same log, so its wording has to be true of a missing handle too.
+    # Reaches the same log as an owner-less roster; the count is what tells them apart.
     assert adapter_mod._NO_OWNER_LOG % 1 in caplog.text
 
 
