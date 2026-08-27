@@ -217,6 +217,13 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     return groups
 
 
+_NO_OWNER_LOG = (
+    "no owner handle among the home chat's %d member participant(s); if the API is not "
+    "serving `role`, no room can be vouched either. An operator change can no longer be "
+    "seen, so vouched authority will not be revoked"
+)
+
+
 def _is_owner(participant: dict) -> bool:
     """Whether a sender or roster participant is the operator who owns this agent.
 
@@ -717,11 +724,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                                    "operator-vouched authority for %s", sorted(revoked))
                 self.operator_key = next_operator
                 if next_operator is None:
-                    logger.error("[plow_chat] no owner handle among the home chat's %d member "
-                                 "participant(s); if the API is not serving `role`, no room can "
-                                 "be vouched either. An operator change can no longer be seen, "
-                                 "so vouched authority will not be revoked",
-                                 len(home_members))
+                    logger.error("[plow_chat] " + _NO_OWNER_LOG, len(home_members))
             # Reach is settled FIRST, before any vouch hydration. The hydration below
             # does network reads that can fail, and a failure there used to abort the
             # pass before removal ever ran — so a departed room kept its socket and its
