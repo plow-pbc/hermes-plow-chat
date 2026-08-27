@@ -287,6 +287,10 @@ def test_groups_parses_uid_equals_name(monkeypatch):
         # could still equal a derived one — a bare uid, or the `(cht_…)` form.
         ("cht_a=cht_x", "looks like a chat id"),
         ("cht_a=Cleaning (cht_x)", "looks like a chat id"),
+        # Folded before matching, like every other pinned-tier rule here — the
+        # resolver compares case-insensitively, so a case variant is the same paste.
+        ("cht_a=CHT_X", "looks like a chat id"),
+        ("cht_a=Cleaning (CHT_X)", "looks like a chat id"),
     ],
 )
 def test_groups_rejects_malformed_entries(monkeypatch, value, message):

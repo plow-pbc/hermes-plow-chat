@@ -228,7 +228,8 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     # beside the other pinned-tier rules, where the operator is looking at what
     # they typed.
     shaped = sorted(group["name"] for group in groups.values()
-                    if group["name"].startswith("cht_") or _DERIVED_NAME_SHAPE.search(group["name"]))
+                    if (folded_name := group["name"].casefold()).startswith("cht_")
+                    or _DERIVED_NAME_SHAPE.search(folded_name))
     if shaped:
         raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {shaped[0]!r} looks like a chat "
                          f"id or an auto-generated name; pick a name a person would type")
