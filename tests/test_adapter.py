@@ -1325,12 +1325,21 @@ def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
 
 # `{"uid": <anything>}` is deliberately absent: only the keys are read, so a
 # mapping with junk values is a valid record, not a malformed one.
-@pytest.mark.parametrize("bad", [1, [2], "a bare string", None])
+@pytest.mark.parametrize("bad, fault", [
+    (1, "int"),
+    # A sound container holding an unsound element. Naming the container here
+    # ("got list") points an operator at the half that was fine.
+    ([2], "int element"),
+    ("a bare string", "str"),
+    (None, "NoneType"),
+])
 def test_one_malformed_chat_does_not_discard_every_other_chats_record(
-    monkeypatch, tmp_path, caplog, bad
+    monkeypatch, tmp_path, caplog, bad, fault
 ):
     """All-or-nothing meant a single bad entry anchored every chat on the box,
-    each silently skipping whatever was pending in it."""
+    each silently skipping whatever was pending in it. The warning is the only
+    thing telling an operator which chat that was, and why — so it has to name
+    the actual fault, not the type it happened to accept."""
     (tmp_path / "plow-chat-seen.json").write_text(
         json.dumps({"cht_good": {"msg_1": None}, "cht_bad": bad})
     )
@@ -1341,6 +1350,7 @@ def test_one_malformed_chat_does_not_discard_every_other_chats_record(
     assert a._seen == {"cht_good": {"msg_1": None}}
     assert "cht_bad" in caplog.text
     assert "cht_good" not in caplog.text
+    assert f"got {fault}" in caplog.text
 
 
 def test_a_record_written_as_a_list_still_loads(monkeypatch, tmp_path):
@@ -1785,21 +1795,3 @@ def test_the_backstop_count_reports_only_what_it_replayed(monkeypatch, caplog):
 
     assert [e.text for e in a.handled] == ["body_3", "body_1"]
     assert "replaying 2 and not looking further back" in caplog.text
-
-
-def test_the_dropped_record_warning_names_the_element_not_the_container(monkeypatch, tmp_path, caplog):
-    """This warning is the only thing telling an operator which chat will
-    silently skip pending messages on its next walk. Reporting the accepted type
-    as the fault — "got list", when the list is fine and an element is not —
-    points them at the wrong thing, and a wrong diagnostic is worse than none."""
-    (tmp_path / "plow-chat-seen.json").write_text(
-        json.dumps({"cht_good": ["ok_uid"], "cht_bad": ["ok_uid", 7]})
-    )
-
-    with caplog.at_level(logging.WARNING):
-        a = _adapter(monkeypatch)
-
-    assert "int element" in caplog.text
-    assert "got list" not in caplog.text
-    assert "cht_bad" in caplog.text
-    assert list(a._seen) == ["cht_good"], "the well-formed sibling survives"
