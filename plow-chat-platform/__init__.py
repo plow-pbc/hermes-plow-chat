@@ -579,8 +579,9 @@ class PlowChatAdapter(BasePlatformAdapter):
 
         The list endpoints this reads report has_more and document no way to ask
         for the next page. (`/v1/chats/{uid}/messages` is the exception — it
-        takes `starting_after`, which `_messages_page` below uses.) Everything read here degrades silently past that boundary while
-        the poll still looks healthy — a chat never discovered, or a vouch that
+        takes `starting_after`, which `_messages_page` below uses.) Everything
+        read here degrades silently past that boundary while the poll still
+        looks healthy — a chat never discovered, or a vouch that
         scrolled off, taking its room back behind the pairing gate. Say it rather
         than invent a cursor parameter the API does not have.
         """
