@@ -431,17 +431,21 @@ def test_the_group_session_guard_is_always_set(monkeypatch):
     assert _adapter(monkeypatch).config.extra["group_sessions_per_user"] is False
     assert _adapter(monkeypatch, groups=None).config.extra["group_sessions_per_user"] is False
 
-def _inbound(chat_uid, body="hi", uid="m1", sender=None):
+def _msg(uid, body="hi", chat_uid="cht_a", sender=None):
+    """One inbound message as the REST history returns it."""
     return {
-        "type": "message_received",
-        "message": {
-            "uid": uid,
-            "direction": "inbound",
-            "chat_uid": chat_uid,
-            "body": body,
-            "sender": sender or {"uid": "u1", "display_name": "Sam"},
-        },
+        "uid": uid,
+        "direction": "inbound",
+        "chat_uid": chat_uid,
+        "body": body,
+        "sender": sender or {"uid": "u1", "display_name": "Sam"},
     }
+
+
+def _inbound(chat_uid, body="hi", uid="m1", sender=None):
+    """The same message as the socket delivers it — wrapped in its frame."""
+    return {"type": "message_received",
+            "message": _msg(uid, body, chat_uid, sender)}
 
 
 def test_frame_naming_another_chat_is_ignored(monkeypatch):
@@ -1310,33 +1314,24 @@ def test_a_dispatched_turn_checkpoints(monkeypatch, tmp_path):
     assert a._last_uids == {"cht_a": "msg_1"}
 
 
-def _msg(uid, body):
-    return {"uid": uid, "direction": "inbound", "chat_uid": "cht_a", "body": body,
-            "sender": {"uid": "u1", "display_name": "Sam"}}
-
-
-def test_a_first_sight_chat_anchors_without_replaying_its_history(monkeypatch, tmp_path):
+@pytest.mark.parametrize("history, expected", [
+    ([_msg("msg_9", "newest")], "msg_9"),
+    # An empty chat still records that it anchored. Without the marker the next
+    # process re-anchors, over everything that arrived in between.
+    ([], ""),
+])
+def test_a_first_sight_chat_anchors_without_replaying_its_history(
+    monkeypatch, tmp_path, history, expected
+):
     """Adopting a chat must not fire its whole back catalogue at the agent."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [_msg("msg_9", "newest")]})
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": history})
 
     asyncio.run(a._anchor("cht_a"))
 
-    assert a._last_uids == {"cht_a": "msg_9"}
+    assert a._last_uids == {"cht_a": expected}
     assert a.handled == []
-
-
-def test_an_empty_chat_still_anchors(monkeypatch, tmp_path):
-    """Without a marker the next process re-anchors over everything that
-    arrived in between."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._http_session = PagingSession({"/v1/chats/cht_a/messages": []})
-
-    asyncio.run(a._anchor("cht_a"))
-
-    assert a._last_uids == {"cht_a": ""}
 
 
 def test_backfill_replays_the_gap_oldest_first(monkeypatch, tmp_path):
