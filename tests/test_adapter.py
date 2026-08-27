@@ -713,10 +713,10 @@ def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_ope
     if expected_operator is None:
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
-        assert "no owner among the home chat's" in caplog.text
+        assert "no owner handle among the home chat's" in caplog.text
 
 
-def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch):
+def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch, caplog):
     """Every read of this user-wide listing is `.get`-based for one reason: an exception
     escapes `_reconcile_once`, is swallowed as a warning, and costs the whole pass —
     reach, revocation and vouch hydration — on every poll for the life of the process."""
@@ -731,6 +731,8 @@ def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypat
     asyncio.run(a._reconcile_once())
     assert a.operator_key is None
     assert "cht_good" in a.chat_uids     # the rest of the pass still ran
+    # Reaches the same log, so its wording has to be true of a missing handle too.
+    assert "no owner handle among the home chat's" in caplog.text
 
 
 def test_a_new_operator_does_not_inherit_the_old_ones_vouches(monkeypatch):
