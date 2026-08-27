@@ -718,8 +718,10 @@ class PlowChatAdapter(BasePlatformAdapter):
                 self.operator_key = next_operator
                 if next_operator is None:
                     logger.error("[plow_chat] no owner among the home chat's %d member "
-                                 "participant(s); an operator change can no longer be seen, "
-                                 "so vouched authority will not be revoked",
+                                 "participant(s) — nobody there holds the account, or the API "
+                                 "is not serving `role` at all, in which case no room can be "
+                                 "vouched either. An operator change can no longer be seen, so "
+                                 "vouched authority will not be revoked",
                                  len(home_members))
             # Reach is settled FIRST, before any vouch hydration. The hydration below
             # does network reads that can fail, and a failure there used to abort the
