@@ -362,17 +362,33 @@ def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: st
     names: dict[str, str] = {}
     taken: dict[str, str] = {}
 
-    def claim(uid: str, name: str) -> None:
+    def claim(uid: str, name: str, *, pinned: bool = False) -> None:
+        """Assign a name. The only way one is assigned, and the only place
+        uniqueness is enforced -- every earlier shape of this checked `taken` at
+        each call site instead, and each round of review found another site that
+        did not. A pinned name is the operator's own and is never modified; two
+        of those cannot collide, because `_groups` rejects a repeated display
+        name and forbids the home uid.
+        """
+        if not pinned and name.casefold() in taken:
+            logger.warning("[plow_chat] %s wants a name that is already taken; "
+                           "disambiguating it with an id suffix", uid)
+            base, name, n = f"{name} ({uid[-6:]})", f"{name} ({uid[-6:]})", 2
+            # A title can imitate the suffix form, so the first suffix is not
+            # guaranteed free either. Terminates: each turn is a distinct string
+            # and `taken` is finite.
+            while name.casefold() in taken:
+                name, n = f"{base} {n}", n + 1
         names[uid] = name
         taken[name.casefold()] = uid
 
-    claim(home_uid, HOME_CHAT_NAME)
+    claim(home_uid, HOME_CHAT_NAME, pinned=True)
     for uid, group in groups.items():
-        claim(uid, group["name"])
+        claim(uid, group["name"], pinned=True)
 
     listed = {chat["uid"] for chat in chats}
     for uid, name in sorted(previous.items()):
-        if uid not in listed and uid not in names and name.casefold() not in taken:
+        if uid not in listed and uid not in names:
             claim(uid, name)
 
     wanted: dict[str, str] = {}
@@ -383,21 +399,37 @@ def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: st
         wanted[uid] = (chat.get("display_name") or "").strip() or _derive_name(chat) or uid
 
     for uid in sorted(wanted):
-        if previous.get(uid) == wanted[uid] and wanted[uid].casefold() not in taken:
+        if previous.get(uid) == wanted[uid]:
             claim(uid, wanted[uid])
 
     for uid in sorted(wanted):
-        if uid in names:
-            continue
-        name = wanted[uid]
-        if name.casefold() in taken:
-            # The uid and nothing else: the colliding name can be a handle, and
-            # the id is what an operator needs to find the thread anyway.
-            logger.warning("[plow_chat] %s wants a name that is already taken; "
-                           "disambiguating it with an id suffix", uid)
-            name = f"{name} ({uid[-6:]})"
-        claim(uid, name)
+        if uid not in names:
+            claim(uid, wanted[uid])
     return names
+
+
+def _aliases_path():
+    from hermes_cli.config import get_hermes_home
+
+    return get_hermes_home() / "channel_aliases.json"
+
+
+def _read_channel_aliases() -> dict[str, str]:
+    """Our own block of the registry, as last published.
+
+    The durable half of incumbency. `chat_names` is in-memory and
+    `_reset_poll_state` empties it on every connect, so without this a reconnect
+    puts the winner between two rooms wanting one name back on uid order -- and
+    an attacker need not win a race, only title their thread and wait for one.
+    Unreadable for any reason means no incumbents rather than no naming: this
+    decides who keeps a name, and the pass that follows still assigns every one.
+    """
+    try:
+        with open(_aliases_path(), encoding="utf-8") as fh:
+            block = json.load(fh).get("plow_chat")
+        return {k: v for k, v in block.items() if isinstance(v, str)} if isinstance(block, dict) else {}
+    except Exception:
+        return {}
 
 
 def _write_channel_aliases(names: dict[str, str]) -> None:
@@ -414,9 +446,7 @@ def _write_channel_aliases(names: dict[str, str]) -> None:
     cannot parse is left alone rather than overwritten -- the caller logs it
     every pass until someone fixes it.
     """
-    from hermes_cli.config import get_hermes_home
-
-    path = get_hermes_home() / "channel_aliases.json"
+    path = _aliases_path()
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -902,7 +932,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             # did not happen.
             # Filtered to reach: a name must not outlive the room it belongs to,
             # but must survive a page that simply did not list it.
-            carried = {uid: name for uid, name in self.chat_names.items()
+            carried = {uid: name
+                       for uid, name in (self.chat_names or _read_channel_aliases()).items()
                        if uid in self.chat_uids}
             self.chat_names = _resolve_chat_names(mine, self.groups, self.chat_uid, carried)
             try:

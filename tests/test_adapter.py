@@ -1515,3 +1515,50 @@ def test_a_newcomer_cannot_take_the_name_of_a_chat_that_is_merely_unlisted():
         previous={"cht_zzz": "Snoqualmie"})
     assert names["cht_zzz"] == "Snoqualmie"
     assert names["cht_aaa"].startswith("Snoqualmie (")
+
+
+def test_no_two_chats_can_publish_the_same_name():
+    """Uniqueness is what the whole collision rule rests on, so the suffix a
+    collision produces has to be checked too — a title can imitate the suffix
+    form and land on a name another room was just given."""
+    chats = [
+        _titled("cht_aaa", [OWNER], display_name="Foo"),
+        _titled("cht_bbb", [OWNER], display_name="Foo (ht_zzz)"),
+        _titled("cht_zzz", [OWNER], display_name="Foo"),
+    ]
+    names = adapter_mod._resolve_chat_names(chats, {}, "cht_home")
+    assert len(set(names.values())) == len(names), \
+        f"two rooms answer to one name: {names}"
+
+
+def test_incumbency_survives_a_reconnect(monkeypatch, tmp_path):
+    """chat_names is in-memory and _reset_poll_state empties it on every connect,
+    so an attacker would not need to win a race — only title their thread and wait
+    for a reconnect. The registry on disk is the durable record."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    path.write_text(json.dumps({"plow_chat": {"cht_zzz": "Cleaning"}}))
+
+    a = _adapter(monkeypatch, groups=None)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    assert a.chat_names == {}, "a freshly connected adapter remembers nothing"
+    a._http_session = PagingSession({
+        "/v1/chats": [
+            _chat("cht_home", "line_1", ["+1"]),
+            {**_chat("cht_zzz", "line_1", ["+1"]), "display_name": "Cleaning"},
+            {**_chat("cht_aaa", "line_1", ["+9"]), "display_name": "Cleaning"},
+        ],
+        "/v1/chats/cht_zzz/messages": [],
+        "/v1/chats/cht_aaa/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+
+    assert a.chat_names["cht_zzz"] == "Cleaning", "the room that held the name keeps it"
+    assert a.chat_names["cht_aaa"] != "Cleaning"
+
+
+def test_an_unreadable_registry_costs_incumbents_not_naming(monkeypatch, tmp_path):
+    """Reading the durable record is best-effort: it decides who KEEPS a name, and
+    the pass that follows still assigns every chat one."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    path.write_text("{not json")
+    assert adapter_mod._read_channel_aliases() == {}
