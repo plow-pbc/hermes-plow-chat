@@ -155,6 +155,12 @@ GROUP_POLICY = "\n\n".join([_ADDRESSED_ONLY, _DISCLOSURE, _NO_RELAY])
 # call a minute against a list that changes a few times a year; the cost of
 # shortening it is quota, of lengthening it somebody repeating themselves.
 RECONCILE_SECONDS = 60
+PAGE_SIZE = 50
+# The walk is bounded by its cursor in every case anyone intends. This is for the
+# ones nobody does: a cursor the endpoint stopped returning (it filters
+# deleted_at IS NULL) otherwise walks a whole chat and dispatches every message
+# of it, ahead of the live feed.
+MAX_BACKFILL_PAGES = 10
 
 # The connected adapter and the loop its listener tasks run on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
@@ -356,6 +362,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         # backfill copy racing inside one process; this stops a restart replaying
         # from the beginning of a chat, or from nothing at all.
         self._last_uids: dict[str, str] = {}
+        # Resolved once, here, so there is exactly one answer to "where does
+        # state live" and a missing setting is a startup failure with a name on
+        # it. Read per call it was worse than useless: the load path caught the
+        # KeyError and warned benignly, then every dispatched message raised the
+        # same KeyError past handle_message into the socket's generic handler,
+        # tearing the connection down and re-backfilling once per inbound
+        # message. A required setting must stop the agent, not flap it.
+        try:
+            self._state_root = pathlib.Path(os.environ["HERMES_HOME"])
+        except KeyError:
+            raise RuntimeError(
+                "HERMES_HOME is unset; the Plow Chat adapter stores its message "
+                "cursor there and cannot tell a first run from a lost one without it"
+            ) from None
         self._load_cursors()
         self._stop_event = asyncio.Event()
         # The 60s poll and the tool's post-send pass both reconcile. Without this
@@ -867,7 +887,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         `_body` raises on a non-2xx: an error page is not an empty page, and
         reading a 500 as "nothing missed" moves the baseline past the gap.
         """
-        url = f"{self.base_url}/v1/chats/{chat_uid}/messages?limit=50"
+        url = f"{self.base_url}/v1/chats/{chat_uid}/messages?limit={PAGE_SIZE}"
         if after:
             url += f"&starting_after={after}"
         async with self._http_session.get(
@@ -905,7 +925,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             return
         missed: list[dict] = []
         cursor: Optional[str] = None
-        while True:
+        for _ in range(MAX_BACKFILL_PAGES):
             body = await self._messages_page(chat_uid, cursor)
             page = body.get("data") or []
             reached = False
@@ -918,7 +938,28 @@ class PlowChatAdapter(BasePlatformAdapter):
             # drop the OLDEST missed messages while still advancing past them.
             if reached or not page or not body.get("has_more"):
                 break
+            if page[-1]["uid"] == cursor:
+                # The page did not advance, so the next request is this one. A
+                # `while True` here spun forever with the socket connected and
+                # no frame ever read — a dead line with no exception and no log,
+                # which is worse than any failure this function recovers from.
+                raise RuntimeError(
+                    f"{chat_uid}: message paging did not advance past {cursor!r}; "
+                    "refusing to spin"
+                )
             cursor = page[-1]["uid"]
+        else:
+            # Ran the cap out. Replaying an unbounded history would flood the
+            # agent one turn at a time — and this runtime acts on what it reads,
+            # so a months-old request is not merely noise. Keep the newest page
+            # of what we found and say plainly what was dropped.
+            logger.warning(
+                "[plow_chat] %s: stopped backfilling after %d pages without meeting "
+                "cursor %r; replaying only the newest %d message(s) and skipping "
+                "everything older",
+                chat_uid, MAX_BACKFILL_PAGES, self._last_uids.get(chat_uid), PAGE_SIZE,
+            )
+            del missed[PAGE_SIZE:]
         if missed and not reached:
             # Two ways to get here and they look identical from the inside: a
             # chat that anchored empty (correct — everything IS the gap), or a
@@ -942,7 +983,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         rewritten on each checkpoint, so a partial write can never leave two
         chats disagreeing about which restart they belong to.
         """
-        return pathlib.Path(os.environ["HERMES_HOME"]) / "plow-chat-cursor.json"
+        return self._state_root / "plow-chat-cursor.json"
 
     def _load_cursors(self) -> None:
         """Adopt the cursor map, or start empty and say so.
@@ -953,10 +994,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         Warned rather than swallowed, because the cost is real — an anchored
         chat skips whatever was pending in it.
 
-        HERMES_HOME is indexed rather than defaulted for the reason
-        bin/hostex-poll.py indexes it: the image sets it, and defaulting to the
-        cwd would silently resolve to a different state root per working
-        directory, which reads as a clean start and replays nothing.
+        Only the file's own contents are forgiven. A missing HERMES_HOME is
+        raised at construction instead — see __init__.
         """
         try:
             path = self._cursor_path()
@@ -968,7 +1007,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             ):
                 raise ValueError(f"expected a map of chat uid to message uid, got {type(loaded).__name__}")
             self._last_uids = loaded
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "[plow_chat] could not read the message cursor, starting from an "
                 "anchor instead — anything pending in a chat is skipped: %s", exc

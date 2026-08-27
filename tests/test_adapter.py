@@ -1485,3 +1485,116 @@ def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
     asyncio.run(a._websocket_loop("cht_home"))
 
     assert order == ["connected", "backfilled:cht_home"]
+
+
+def test_a_missing_state_root_stops_the_agent_by_name(monkeypatch):
+    """Not a per-message KeyError. Read at each call site this warned benignly at
+    construction and then raised past handle_message on every inbound message,
+    tearing the socket down and re-backfilling once per turn."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    with pytest.raises(RuntimeError, match="HERMES_HOME"):
+        _adapter(monkeypatch)
+
+
+def test_a_cursor_the_history_no_longer_holds_is_capped_not_replayed_whole(monkeypatch, caplog):
+    """The endpoint filters deleted_at IS NULL, so a swept cursor is never met.
+    Walking to exhaustion would dispatch a whole chat at the agent one turn at a
+    time, ahead of the live feed — and this runtime acts on what it reads."""
+    monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
+    monkeypatch.setattr(adapter_mod, "PAGE_SIZE", 2)
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._checkpoint("cht_a", "msg_swept")
+
+    class Endless:
+        def get(self, url, **kwargs):
+            after = url.split("starting_after=")[1] if "starting_after=" in url else "0"
+            n = int(after.rsplit("_", 1)[1]) if after != "0" else 0
+            return FakeResponse({"data": [_msg(f"m_{n + 1}", "a"), _msg(f"m_{n + 2}", "b")],
+                                 "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Endless()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._backfill("cht_a"))
+
+    assert len(a.handled) == 2, "only the newest page survives the cap"
+    assert "skipping everything older" in caplog.text
+
+
+def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
+    """`while True` here hung with the socket connected and no frame ever read —
+    no exception, no log, a dead line with no symptom."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._checkpoint("cht_a", "msg_0")
+
+    class Stuck:
+        def get(self, url, **kwargs):
+            return FakeResponse({"data": [_msg("m_1", "same page forever")], "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Stuck()
+
+    with pytest.raises(RuntimeError, match="did not advance"):
+        asyncio.run(a._backfill("cht_a"))
+
+
+def test_a_failing_backfill_still_serves_live_frames(monkeypatch, caplog):
+    """The point of catching it. A deterministic backfill failure must not mute
+    the room — losing a replay costs a late answer, losing the socket costs
+    every answer."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+
+    class Socket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if getattr(self, "sent", False):
+                a._stop_event.set()
+                raise StopAsyncIteration
+            self.sent = True
+            return types.SimpleNamespace(
+                type=sys.modules["aiohttp"].WSMsgType.TEXT,
+                json=lambda: _inbound("cht_home", body="still listening"),
+            )
+
+    # _websocket_loop imports aiohttp locally, so the frame type has to exist on
+    # the stub the suite installed for it.
+    monkeypatch.setattr(sys.modules["aiohttp"], "WSMsgType",
+                        types.SimpleNamespace(TEXT="text", CLOSED="closed", ERROR="error"),
+                        raising=False)
+
+    a._http_session = types.SimpleNamespace(ws_connect=lambda url, **kw: Socket())
+
+    async def _mint(chat_uid):
+        return "tkt"
+
+    a._mint_ws_ticket = _mint
+
+    async def _boom(chat_uid):
+        raise RuntimeError("history endpoint is down")
+
+    a._backfill = _boom
+
+    async def _sleep_once(_delay):
+        a._stop_event.set()
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep_once)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._websocket_loop("cht_home"))
+
+    assert [e.text for e in a.handled] == ["still listening"]
+    assert "backfill failed" in caplog.text
