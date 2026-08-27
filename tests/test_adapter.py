@@ -1263,53 +1263,31 @@ def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, ca
 # ---------------------------------------------------------------------------
 
 
-def _member(provider_key, role="member", display_name=None):
-    p = {"type": "member", "provider_key": provider_key,
-         "uid": f"u_{provider_key}", "role": role}
-    if display_name is not None:
-        p["display_name"] = display_name
-    return p
-
-
-def _titled(uid, members, display_name=None):
+def _titled(uid, display_name=None):
     """A chat as `GET /v1/chats` serves it. `display_name` is omitted when None,
     which is how the API reports a thread nobody has titled."""
-    chat = {"uid": uid, "participants": [{"type": "agent", "line": {"uid": "line_1"}}, *members]}
+    chat = {"uid": uid, "participants": [{"type": "agent", "line": {"uid": "line_1"}},
+                                         {"type": "member", "provider_key": "+1", "role": "owner"}]}
     if display_name is not None:
         chat["display_name"] = display_name
     return chat
 
 
-OWNER = _member("+1", role="owner", display_name="Sam")
-
-
 @pytest.mark.parametrize("chat,groups,expected", [
-    # The operator's own label outranks anything the thread says about itself.
-    (_titled("cht_a", [OWNER], display_name="Renamed By Someone"),
+    # The operator's own label outranks anything the thread says about itself,
+    # and is the one name published without a uid.
+    (_titled("cht_a", display_name="Renamed By Someone"),
      {"cht_a": {"name": "Owners", "prompt": None}}, "Owners"),
-    # Plow's own answer, which is the iMessage thread title.
-    (_titled("cht_x", [OWNER, _member("+2", display_name="Gianna")],
-             display_name="Snoqualmie Cabin Cleaning Thread"),
-     {}, "Snoqualmie Cabin Cleaning Thread"),
-    # Sparse: the key is absent on a thread nobody titled.
-    (_titled("cht_x", [OWNER, _member("+2", display_name="Gianna")]), {}, "Gianna"),
-    # Present but empty, and present but whitespace, both fall through.
-    (_titled("cht_x", [OWNER, _member("+2", display_name="Gianna")], display_name=""),
-     {}, "Gianna"),
-    (_titled("cht_x", [OWNER, _member("+2", display_name="Gianna")], display_name="   "),
-     {}, "Gianna"),
-    # The owner is the reader, so naming the room after them says nothing.
-    (_titled("cht_x", [OWNER, _member("+2", display_name="Gianna"),
-                       _member("+3", display_name="Abby")]),
-     {}, "Gianna, Abby"),
-    # Plow serves a real name only for a verified member; otherwise the handle.
-    (_titled("cht_x", [OWNER, _member("+15550001111")]), {}, "+15550001111"),
-    # Nothing to go on: the id is the floor, which is today's behaviour.
-    (_titled("cht_x", [OWNER]), {}, "cht_x"),
+    # Plow's own answer -- the iMessage thread title -- always uid-suffixed.
+    (_titled("cht_x", display_name="Snoqualmie Cabin Cleaning Thread"),
+     {}, "Snoqualmie Cabin Cleaning Thread (cht_x)"),
+    # Sparse: absent, empty, and whitespace all mean "nobody titled it".
+    (_titled("cht_x"), {}, "cht_x"),
+    (_titled("cht_x", display_name=""), {}, "cht_x"),
+    (_titled("cht_x", display_name="   "), {}, "cht_x"),
 ])
 def test_a_chat_is_named_from_the_best_source_available(chat, groups, expected):
-    # The home chat is always seeded too (see test_the_home_chat_keeps_its_name),
-    # so this asks about the chat under test rather than the whole mapping.
+    # The home chat is always seeded too, so this asks about the chat under test.
     names = adapter_mod._resolve_chat_names([chat], groups, "cht_home")
     assert names[chat["uid"]] == expected
 
@@ -1317,55 +1295,40 @@ def test_a_chat_is_named_from_the_best_source_available(chat, groups, expected):
 def test_the_home_chat_keeps_its_name():
     """The published registry has to agree with _label, or the overlay renames the
     operator's own DM to its uid."""
-    names = adapter_mod._resolve_chat_names(
-        [_titled("cht_home", [OWNER])], {}, "cht_home")
+    names = adapter_mod._resolve_chat_names([_titled("cht_home")], {}, "cht_home")
     assert names["cht_home"] == "Plow Chat"
 
 
-def test_a_thread_cannot_take_a_configured_group_s_name(caplog):
-    """An iMessage group title is renameable by anyone in the thread, and
-    resolve_channel_name is first-match-wins. The configured group must keep its
-    exact name and the impostor must be disambiguated, or a send by name lands in
-    the wrong room."""
+def test_a_title_can_never_take_another_room_s_name():
+    """An iMessage title is chosen by whoever is in the thread, and the image's
+    resolver takes the first exact match. The uid suffix is what makes a title
+    incapable of equalling another room's name -- including on a first poll,
+    where nothing records who held the name first."""
     chats = [
-        _titled("cht_owners", [OWNER]),
-        _titled("cht_impostor", [OWNER, _member("+2")], display_name="STR Owners"),
+        _titled("cht_owners"),
+        _titled("cht_impostor", display_name="STR Owners"),
+        _titled("cht_home_impostor", display_name="Plow Chat"),
     ]
     groups = {"cht_owners": {"name": "STR Owners", "prompt": None}}
 
-    with caplog.at_level(logging.WARNING):
-        names = adapter_mod._resolve_chat_names(chats, groups, "cht_home")
+    names = adapter_mod._resolve_chat_names(chats, groups, "cht_home")
 
-    assert names["cht_owners"] == "STR Owners", "the configured name is never modified"
-    assert names["cht_impostor"] != "STR Owners"
-    assert names["cht_impostor"].startswith("STR Owners (")
-    assert "cht_impostor" in caplog.text, "an operator has to be able to see this happen"
-    assert "STR Owners" not in caplog.text.split("cht_impostor")[1], \
-        "the colliding name may carry a handle and must not be logged"
-
-
-@pytest.mark.parametrize("title", ["str owners", "StR oWnErS"])
-def test_the_collision_check_ignores_case(title):
-    """resolve_channel_name normalizes before matching, so a case variant is the
-    same capture with a different spelling."""
-    names = adapter_mod._resolve_chat_names(
-        [_titled("cht_owners", [OWNER]),
-         _titled("cht_impostor", [OWNER], display_name=title)],
-        {"cht_owners": {"name": "STR Owners", "prompt": None}}, "cht_home")
-    assert names["cht_impostor"] != title
+    assert names["cht_owners"] == "STR Owners", "a configured label is never modified"
+    assert names["cht_home"] == "Plow Chat"
+    assert names["cht_impostor"] == "STR Owners (cht_impostor)"
+    assert names["cht_home_impostor"] == "Plow Chat (cht_home_impostor)"
+    assert len({n.casefold() for n in names.values()}) == len(names), \
+        f"two rooms answer to one name: {names}"
 
 
-def test_naming_is_stable_across_identical_passes():
-    """The poll runs every 60s. A name that reshuffles between passes would rewrite
-    the registry, and with it every send-by-name the operator had learned."""
-    chats = [
-        _titled("cht_b", [OWNER], display_name="Cleaning"),
-        _titled("cht_a", [OWNER], display_name="Cleaning"),
-    ]
+def test_naming_depends_on_nothing_but_the_listing():
+    """No ordering, history, or reconnect state — so a reconnect, a reordered
+    listing, and a first poll all produce the same names."""
+    chats = [_titled("cht_b", display_name="Cleaning"), _titled("cht_a", display_name="Cleaning")]
     first = adapter_mod._resolve_chat_names(chats, {}, "cht_home")
     second = adapter_mod._resolve_chat_names(list(reversed(chats)), {}, "cht_home")
-    assert first == second, "the listing order must not decide who keeps the plain name"
-    assert first["cht_a"] != first["cht_b"], "two rooms cannot answer to one name"
+    assert first == second
+    assert first["cht_a"] != first["cht_b"]
 
 
 def test_a_name_never_widens_authority(monkeypatch):
@@ -1389,12 +1352,26 @@ def test_a_name_never_widens_authority(monkeypatch):
         "naming itself after a configured group must not authorize its members"
 
 
+def test_a_name_carries_no_participant_identifiers():
+    """The channel directory is listable by any member holding tool authority, so a
+    participant-derived name publishes one room's handles to another room's
+    members. A thread nobody titled is its uid instead."""
+    chat = {"uid": "cht_x", "participants": [
+        {"type": "agent", "line": {"uid": "line_1"}},
+        {"type": "member", "provider_key": "+15550001111", "role": "owner", "display_name": "Sam"},
+        {"type": "member", "provider_key": "+15550002222", "role": "member", "display_name": "Gianna"},
+    ]}
+    name = adapter_mod._resolve_chat_names([chat], {}, "cht_home")["cht_x"]
+    assert name == "cht_x"
+    for leaked in ("Gianna", "Sam", "+15550001111", "+15550002222"):
+        assert leaked not in name
+
+
 def _stub_hermes_home(monkeypatch, tmp_path):
     """Stand in for the image's own home resolver, which the suite does not install."""
-    pkg = types.ModuleType("hermes_cli")
     cfg = types.ModuleType("hermes_cli.config")
     cfg.get_hermes_home = lambda: tmp_path
-    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
     monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
     return tmp_path / "channel_aliases.json"
 
@@ -1444,9 +1421,26 @@ def test_reconcile_publishes_the_names_it_resolved(monkeypatch, tmp_path):
     })
     asyncio.run(a._reconcile_once())
 
-    assert a._label("cht_clean") == ("Snoqualmie Cabin Cleaning Thread", "group")
-    assert json.loads(path.read_text())["plow_chat"]["cht_clean"] == \
-        "Snoqualmie Cabin Cleaning Thread"
+    expected = "Snoqualmie Cabin Cleaning Thread (cht_clean)"
+    assert a._label("cht_clean") == (expected, "group")
+    assert json.loads(path.read_text())["plow_chat"]["cht_clean"] == expected
+
+
+def test_a_configured_group_off_this_line_is_never_published(monkeypatch, tmp_path):
+    """send() refuses a destination outside reach, so publishing a group the poll
+    has not seen on this line advertises a name that cannot be selected — and lets
+    it reserve one a reachable room needs."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    a = _adapter(monkeypatch, groups="cht_elsewhere=Owners")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]),
+                      _chat("cht_elsewhere", "line_9", ["+1"])],
+    })
+    asyncio.run(a._reconcile_once())
+
+    assert "cht_elsewhere" not in a.chat_uids, "it is on a sibling agent's line"
+    assert "cht_elsewhere" not in json.loads(path.read_text())["plow_chat"]
 
 
 def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
@@ -1474,144 +1468,3 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 
     assert "cht_room" in a.chat_uids, "reach survives a naming failure"
     assert "could not publish" in caplog.text, "and the failure is still reported"
-
-
-
-def test_an_established_thread_keeps_its_name_against_a_newcomer():
-    """Incumbency, and the reason it exists. Without it the winner is decided by uid
-    sort order, so a thread created later takes an established thread's name on
-    roughly a coin flip — and a send by name lands in the newcomer's room."""
-    established = _titled("cht_zzz", [OWNER], display_name="Cleaning")
-    newcomer = _titled("cht_aaa", [OWNER, _member("+2")], display_name="Cleaning")
-
-    first = adapter_mod._resolve_chat_names([established], {}, "cht_home")
-    assert first["cht_zzz"] == "Cleaning"
-
-    second = adapter_mod._resolve_chat_names(
-        [established, newcomer], {}, "cht_home", previous=first)
-
-    assert second["cht_zzz"] == "Cleaning", "the room that held the name keeps it"
-    assert second["cht_aaa"].startswith("Cleaning ("), "the newcomer is the one suffixed"
-
-
-def test_a_retitled_thread_takes_its_new_name():
-    """Incumbency protects a name against other rooms, not against the thread's own
-    operator retitling it — otherwise a name could never be corrected."""
-    before = {"cht_a": "Cleaning", "cht_home": "Plow Chat"}
-    names = adapter_mod._resolve_chat_names(
-        [_titled("cht_a", [OWNER], display_name="Deep Clean")], {}, "cht_home",
-        previous=before)
-    assert names["cht_a"] == "Deep Clean"
-
-
-def test_a_reachable_chat_missing_from_a_page_keeps_its_name():
-    """Reach already survives a truncated listing. Names have to follow it, or a
-    thread intermittently regresses to a raw id with nothing tying it to paging."""
-    names = adapter_mod._resolve_chat_names(
-        [_titled("cht_seen", [OWNER], display_name="Cleaning")], {}, "cht_home",
-        previous={"cht_unlisted": "Snoqualmie", "cht_seen": "Cleaning"})
-    assert names["cht_unlisted"] == "Snoqualmie"
-
-
-def test_a_newcomer_cannot_take_the_name_of_a_chat_that_is_merely_unlisted():
-    """The continuity rule above must not become a way around the collision rule."""
-    names = adapter_mod._resolve_chat_names(
-        [_titled("cht_aaa", [OWNER], display_name="Snoqualmie")], {}, "cht_home",
-        previous={"cht_zzz": "Snoqualmie"})
-    assert names["cht_zzz"] == "Snoqualmie"
-    assert names["cht_aaa"].startswith("Snoqualmie (")
-
-
-def test_no_two_chats_can_publish_the_same_name():
-    """Uniqueness is what the whole collision rule rests on, so the suffix a
-    collision produces has to be checked too — a title can imitate the suffix
-    form and land on a name another room was just given."""
-    chats = [
-        _titled("cht_aaa", [OWNER], display_name="Foo"),
-        _titled("cht_bbb", [OWNER], display_name="Foo (ht_zzz)"),
-        _titled("cht_zzz", [OWNER], display_name="Foo"),
-    ]
-    names = adapter_mod._resolve_chat_names(chats, {}, "cht_home")
-    assert len({n.casefold() for n in names.values()}) == len(names), \
-        f"two rooms answer to one name: {names}"
-
-
-def test_incumbency_survives_a_reconnect(monkeypatch, tmp_path):
-    """chat_names is in-memory and _reset_poll_state empties it on every connect,
-    so an attacker would not need to win a race — only title their thread and wait
-    for a reconnect. The registry on disk is the durable record."""
-    path = _stub_hermes_home(monkeypatch, tmp_path)
-    path.write_text(json.dumps({"plow_chat": {"cht_zzz": "Cleaning"}}))
-
-    a = _adapter(monkeypatch, groups=None)
-    a._websocket_loop = lambda uid: asyncio.sleep(0)
-    assert a.chat_names == {}, "a freshly connected adapter remembers nothing"
-    a._http_session = PagingSession({
-        "/v1/chats": [
-            _chat("cht_home", "line_1", ["+1"]),
-            {**_chat("cht_zzz", "line_1", ["+1"]), "display_name": "Cleaning"},
-            {**_chat("cht_aaa", "line_1", ["+9"]), "display_name": "Cleaning"},
-        ],
-        "/v1/chats/cht_zzz/messages": [],
-        "/v1/chats/cht_aaa/messages": [],
-    })
-    asyncio.run(a._reconcile_once())
-
-    assert a.chat_names["cht_zzz"] == "Cleaning", "the room that held the name keeps it"
-    assert a.chat_names["cht_aaa"] != "Cleaning"
-
-
-@pytest.mark.parametrize("contents,warns", [
-    (None, False),                                   # absent: the normal first run
-    ("{not json", True),                             # unparseable
-    ('{"plow_chat": ["not", "an", "object"]}', True),  # right key, wrong shape
-])
-def test_an_unreadable_registry_costs_incumbents_not_naming(monkeypatch, tmp_path,
-                                                            caplog, contents, warns):
-    """Reading the durable record is best-effort: it decides who KEEPS a name, and
-    the pass that follows still assigns every chat one. But `{}` means "no
-    incumbents", which reopens the capture window — so anything other than a
-    missing file has to say so, or a name moves with nothing explaining it."""
-    path = _stub_hermes_home(monkeypatch, tmp_path)
-    if contents is not None:
-        path.write_text(contents)
-
-    with caplog.at_level(logging.WARNING):
-        assert adapter_mod._read_channel_aliases() == {}
-
-    assert ("incumbency starts empty" in caplog.text) is warns
-
-
-def test_the_pinned_tier_cannot_publish_a_duplicate_either(monkeypatch):
-    """claim() takes the pinned tier's uniqueness on trust from _groups, which lives
-    a long way from it. This asserts the invariant where the assumption is made: a
-    real PLOW_CHAT_GROUP_UIDS through _groups, then adopted threads titled to
-    imitate a group label, its case variant, and the home chat's own name."""
-    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_own=STR Owners,cht_cln=Cleaners")
-    groups = adapter_mod._groups({}, "cht_home")
-    chats = [
-        _titled("cht_own", [OWNER]),
-        _titled("cht_cln", [OWNER]),
-        _titled("cht_imp1", [OWNER, _member("+2")], display_name="STR Owners"),
-        _titled("cht_imp2", [OWNER, _member("+3")], display_name="Plow Chat"),
-        _titled("cht_imp3", [OWNER, _member("+4")], display_name="cleaners"),
-    ]
-
-    names = adapter_mod._resolve_chat_names(chats, groups, "cht_home")
-
-    assert names["cht_own"] == "STR Owners", "a configured label is never modified"
-    assert names["cht_cln"] == "Cleaners"
-    assert names["cht_home"] == "Plow Chat"
-    assert len({n.casefold() for n in names.values()}) == len(names), \
-        f"two rooms answer to one name: {names}"
-
-
-def test_prompt_keys_differing_only_by_case_are_reported(monkeypatch, caplog):
-    """Both bind to one group and the file's order decides which wins, so the one
-    that loses has to be visible — it governs what the agent will say in that room."""
-    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_a=Owners")
-    with caplog.at_level(logging.WARNING):
-        adapter_mod._groups({"group_prompts": {"Owners": "be candid", "owners": "say less"}},
-                            "cht_home")
-    assert "differ only by case" in caplog.text
-    assert "no configured group" not in caplog.text, "neither key is orphaned; both bind"

@@ -198,16 +198,16 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
         groups[uid] = {"name": name, "prompt": None}
 
     prompts = (extra or {}).get("group_prompts") or {}
-    # Case-insensitively, because that is how the resolver these names are handed
-    # to compares them: an exact-string check here passed "Owners,owners" and
-    # published two rooms under one resolver-visible name.
-    named = {group["name"].casefold(): group for group in groups.values()}
+    named = {group["name"]: group for group in groups.values()}
+    # Compared case-insensitively, because that is how the resolver these names
+    # are handed to compares them: an exact-string check passed "Owners,owners"
+    # and published two rooms under one resolver-visible name.
+    folded = [group["name"].casefold() for group in groups.values()]
     # Two groups sharing a name defeats the point: the agent cannot tell them
     # apart, a send cannot resolve one, and a prompt keyed by that name would
     # silently reach only whichever was listed last.
-    if len(named) != len(groups):
+    if len(set(folded)) != len(groups):
         names = [group["name"] for group in groups.values()]
-        folded = [name.casefold() for name in names]
         repeated = sorted({name for name in names if folded.count(name.casefold()) > 1})
         raise ValueError(f"PLOW_CHAT_GROUP_UIDS repeats display name(s) {repeated}")
     # Configured labels and the home chat are both pinned in _resolve_chat_names,
@@ -222,22 +222,12 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     # in the untracked dotenv, so an orphan is the *normal* state on a fresh
     # restore. Raising would brick the gateway in the recovery path config exists
     # to serve.
-    orphaned = sorted(name for name in prompts if name.casefold() not in named)
+    orphaned = sorted(set(prompts) - set(named))
     if orphaned:
         logger.warning("[plow_chat] group_prompts names no configured group: %s", orphaned)
-    # Matching case-insensitively is what lets a prompt find its group, but it also
-    # means two keys differing only by case both bind, and the file's order alone
-    # decides which survives. Said out loud, because the losing key vanished
-    # without a word: before the lookup was normalized it was reported orphaned.
-    folded = [name.casefold() for name in prompts]
-    collapsed = sorted(name for name in prompts if folded.count(name.casefold()) > 1)
-    if collapsed:
-        logger.warning("[plow_chat] group_prompts keys %s differ only by case and bind to "
-                       "the same group; the last one in the file wins", collapsed)
     for name, prompt in prompts.items():
-        group = named.get(name.casefold())
-        if group is not None:
-            group["prompt"] = (prompt or "").strip() or None
+        if name in named:
+            named[name]["prompt"] = (prompt or "").strip() or None
     return groups
 
 
@@ -338,132 +328,41 @@ def _agent_line(chat: dict) -> str | None:
     return None
 
 
-def _derive_name(chat: dict) -> str:
-    """A name from the people in the room, the owner excluded.
+def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: str) -> dict[str, str]:
+    """uid -> display name.
 
-    The owner is the one reading the directory, so naming a room after them says
-    nothing that distinguishes it from every other room. Plow serves a member's
-    `display_name` as a real name once they are verified and as the raw handle
-    otherwise, so this is a name when Plow has one and a phone number when it
-    does not -- which is still the difference between two adopted threads.
+    The operator's own labels and the home chat keep their exact names. Every
+    other chat is named from its `display_name` -- Plow's own answer, which is
+    the iMessage thread title -- and is *always* published with its uid appended.
+
+    That suffix is what makes this safe rather than tidy, and it is why there is
+    no collision machinery here to read. A thread's title is chosen by whoever
+    is in it, so an unsuffixed one is a name an outsider can pick; on a first
+    poll nothing records who held it first, and the image resolves the first
+    match. Appending the uid makes every unconfigured name unique by
+    construction, so no title can equal another room's name, and no ordering,
+    history, or across-reconnect state has to be kept to hold that true.
+
+    It stays addressable, because the image's resolver falls back to an
+    unambiguous prefix match: `plow_chat:#Snoqualmie Cabin Cleaning` still
+    reaches `Snoqualmie Cabin Cleaning (cht_...)`, while an exact configured
+    name still wins outright ahead of it.
+
+    A thread with no title is its uid, which is what every adopted thread was
+    before this existed. Participant-derived names are deliberately absent: the
+    directory is listable by any member holding tool authority, so a name built
+    from participants publishes one room's handles to another room's members.
     """
-    return ", ".join(
-        name for member in _members(chat)
-        if not _is_owner(member)
-        and (name := (member.get("display_name") or member.get("provider_key") or "").strip())
-    )
-
-
-def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: str,
-                        previous: dict[str, str] | None = None) -> dict[str, str]:
-    """uid -> display name, from the best source each chat has.
-
-    The chain, highest first: the operator's own `PLOW_CHAT_GROUP_UIDS` label,
-    then `display_name` -- Plow's own answer, which is the iMessage thread title
-    -- then the participants, then the uid as the floor.
-
-    Uniqueness is load-bearing rather than tidy. An iMessage group title is
-    renameable by *anyone in the thread*, and the image's resolver takes the
-    first name that matches, so without this a cleaner could rename their thread
-    to a name the operator already sends to and capture that send.
-
-    `previous` is the last pass's names, filtered by the caller to chats still in
-    reach, and it settles two things a single pass cannot. **Incumbency**: a chat
-    still asking for the name it already answers to keeps it, so a thread created
-    later cannot take an established thread's name merely by sorting lower --
-    which is the whole attack, and which uid order alone decides by coin flip.
-    **Continuity**: a chat still reachable but absent from a truncated page has no
-    object to be named from this pass, so last pass's answer stands rather than
-    the thread regressing to a raw id.
-
-    Only the operator's labels and the home chat outrank an incumbent; among
-    everything else assignment runs in uid order, so two passes over the same
-    account agree.
-    """
-    previous = previous or {}
-    names: dict[str, str] = {}
-    taken: dict[str, str] = {}
-
-    def claim(uid: str, name: str, *, pinned: bool = False) -> None:
-        """Assign a name. The only way one is assigned, and the only place
-        uniqueness is enforced -- every earlier shape of this checked `taken` at
-        each call site instead, and each round of review found another site that
-        did not. A pinned name is the operator's own and is never modified; two
-        of those cannot collide, because `_groups` rejects a repeated display
-        name and forbids the home uid.
-        """
-        if not pinned and name.casefold() in taken:
-            logger.warning("[plow_chat] %s wants a name that is already taken; "
-                           "disambiguating it with an id suffix", uid)
-            base, name, n = f"{name} ({uid[-6:]})", f"{name} ({uid[-6:]})", 2
-            # A title can imitate the suffix form, so the first suffix is not
-            # guaranteed free either. Terminates: each turn is a distinct string
-            # and `taken` is finite.
-            while name.casefold() in taken:
-                name, n = f"{base} {n}", n + 1
-        names[uid] = name
-        taken[name.casefold()] = uid
-
-    claim(home_uid, HOME_CHAT_NAME, pinned=True)
+    names = {home_uid: HOME_CHAT_NAME}
     for uid, group in groups.items():
-        claim(uid, group["name"], pinned=True)
-
-    listed = {chat["uid"] for chat in chats}
-    for uid, name in sorted(previous.items()):
-        if uid not in listed and uid not in names:
-            claim(uid, name)
-
-    wanted: dict[str, str] = {}
+        names[uid] = group["name"]
     for chat in chats:
         uid = chat["uid"]
         if uid in names:
             continue
-        wanted[uid] = (chat.get("display_name") or "").strip() or _derive_name(chat) or uid
-
-    for uid in sorted(wanted):
-        if previous.get(uid) == wanted[uid]:
-            claim(uid, wanted[uid])
-
-    for uid in sorted(wanted):
-        if uid not in names:
-            claim(uid, wanted[uid])
+        title = (chat.get("display_name") or "").strip()
+        names[uid] = f"{title} ({uid})" if title else uid
     return names
-
-
-def _aliases_path():
-    from hermes_cli.config import get_hermes_home
-
-    return get_hermes_home() / "channel_aliases.json"
-
-
-def _read_channel_aliases() -> dict[str, str]:
-    """Our own block of the registry, as last published.
-
-    The durable half of incumbency. `chat_names` is in-memory and
-    `_reset_poll_state` empties it on every connect, so without this a reconnect
-    puts the winner between two rooms wanting one name back on uid order -- and
-    an attacker need not win a race, only title their thread and wait for one.
-    Unreadable for any reason means no incumbents rather than no naming: this
-    decides who keeps a name, and the pass that follows still assigns every one.
-    """
-    try:
-        with open(_aliases_path(), encoding="utf-8") as fh:
-            block = json.load(fh).get("plow_chat")
-    except FileNotFoundError:
-        return {}                       # the normal first-run case
-    except Exception as exc:
-        # Said out loud, unlike the missing file. `{}` here means "no incumbents",
-        # which reopens the capture window this read exists to close, and the only
-        # other symptom is a name quietly moving.
-        logger.warning("[plow_chat] could not read prior channel aliases (%s); "
-                       "incumbency starts empty this pass", exc)
-        return {}
-    if not isinstance(block, dict):
-        if block is not None:
-            logger.warning("[plow_chat] prior channel aliases block is %s, not an object; "
-                           "incumbency starts empty this pass", type(block).__name__)
-        return {}
-    return {k: v for k, v in block.items() if isinstance(v, str)}
 
 
 def _write_channel_aliases(names: dict[str, str]) -> None:
@@ -480,7 +379,9 @@ def _write_channel_aliases(names: dict[str, str]) -> None:
     cannot parse is left alone rather than overwritten -- the caller logs it
     every pass until someone fixes it.
     """
-    path = _aliases_path()
+    from hermes_cli.config import get_hermes_home
+
+    path = get_hermes_home() / "channel_aliases.json"
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -964,12 +865,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             # subscription — nor make start_group_thread, which calls this and
             # reads chat_uids for its `adoption` field, report a failure that
             # did not happen.
-            # Filtered to reach: a name must not outlive the room it belongs to,
-            # but must survive a page that simply did not list it.
-            carried = {uid: name
-                       for uid, name in (self.chat_names or _read_channel_aliases()).items()
-                       if uid in self.chat_uids}
-            self.chat_names = _resolve_chat_names(mine, self.groups, self.chat_uid, carried)
+            # Reach-filtered: send() refuses a destination outside chat_uids, so
+            # publishing a configured group the poll has not seen on this line
+            # advertises a name that cannot be selected -- and lets it reserve
+            # one that a reachable room needs.
+            reachable = {uid: group for uid, group in self.groups.items()
+                         if uid in self.chat_uids}
+            self.chat_names = _resolve_chat_names(mine, reachable, self.chat_uid)
             try:
                 _write_channel_aliases(self.chat_names)
             except Exception as exc:

@@ -65,30 +65,38 @@ URL in git.
 ### What a group thread is called
 
 Nothing has to be configured for a thread to have a name. Every 60s poll reads
-`GET /v1/chats`, and each chat is named from the best source it has:
+`GET /v1/chats` and names each reachable chat:
 
-1. its `PLOW_CHAT_GROUP_UIDS` entry, when the operator set one;
-2. the chat's own `display_name` — the iMessage thread title, when the thread
-   has been titled;
-3. the members, owner excluded — a name each where Plow has verified them, the
-   handle where it has not;
-4. the `cht_` id, as the floor.
+1. its `PLOW_CHAT_GROUP_UIDS` entry, when the operator set one — published
+   exactly as written, and the only name without a uid in it;
+2. otherwise the chat's own `display_name` — the iMessage thread title — always
+   published as `<title> (<cht_ id>)`;
+3. and a thread nobody has titled is its `cht_` id, as before.
 
 The result is published into the image's own `~/.hermes/channel_aliases.json`
 overlay, which is re-applied on every channel-directory build and every load and
-carries ids that have produced no traffic yet. So a thread is addressable as
-`plow_chat:#<name>` — and visible to `send_message action="list"` — from the
-first poll after it is created, without a restart and without a dotenv edit.
-**That file's `plow_chat` block is written by this adapter**: to change a name,
-retitle the thread in iMessage or list it in `PLOW_CHAT_GROUP_UIDS`, rather than
-hand-editing the block.
+carries ids that have produced no traffic yet. So a thread is addressable — and
+visible to `send_message action="list"` — from the first poll after it is
+created, without a restart and without a dotenv edit. The uid suffix does not
+get in the way of addressing it: the image's resolver falls back to an
+unambiguous prefix match, so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
+`Snoqualmie Cabin Cleaning (cht_…)`. **That file's `plow_chat` block is written
+by this adapter**: to change a name, retitle the thread in iMessage or list it
+in `PLOW_CHAT_GROUP_UIDS`, rather than hand-editing the block.
 
-Two rules make provider-supplied text safe to consume, and both are asserted in
-the suite. A name **grants nothing** — tool authority stays configured-in-dotenv
-or earned by the operator speaking in the thread. And because an iMessage title
-is renameable by anyone in the thread while the image's resolver takes the first
-matching name, a title that collides with an already-assigned name is given an
-id suffix rather than allowed to shadow the room that holds it.
+Two properties make provider-supplied text safe to consume here, and both are
+asserted in the suite. A name **grants nothing** — tool authority stays
+configured-in-dotenv or earned by the operator speaking in the thread. And
+because an iMessage title is chosen by whoever is in the thread while the
+image's resolver takes the first exact match, the uid suffix makes every
+unconfigured name unique *by construction* — no title can equal another room's
+name, so there is no ordering or history to keep in order to hold that true.
+
+A name is deliberately **never derived from the participants**. The channel
+directory is listable by any member holding tool authority, so a name built from
+who is in a room would publish that room's names and handles to the members of
+every other room. An untitled thread shows as its id instead; titling it in
+iMessage is the fix, and it takes effect on the next poll.
 
 ## There is a second implementation, and it is not this one
 
