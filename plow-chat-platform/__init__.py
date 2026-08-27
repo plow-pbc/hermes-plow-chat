@@ -217,6 +217,22 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     return groups
 
 
+def _is_owner(participant: dict) -> bool:
+    """Whether a sender or roster participant is the operator who owns this agent.
+
+    The single owner of that fact. `role` is the Chat API's own answer
+    (plow-pbc/plow#1381), resolved there against the account's canonical handle
+    and served on both surfaces this adapter reads — message senders and chat
+    participants. Re-deriving it by comparing handles is the drift `role` exists
+    to retire: the roster and the wire spell the same person differently, and
+    the disagreement is silent in both directions.
+
+    An absent `role` reads as not-owner: absent data must never elevate. That is
+    also what makes this total over the agent's own traffic, which carries none.
+    """
+    return participant.get("role") == "owner"
+
+
 def _speaker_line(sender: dict) -> str:
     """Whether the speaker owns this agent — deliberately not who they are.
 
@@ -228,14 +244,8 @@ def _speaker_line(sender: dict) -> str:
     has no name field — but names are a planned addition, and this is the line
     they would be injected into. So the prompt carries the fact and the event
     carries the name.
-
-    `role` is the Chat API's own answer (plow-pbc/plow#1381), resolved there
-    against the account's canonical handle — so this does not re-derive
-    ownership by comparing handles, which is the comparison that drifts between
-    the roster spelling and the webhook payload. An absent `role` — an API
-    predating the field — reads as not-owner: absent data must never elevate.
     """
-    if sender.get("role") == "owner":
+    if _is_owner(sender):
         return "The message below is from the owner of this agent."
     return ("The message below is from a member of this chat who does not own "
             "this agent.")
@@ -325,10 +335,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # vouch dies with the operator that made it, a configured grant does not.
         # One set holding both forced a subtract-and-re-add on every transition.
         self.operator_vouched: set[str] = set()
-        # The handle that owns this agent, learned off the home chat by the poll.
-        # None also means "ambiguous", so a separate flag marks whether the poll has
-        # ever resolved it — otherwise a home chat that is ambiguous from the very
-        # first pass compares equal to the initial None and reports nothing.
+        # The owner's handle, learned off the home chat by the poll. Its only job is
+        # to notice an operator *change*; whether any given message is the operator's
+        # is `_is_owner`'s answer, never a comparison against this. None also means
+        # "not yet resolved", so a separate flag separates the two — otherwise a home
+        # chat with no owner in the very first pass compares equal to the initial
+        # None and reports nothing.
         self.operator_key: Optional[str] = None
         self._operator_resolved = False
         self._http_session = None
@@ -680,13 +692,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                                    chat.get("uid", "<no uid>"))
                 elif line == home_line:
                     mine.append(chat)
-            # Positional, so pin the shape rather than guess. operator_key is the sole
-            # credential that grants tool authority to a room; picking arbitrarily out
-            # of a multi-member home chat is a silent authority escalation.
             home_members = _members(home[0])
-            # None when the home chat is ambiguous: choosing positionally out of several
-            # members would let an arbitrary participant vouch rooms.
-            next_operator = home_members[0]["provider_key"] if len(home_members) == 1 else None
+            # Every owner-role participant IS the operator, so which one is arbitrary —
+            # but the pick has to be stable, or a reordered listing reads as an identity
+            # change and revokes every vouch on each poll.
+            next_operator = min((m["provider_key"] for m in home_members if _is_owner(m)),
+                                default=None)
             if next_operator != self.operator_key or not self._operator_resolved:
                 self._operator_resolved = True
                 # Grants do not outlive the identity that made them. `authorized` only
@@ -702,8 +713,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                                    "operator-vouched authority for %s", sorted(revoked))
                 self.operator_key = next_operator
                 if next_operator is None:
-                    logger.error("[plow_chat] home chat has %d member participants, expected 1; "
-                                 "operator cleared, so operator-derived authorization is off",
+                    logger.error("[plow_chat] no owner among the home chat's %d member "
+                                 "participant(s); an operator change can no longer be seen, "
+                                 "so vouched authority will not be revoked",
                                  len(home_members))
             # Reach is settled FIRST, before any vouch hydration. The hydration below
             # does network reads that can fail, and a failure there used to abort the
@@ -732,7 +744,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # Decided every pass until earned. A vouch that landed while the socket
                 # was down reached no frame handler, so a room the operator spoke in
                 # would otherwise stay behind the gate for the life of the process.
-                if any(self._is_operator(msg.get("sender") or {})
+                if any(_is_owner(msg.get("sender") or {})
                        for msg in await self._page(f"/v1/chats/{chat_uid}/messages")
                        if isinstance(msg, dict) and msg.get("direction") == "inbound"):
                     self.operator_vouched.add(chat_uid)
@@ -867,7 +879,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # cannot send a message *as* the operator. Presence would not do — an
         # injected instruction can put the operator in a room with an attacker.
         # Speaking there is a choice.
-        if self._is_operator(sender):
+        if _is_owner(sender):
             self.operator_vouched.add(chat_uid)
 
         # One decision, used for both. Pairing is keyed by (platform, user id), not
@@ -913,20 +925,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         if chat_uid == self.chat_uid or chat_uid in self.operator_vouched:
             return True
         return chat_uid in self.groups and chat_uid in self.chat_uids
-
-    def _is_operator(self, sender: dict) -> bool:
-        """Whether a message came from the operator, by provider_key.
-
-        provider_key is the only handle that identifies a person across chats: a
-        chat_participant uid is per-chat, and the roster is not authoritative
-        either — it grows as quiet members first speak. The message carries the
-        answer, so the message is what is asked.
-
-        Not a bare equality: an agent-sent frame carries no provider_key, and
-        before the first poll there is no key to compare against, so None == None
-        would make the gateway's own traffic the operator's.
-        """
-        return bool(self.operator_key) and sender.get("provider_key") == self.operator_key
 
     async def _send_activation_welcome(self) -> None:
         """Send one setup-success message when Plow reports the chat active.

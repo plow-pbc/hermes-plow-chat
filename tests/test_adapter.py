@@ -407,7 +407,7 @@ def test_a_vouch_missed_while_the_socket_was_down_is_recovered_by_the_poll(monke
     # The operator speaks while the socket is down; only the poll can see it.
     a._http_session = PagingSession({
         **quiet,
-        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"provider_key": "+1"}}],
+        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"role": "owner"}}],
     })
     asyncio.run(a._reconcile_once())
     assert a._may_approve("cht_room") is True
@@ -501,21 +501,23 @@ def test_adopted_chat_is_audible_but_not_authorized(monkeypatch):
 
 
 def test_operator_speaking_vouches_for_the_room(monkeypatch):
+    """No operator_key is set: the frame carries the answer, so a room the operator
+    speaks in is vouched even on a process that has not polled yet."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a.operator_key = "+15550001111"
+    assert a.operator_key is None
     a.chat_uids = frozenset({*a.chat_uids, "cht_new"})
     asyncio.run(a._handle_ws_frame(
-        "cht_new", _inbound("cht_new", sender={"uid": "u9", "provider_key": "+15550001111"})))
+        "cht_new", _inbound("cht_new", sender={"uid": "u9", "role": "owner"})))
     assert "cht_new" in a.operator_vouched
     assert a.handled[0].source.role_authorized is True
 
 
-def test_agent_frame_without_provider_key_is_not_the_operator(monkeypatch):
-    """None == None would make the gateway's own traffic the operator's."""
+def test_a_sender_without_a_role_never_vouches_for_the_room(monkeypatch):
+    """The agent's own traffic carries no `role` at all, so the gateway cannot vouch a
+    room by talking in it — and neither can an API too old to serve the field."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
-    assert a.operator_key is None
     asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", sender={"uid": "agent"})))
-    assert a._is_operator({"uid": "agent"}) is False
+    assert a.operator_vouched == set()
 
 
 def test_send_rejects_a_chat_outside_reach(monkeypatch):
@@ -542,10 +544,11 @@ class PagingSession:
         return None
 
 
-def _chat(uid, line, members):
+def _chat(uid, line, members, owner="+1"):
     return {"uid": uid, "participants": [
         {"type": "agent", "line": {"uid": line}},
-        *[{"type": "member", "provider_key": k, "uid": f"u_{k}"} for k in members],
+        *[{"type": "member", "provider_key": k, "uid": f"u_{k}",
+           "role": "owner" if k == owner else "member"} for k in members],
     ]}
 
 
@@ -579,7 +582,7 @@ def test_reconcile_authorizes_a_room_the_operator_has_spoken_in(monkeypatch):
     a._http_session = PagingSession({
         "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
         "/v1/chats/cht_room/messages": [
-            {"direction": "inbound", "sender": {"provider_key": "+1"}},
+            {"direction": "inbound", "sender": {"role": "owner"}},
         ],
     })
     asyncio.run(a._reconcile_once())
@@ -592,7 +595,7 @@ def test_reconcile_adopts_without_authorizing_a_room_the_operator_is_silent_in(m
     a._http_session = PagingSession({
         "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_quiet", "line_1", ["+9"])],
         "/v1/chats/cht_quiet/messages": [
-            {"direction": "inbound", "sender": {"provider_key": "+9"}},
+            {"direction": "inbound", "sender": {"role": "member"}},
         ],
     })
     asyncio.run(a._reconcile_once())
@@ -686,28 +689,53 @@ def test_one_unclassifiable_chat_does_not_abort_discovery(monkeypatch):
     assert "cht_weird" not in a.chat_uids
 
 
-@pytest.mark.parametrize("members_per_poll,expected_operator", [
-    ([["+1", "+2"]], None),            # ambiguous from the very first poll
-    ([["+1"], ["+1", "+2"]], None),    # resolved, then becomes ambiguous
-    ([["+1"], ["+2"]], "+2"),          # resolved, then a different single member
-], ids=["ambiguous-first-poll", "goes-ambiguous", "changes-identity"])
-def test_operator_identity_across_polls(monkeypatch, caplog, members_per_poll, expected_operator):
-    """operator_key is the sole credential granting a room tool authority, so a
-    positional pick out of several members is a silent escalation — and a key that
-    stops holding must not keep vouching. Both first-poll and transition cases run
-    the same arrange/act, so they share one harness."""
+@pytest.mark.parametrize("polls,expected_operator", [
+    ([(["+1", "+2"], "+1")], "+1"),                  # company in the home chat, from the start
+    ([(["+1"], "+1"), (["+1", "+2"], "+1")], "+1"),  # ...and arriving later
+    ([(["+1"], "+1"), (["+2"], "+2")], "+2"),        # the account changed hands
+    ([(["+9"], None)], None),                        # nobody here owns the account
+], ids=["company-first-poll", "company-later", "changes-identity", "no-owner"])
+def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_operator):
+    """A crowded home chat used to clear the operator, because the pick was positional
+    and choosing among several members would have been a silent escalation. `role` is
+    the API's own answer, so company is no longer ambiguous — only an actual change of
+    owner moves the key, and only a home chat with no owner in it leaves us without one."""
     caplog.set_level(logging.INFO)
     a = _adapter(monkeypatch, groups="cht_x=Other")
     a._websocket_loop = lambda uid: asyncio.sleep(0)
-    for members in members_per_poll:
-        a._http_session = PagingSession({"/v1/chats": [_chat("cht_home", "line_1", members)]})
+    for members, owner in polls:
+        a._http_session = PagingSession(
+            {"/v1/chats": [_chat("cht_home", "line_1", members, owner=owner)]})
         asyncio.run(a._reconcile_once())
     assert a.operator_key == expected_operator
     if expected_operator is None:
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
-        assert "expected 1" in caplog.text
-        assert a._is_operator({"provider_key": "+1"}) is False
+        assert "no owner among the home chat's" in caplog.text
+
+
+def test_a_new_operator_does_not_inherit_the_old_ones_vouches(monkeypatch):
+    """Grants do not outlive the identity that made them. `operator_vouched` only ever
+    grows, so a room the departed operator spoke in would otherwise keep tool authority
+    and gateway-wide pairing approval from someone who no longer holds the account."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"role": "owner"}}],
+    })
+    asyncio.run(a._reconcile_once())
+    assert a._may_approve("cht_room") is True
+
+    # The account changes hands, and the new owner has never spoken in that room.
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+2"], owner="+2"),
+                      _chat("cht_room", "line_1", ["+2"], owner="+2")],
+        "/v1/chats/cht_room/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert a.operator_key == "+2"
+    assert a._may_approve("cht_room") is False
 
 
 def test_non_dict_extra_still_lands_the_dispatch_guard(monkeypatch):
@@ -1011,8 +1039,8 @@ def test_history_messages_missing_direction_or_sender_are_skipped(monkeypatch):
     a._http_session = PagingSession({
         "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
         "/v1/chats/cht_room/messages": [
-            {"sender": {"provider_key": "+1"}},          # no direction
-            {"direction": "inbound"},                     # no sender
+            {"sender": {"role": "owner"}},   # no direction
+            {"direction": "inbound"},        # no sender
             "not-a-dict",
         ],
     })
@@ -1055,7 +1083,7 @@ def test_a_chat_that_leaves_our_line_loses_socket_reach_and_vouch(monkeypatch, h
     a._websocket_loop = lambda uid: asyncio.sleep(3600)
     a._http_session = PagingSession({
         "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
-        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"provider_key": "+1"}}],
+        "/v1/chats/cht_room/messages": [{"direction": "inbound", "sender": {"role": "owner"}}],
     })
     asyncio.run(a._reconcile_once())
     assert "cht_room" in a.chat_uids and a._may_approve("cht_room") is True
