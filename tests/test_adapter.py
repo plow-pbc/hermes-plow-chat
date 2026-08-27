@@ -735,7 +735,6 @@ def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypat
     asyncio.run(a._reconcile_once())
     assert a.operator_key is None
     assert "cht_good" in a.chat_uids     # the rest of the pass still ran
-    # Reaches the same log as an owner-less roster; the count is what tells them apart.
     assert adapter_mod._NO_OWNER_LOG % 1 in caplog.text
 
 
