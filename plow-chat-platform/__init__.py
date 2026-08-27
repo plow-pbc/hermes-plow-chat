@@ -225,6 +225,15 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     orphaned = sorted(name for name in prompts if name.casefold() not in named)
     if orphaned:
         logger.warning("[plow_chat] group_prompts names no configured group: %s", orphaned)
+    # Matching case-insensitively is what lets a prompt find its group, but it also
+    # means two keys differing only by case both bind, and the file's order alone
+    # decides which survives. Said out loud, because the losing key vanished
+    # without a word: before the lookup was normalized it was reported orphaned.
+    folded = [name.casefold() for name in prompts]
+    collapsed = sorted(name for name in prompts if folded.count(name.casefold()) > 1)
+    if collapsed:
+        logger.warning("[plow_chat] group_prompts keys %s differ only by case and bind to "
+                       "the same group; the last one in the file wins", collapsed)
     for name, prompt in prompts.items():
         group = named.get(name.casefold())
         if group is not None:

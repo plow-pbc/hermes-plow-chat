@@ -1532,7 +1532,7 @@ def test_no_two_chats_can_publish_the_same_name():
         _titled("cht_zzz", [OWNER], display_name="Foo"),
     ]
     names = adapter_mod._resolve_chat_names(chats, {}, "cht_home")
-    assert len(set(names.values())) == len(names), \
+    assert len({n.casefold() for n in names.values()}) == len(names), \
         f"two rooms answer to one name: {names}"
 
 
@@ -1580,3 +1580,38 @@ def test_an_unreadable_registry_costs_incumbents_not_naming(monkeypatch, tmp_pat
         assert adapter_mod._read_channel_aliases() == {}
 
     assert ("incumbency starts empty" in caplog.text) is warns
+
+
+def test_the_pinned_tier_cannot_publish_a_duplicate_either(monkeypatch):
+    """claim() takes the pinned tier's uniqueness on trust from _groups, which lives
+    a long way from it. This asserts the invariant where the assumption is made: a
+    real PLOW_CHAT_GROUP_UIDS through _groups, then adopted threads titled to
+    imitate a group label, its case variant, and the home chat's own name."""
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_own=STR Owners,cht_cln=Cleaners")
+    groups = adapter_mod._groups({}, "cht_home")
+    chats = [
+        _titled("cht_own", [OWNER]),
+        _titled("cht_cln", [OWNER]),
+        _titled("cht_imp1", [OWNER, _member("+2")], display_name="STR Owners"),
+        _titled("cht_imp2", [OWNER, _member("+3")], display_name="Plow Chat"),
+        _titled("cht_imp3", [OWNER, _member("+4")], display_name="cleaners"),
+    ]
+
+    names = adapter_mod._resolve_chat_names(chats, groups, "cht_home")
+
+    assert names["cht_own"] == "STR Owners", "a configured label is never modified"
+    assert names["cht_cln"] == "Cleaners"
+    assert names["cht_home"] == "Plow Chat"
+    assert len({n.casefold() for n in names.values()}) == len(names), \
+        f"two rooms answer to one name: {names}"
+
+
+def test_prompt_keys_differing_only_by_case_are_reported(monkeypatch, caplog):
+    """Both bind to one group and the file's order decides which wins, so the one
+    that loses has to be visible — it governs what the agent will say in that room."""
+    monkeypatch.setenv("PLOW_CHAT_GROUP_UIDS", "cht_a=Owners")
+    with caplog.at_level(logging.WARNING):
+        adapter_mod._groups({"group_prompts": {"Owners": "be candid", "owners": "say less"}},
+                            "cht_home")
+    assert "differ only by case" in caplog.text
+    assert "no configured group" not in caplog.text, "neither key is orphaned; both bind"
