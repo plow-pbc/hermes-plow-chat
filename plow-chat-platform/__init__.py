@@ -951,6 +951,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if message["uid"] in self._seen[chat_uid]:
                     reached = True
                     break
+                # The floor above tests every row — an anchored chat has the
+                # agent's own uids in its record, so one of those legitimately
+                # ends the walk. Collecting is narrower: an outbound row is
+                # dropped by the frame handler anyway, so carrying it here only
+                # inflates the two counts an operator reads to tell a long
+                # outage from a broken endpoint.
+                if message.get("direction") != "inbound":
+                    continue
                 missed.append(message)
             if reached or not page or not body.get("has_more"):
                 break
@@ -1004,15 +1012,25 @@ class PlowChatAdapter(BasePlatformAdapter):
             if not path.exists():
                 return
             loaded = json.loads(path.read_text())
-            if not isinstance(loaded, dict) or not all(
-                isinstance(k, str) and isinstance(v, dict)
-                and all(isinstance(u, str) for u in v)
-                for k, v in loaded.items()
-            ):
-                raise ValueError(
-                    f"expected a map of chat uid to message uids, got {type(loaded).__name__}"
-                )
-            self._seen = {k: dict.fromkeys(v) for k, v in loaded.items()}
+            if not isinstance(loaded, dict):
+                raise ValueError(f"expected a map of chat uid to message uids, got {type(loaded).__name__}")
+            # Per entry, keeping what parses. All-or-nothing meant one malformed
+            # chat discarded every chat's record, and each of those then anchors
+            # on its next walk and silently skips whatever was pending in it —
+            # the loss named above, multiplied by the whole file. A list is
+            # accepted alongside a mapping because `dict.fromkeys` reads both
+            # and an older file holds the list shape.
+            for chat_uid, uids in loaded.items():
+                if (isinstance(chat_uid, str) and isinstance(uids, (list, dict))
+                        and all(isinstance(u, str) for u in uids)):
+                    self._seen[chat_uid] = dict.fromkeys(uids)
+                else:
+                    logger.warning(
+                        "[plow_chat] dropping the seen-message record for %r: expected a "
+                        "list or map of message uids, got %s — that chat anchors on its "
+                        "next walk and skips anything pending in it",
+                        chat_uid, type(uids).__name__,
+                    )
         except (OSError, ValueError) as exc:
             logger.warning(
                 "[plow_chat] could not read the seen-message record, starting from "

@@ -1307,7 +1307,7 @@ def test_a_failed_write_leaves_the_last_good_record_intact(monkeypatch, tmp_path
     assert _adapter(monkeypatch)._seen == {"cht_a": {"msg_1": None}}, "and it still loads"
 
 
-@pytest.mark.parametrize("garbage", ['{"cht_a": 1}', '{"cht_a": [2]}', "[]", "nope", ""])
+@pytest.mark.parametrize("garbage", ["[]", "nope", ""])
 def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
     monkeypatch, tmp_path, caplog, garbage
 ):
@@ -1321,6 +1321,51 @@ def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
 
     assert a._seen == {}
     assert "could not read the seen-message record" in caplog.text
+
+
+# `{"uid": <anything>}` is deliberately absent: only the keys are read, so a
+# mapping with junk values is a valid record, not a malformed one.
+@pytest.mark.parametrize("bad", [1, [2], "a bare string", None])
+def test_one_malformed_chat_does_not_discard_every_other_chats_record(
+    monkeypatch, tmp_path, caplog, bad
+):
+    """All-or-nothing meant a single bad entry anchored every chat on the box,
+    each silently skipping whatever was pending in it."""
+    (tmp_path / "plow-chat-seen.json").write_text(
+        json.dumps({"cht_good": {"msg_1": None}, "cht_bad": bad})
+    )
+
+    with caplog.at_level(logging.WARNING):
+        a = _adapter(monkeypatch)
+
+    assert a._seen == {"cht_good": {"msg_1": None}}
+    assert "cht_bad" in caplog.text
+    assert "cht_good" not in caplog.text
+
+
+def test_a_record_written_as_a_list_still_loads(monkeypatch, tmp_path):
+    """The shape changed from a list to a mapping. Reading only the new one
+    would anchor every chat once, on exactly the upgrade that was supposed to
+    preserve them."""
+    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_a": ["msg_2", "msg_1"]}))
+
+    assert list(_adapter(monkeypatch)._seen["cht_a"]) == ["msg_2", "msg_1"]
+
+
+def test_the_record_keeps_the_newest_and_survives_the_round_trip(monkeypatch):
+    """Three claims the mapping rests on, and they fail together: insertion
+    order carries age, the trim drops the OLDEST, and both survive JSON as an
+    object. Slice the wrong end or restore sort_keys and the record starts
+    discarding the newest uids — which re-dispatches already-answered messages,
+    the one failure this whole file exists to prevent."""
+    monkeypatch.setattr(adapter_mod, "SEEN_LIMIT", 3)
+    a = _adapter(monkeypatch)
+
+    for uid in ["m_1", "m_2", "m_3", "m_4"]:      # oldest first, as they arrive
+        a._mark_seen("cht_a", [uid])
+
+    assert list(a._seen["cht_a"]) == ["m_4", "m_3", "m_2"], "newest kept, oldest trimmed"
+    assert list(_adapter(monkeypatch)._seen["cht_a"]) == ["m_4", "m_3", "m_2"], "and it reloads in order"
 
 
 def test_a_missing_state_root_stops_the_agent_by_name(monkeypatch):
@@ -1429,7 +1474,7 @@ def test_backfill_raises_rather_than_reading_an_error_as_an_empty_gap(monkeypatc
 
 
 def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
-    """A fully-seen page is the floor, not a page count. Stopping early would
+    """A recognised message is the floor, not a page count. Stopping early would
     drop the OLDEST missed messages while still recording the newest as seen."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._mark_seen("cht_a", ["msg_0"])
