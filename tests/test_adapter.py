@@ -1470,3 +1470,48 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
     assert "cht_room" in a.chat_uids, "reach survives a naming failure"
     assert "could not publish" in caplog.text, "and the failure is still reported"
 
+
+
+def test_an_established_thread_keeps_its_name_against_a_newcomer():
+    """Incumbency, and the reason it exists. Without it the winner is decided by uid
+    sort order, so a thread created later takes an established thread's name on
+    roughly a coin flip — and a send by name lands in the newcomer's room."""
+    established = _titled("cht_zzz", [OWNER], display_name="Cleaning")
+    newcomer = _titled("cht_aaa", [OWNER, _member("+2")], display_name="Cleaning")
+
+    first = adapter_mod._resolve_chat_names([established], {}, "cht_home")
+    assert first["cht_zzz"] == "Cleaning"
+
+    second = adapter_mod._resolve_chat_names(
+        [established, newcomer], {}, "cht_home", previous=first)
+
+    assert second["cht_zzz"] == "Cleaning", "the room that held the name keeps it"
+    assert second["cht_aaa"].startswith("Cleaning ("), "the newcomer is the one suffixed"
+
+
+def test_a_retitled_thread_takes_its_new_name():
+    """Incumbency protects a name against other rooms, not against the thread's own
+    operator retitling it — otherwise a name could never be corrected."""
+    before = {"cht_a": "Cleaning", "cht_home": "Plow Chat"}
+    names = adapter_mod._resolve_chat_names(
+        [_titled("cht_a", [OWNER], display_name="Deep Clean")], {}, "cht_home",
+        previous=before)
+    assert names["cht_a"] == "Deep Clean"
+
+
+def test_a_reachable_chat_missing_from_a_page_keeps_its_name():
+    """Reach already survives a truncated listing. Names have to follow it, or a
+    thread intermittently regresses to a raw id with nothing tying it to paging."""
+    names = adapter_mod._resolve_chat_names(
+        [_titled("cht_seen", [OWNER], display_name="Cleaning")], {}, "cht_home",
+        previous={"cht_unlisted": "Snoqualmie", "cht_seen": "Cleaning"})
+    assert names["cht_unlisted"] == "Snoqualmie"
+
+
+def test_a_newcomer_cannot_take_the_name_of_a_chat_that_is_merely_unlisted():
+    """The continuity rule above must not become a way around the collision rule."""
+    names = adapter_mod._resolve_chat_names(
+        [_titled("cht_aaa", [OWNER], display_name="Snoqualmie")], {}, "cht_home",
+        previous={"cht_zzz": "Snoqualmie"})
+    assert names["cht_zzz"] == "Snoqualmie"
+    assert names["cht_aaa"].startswith("Snoqualmie (")

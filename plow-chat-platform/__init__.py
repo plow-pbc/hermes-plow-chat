@@ -332,7 +332,8 @@ def _derive_name(chat: dict) -> str:
     )
 
 
-def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: str) -> dict[str, str]:
+def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: str,
+                        previous: dict[str, str] | None = None) -> dict[str, str]:
     """uid -> display name, from the best source each chat has.
 
     The chain, highest first: the operator's own `PLOW_CHAT_GROUP_UIDS` label,
@@ -342,12 +343,22 @@ def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: st
     Uniqueness is load-bearing rather than tidy. An iMessage group title is
     renameable by *anyone in the thread*, and the image's resolver takes the
     first name that matches, so without this a cleaner could rename their thread
-    to a configured group's name and capture a send meant for the owners. The
-    operator's labels and the home chat are assigned first and never modified;
-    everything else is taken in uid order so two passes over the same account
-    agree, and a name already spoken for gets an id suffix instead of shadowing
-    the room that holds it.
+    to a name the operator already sends to and capture that send.
+
+    `previous` is the last pass's names, filtered by the caller to chats still in
+    reach, and it settles two things a single pass cannot. **Incumbency**: a chat
+    still asking for the name it already answers to keeps it, so a thread created
+    later cannot take an established thread's name merely by sorting lower --
+    which is the whole attack, and which uid order alone decides by coin flip.
+    **Continuity**: a chat still reachable but absent from a truncated page has no
+    object to be named from this pass, so last pass's answer stands rather than
+    the thread regressing to a raw id.
+
+    Only the operator's labels and the home chat outrank an incumbent; among
+    everything else assignment runs in uid order, so two passes over the same
+    account agree.
     """
+    previous = previous or {}
     names: dict[str, str] = {}
     taken: dict[str, str] = {}
 
@@ -359,11 +370,26 @@ def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: st
     for uid, group in groups.items():
         claim(uid, group["name"])
 
-    for chat in sorted(chats, key=lambda c: c["uid"]):
+    listed = {chat["uid"] for chat in chats}
+    for uid, name in sorted(previous.items()):
+        if uid not in listed and uid not in names and name.casefold() not in taken:
+            claim(uid, name)
+
+    wanted: dict[str, str] = {}
+    for chat in chats:
         uid = chat["uid"]
         if uid in names:
             continue
-        name = (chat.get("display_name") or "").strip() or _derive_name(chat) or uid
+        wanted[uid] = (chat.get("display_name") or "").strip() or _derive_name(chat) or uid
+
+    for uid in sorted(wanted):
+        if previous.get(uid) == wanted[uid] and wanted[uid].casefold() not in taken:
+            claim(uid, wanted[uid])
+
+    for uid in sorted(wanted):
+        if uid in names:
+            continue
+        name = wanted[uid]
         if name.casefold() in taken:
             # The uid and nothing else: the colliding name can be a handle, and
             # the id is what an operator needs to find the thread anyway.
@@ -874,7 +900,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             # subscription — nor make start_group_thread, which calls this and
             # reads chat_uids for its `adoption` field, report a failure that
             # did not happen.
-            self.chat_names = _resolve_chat_names(mine, self.groups, self.chat_uid)
+            # Filtered to reach: a name must not outlive the room it belongs to,
+            # but must survive a page that simply did not list it.
+            carried = {uid: name for uid, name in self.chat_names.items()
+                       if uid in self.chat_uids}
+            self.chat_names = _resolve_chat_names(mine, self.groups, self.chat_uid, carried)
             try:
                 _write_channel_aliases(self.chat_names)
             except Exception as exc:
