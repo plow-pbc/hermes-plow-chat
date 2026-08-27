@@ -1251,3 +1251,32 @@ def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, ca
     assert "websocket loop error" in caplog.text, "the failure must still be reported"
     assert ticket not in caplog.text, "the handshake error leaked a live ws ticket"
     assert "403" in caplog.text, "the status is what makes this diagnosable"
+
+
+# --- durable cursor + backfill across a socket gap (#2) ---------------------
+
+
+def test_the_cursor_survives_a_restart(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch)
+    a._checkpoint("cht_a", "msg_7")
+
+    revived = _adapter(monkeypatch)
+
+    assert revived._last_uids == {"cht_a": "msg_7"}
+
+
+def test_a_cursor_write_leaves_no_partial_file(monkeypatch, tmp_path):
+    """A truncated cursor would raise on every later start — the one failure an
+    unattended agent cannot recover from."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch)
+
+    a._checkpoint("cht_a", "msg_1")
+    a._checkpoint("cht_b", "msg_2")
+
+    assert not list(tmp_path.glob("*.tmp")), "temp file left behind"
+    assert json.loads((tmp_path / "plow-chat-cursor.json").read_text()) == {
+        "cht_a": "msg_1",
+        "cht_b": "msg_2",
+    }

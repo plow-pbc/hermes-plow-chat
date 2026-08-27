@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import re
 import time
 from typing import Any, Optional
@@ -351,6 +352,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_tasks: dict[str, asyncio.Task] = {}
         self._reconcile_task: Optional[asyncio.Task] = None
         self._seen_message_uids: set[str] = set()
+        # The durable half of the dedupe above. The set stops a live frame and its
+        # backfill copy racing inside one process; this stops a restart replaying
+        # from the beginning of a chat, or from nothing at all.
+        self._last_uids: dict[str, str] = {}
+        self._load_cursors()
         self._stop_event = asyncio.Event()
         # The 60s poll and the tool's post-send pass both reconcile. Without this
         # they interleave, and an older /v1/chats snapshot applying second evicts a
@@ -829,6 +835,32 @@ class PlowChatAdapter(BasePlatformAdapter):
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
+
+    def _cursor_path(self) -> pathlib.Path:
+        """One file for every chat, beside the rest of the agent's state.
+
+        Keyed by chat uid rather than one file per chat: the whole map is
+        rewritten on each checkpoint, so a partial write can never leave two
+        chats disagreeing about which restart they belong to.
+        """
+        return pathlib.Path(os.environ.get("HERMES_HOME", ".")) / "plow-chat-cursor.json"
+
+    def _load_cursors(self) -> None:
+        path = self._cursor_path()
+        if path.exists():
+            self._last_uids = json.loads(path.read_text())
+
+    def _checkpoint(self, chat_uid: str, uid: str) -> None:
+        """Record the newest uid this agent has dispatched for one chat.
+
+        Written atomically: a truncated cursor would raise on every later start.
+        A fixed tmp name is safe because one adapter owns this file.
+        """
+        self._last_uids[chat_uid] = uid
+        path = self._cursor_path()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self._last_uids, indent=2, sort_keys=True))
+        os.replace(tmp, path)
 
     async def _handle_ws_frame(self, chat_uid: str, frame: dict[str, Any]) -> None:
         frame_type = frame.get("type")
