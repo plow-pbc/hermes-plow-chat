@@ -62,6 +62,13 @@ URL in git.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
+One variable is **not** in `plugin.yaml`, because the operator does not set it —
+the Hermes image does, and the adapter refuses to construct without it:
+
+| var | set by | meaning |
+|---|---|---|
+| `HERMES_HOME` | the image (`/opt/data`) | state root. The adapter keeps `plow-chat-cursor.json` there — the newest message uid it has dispatched per chat, which is what a reconnect pages back to. Resolved once at construction and fatal if unset, rather than defaulted to the working directory: a cursor read from the wrong root reads as a clean start, and a clean start replays nothing. |
+
 ## There is a second implementation, and it is not this one
 
 `plow-pbc/plow`'s `cloud-agents/hermes/plugins/plow_chat/` registers the **same

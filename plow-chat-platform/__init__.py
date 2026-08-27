@@ -156,10 +156,9 @@ GROUP_POLICY = "\n\n".join([_ADDRESSED_ONLY, _DISCLOSURE, _NO_RELAY])
 # shortening it is quota, of lengthening it somebody repeating themselves.
 RECONCILE_SECONDS = 60
 PAGE_SIZE = 50
-# The walk is bounded by its cursor in every case anyone intends. This is for the
-# ones nobody does: a cursor the endpoint stopped returning (it filters
-# deleted_at IS NULL) otherwise walks a whole chat and dispatches every message
-# of it, ahead of the live feed.
+# A backstop on the FETCH, for the cases the cursor cannot bound: a cursor the
+# endpoint stopped returning (it filters deleted_at IS NULL) would otherwise walk
+# a whole chat. It deliberately does not bound the replay — see _backfill.
 MAX_BACKFILL_PAGES = 10
 
 # The connected adapter and the loop its listener tasks run on. The group-message
@@ -934,8 +933,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                     reached = True
                     break
                 missed.append(message)
-            # Bounded by the cursor, not by a page count: stopping early would
-            # drop the OLDEST missed messages while still advancing past them.
+            # The cursor is the intended bound. MAX_BACKFILL_PAGES below is only
+            # a backstop for when it cannot be met, and it bounds the FETCH —
+            # never the replay. Everything fetched is a message this agent has
+            # not seen, so dropping any of it here would advance the cursor past
+            # real traffic, which is the loss this whole function exists to undo.
             if reached or not page or not body.get("has_more"):
                 break
             if page[-1]["uid"] == cursor:
@@ -948,28 +950,18 @@ class PlowChatAdapter(BasePlatformAdapter):
                     "refusing to spin"
                 )
             cursor = page[-1]["uid"]
-        else:
-            # Ran the cap out. Replaying an unbounded history would flood the
-            # agent one turn at a time — and this runtime acts on what it reads,
-            # so a months-old request is not merely noise. Keep the newest page
-            # of what we found and say plainly what was dropped.
-            logger.warning(
-                "[plow_chat] %s: stopped backfilling after %d pages without meeting "
-                "cursor %r; replaying only the newest %d message(s) and skipping "
-                "everything older",
-                chat_uid, MAX_BACKFILL_PAGES, self._last_uids.get(chat_uid), PAGE_SIZE,
-            )
-            del missed[PAGE_SIZE:]
         if missed and not reached:
-            # Two ways to get here and they look identical from the inside: a
-            # chat that anchored empty (correct — everything IS the gap), or a
-            # cursor the endpoint no longer returns, since it filters
-            # deleted_at IS NULL. The second replays the whole history, so say
-            # which walk this was rather than let it pass as routine.
+            # One warning, because there is one outcome: everything fetched gets
+            # replayed. Three ways to arrive here and they are indistinguishable
+            # from the inside — a chat that anchored empty (correct, everything
+            # IS the gap), a gap longer than the walk, or a cursor the endpoint
+            # no longer returns, since it filters deleted_at IS NULL. Say what
+            # happened and let the operator read which it was.
             logger.warning(
-                "[plow_chat] %s: walked %d message(s) to exhaustion without "
-                "meeting cursor %r — replaying all of them",
-                chat_uid, len(missed), self._last_uids.get(chat_uid),
+                "[plow_chat] %s: replaying %d message(s) without having met cursor "
+                "%r — the chat anchored empty, the gap is longer than %d pages, or "
+                "the cursor message is gone",
+                chat_uid, len(missed), self._last_uids.get(chat_uid), MAX_BACKFILL_PAGES,
             )
         for message in reversed(missed):
             await self._handle_ws_frame(chat_uid, {"type": "message_received", "message": message})
