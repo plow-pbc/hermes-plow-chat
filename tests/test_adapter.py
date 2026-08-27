@@ -1715,3 +1715,73 @@ def test_a_failing_backfill_still_serves_live_frames(monkeypatch, caplog):
 
     assert [e.text for e in a.handled] == ["still listening"]
     assert "backfill failed" in caplog.text
+
+
+def test_a_healthy_chat_reports_no_backfill_at_all(monkeypatch, caplog):
+    """A zero-length gap must be silent. The rows above the floor in an answered
+    chat are the agent's own replies and its attachment-only messages — none of
+    which can become a turn — and counting them made every routine reconnect
+    claim it had recovered something."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_1"])
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        {"uid": "out_1", "direction": "outbound", "chat_uid": "cht_a",
+         "body": "the agent's own reply", "sender": {"type": "agent"}},
+        _msg("att_1", "", chat_uid="cht_a"),
+        _msg("msg_1", "already answered"),
+    ]})
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(a._backfill("cht_a"))
+
+    assert a.handled == []
+    assert "backfilled" not in caplog.text
+
+
+def test_an_attachment_only_message_does_not_re_collect_forever(monkeypatch, caplog):
+    """It is inbound, so a direction-only gate collects it — and the frame
+    handler drops it before anything records it, so it stays above the floor and
+    comes back on every single reconnect."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["msg_1"])
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        _msg("att_1", "   ", chat_uid="cht_a"),
+        _msg("msg_1", "already answered"),
+    ]})
+
+    for _ in range(3):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            asyncio.run(a._backfill("cht_a"))
+        assert "backfilled" not in caplog.text
+
+    assert a.handled == []
+
+
+def test_the_backstop_count_reports_only_what_it_replayed(monkeypatch, caplog):
+    """The one number an operator reads to tell a long outage from a broken
+    endpoint. Counting rows that cannot become turns overstates the gap."""
+    monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._mark_seen("cht_a", ["never_returned"])
+
+    class Endless:
+        def get(self, url, **kwargs):
+            after = url.split("starting_after=")[1] if "starting_after=" in url else None
+            n = int(after.rsplit("_", 1)[1]) if after else 0
+            return FakeResponse({"data": [
+                _msg(f"m_{n + 1}", f"body_{n + 1}"),
+                {"uid": f"m_{n + 2}", "direction": "outbound", "chat_uid": "cht_a",
+                 "body": "agent reply", "sender": {"type": "agent"}},
+            ], "has_more": True})
+
+        async def close(self):
+            return None
+
+    a._http_session = Endless()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["body_3", "body_1"]
+    assert "replaying 2 and not looking further back" in caplog.text

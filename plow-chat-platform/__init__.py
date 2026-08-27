@@ -293,6 +293,23 @@ async def _body(resp):
     return await resp.json(content_type=None)
 
 
+def _is_replayable(message: dict) -> bool:
+    """Whether this row can become an agent turn.
+
+    Asked in two places — what a backfill collects, and what the frame handler
+    accepts — and it has to be one predicate. When collection was the looser of
+    the two it gathered rows the handler then dropped, which inflated the
+    "backfilled N" line and the backstop's count; worse, a dropped row never
+    reaches the record, so it stayed above the walk's floor and re-collected on
+    every reconnect, permanently.
+
+    Empty bodies are the non-obvious half: an attachment- or sticker-only
+    message arrives inbound with no text and is exactly that shape.
+    """
+    return (message.get("direction") == "inbound"
+            and bool((message.get("body") or "").strip()))
+
+
 def _members(chat: dict) -> list[dict]:
     """The people in a chat. The remaining participant is this agent's own line.
 
@@ -953,11 +970,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                     break
                 # The floor above tests every row — an anchored chat has the
                 # agent's own uids in its record, so one of those legitimately
-                # ends the walk. Collecting is narrower: an outbound row is
-                # dropped by the frame handler anyway, so carrying it here only
-                # inflates the two counts an operator reads to tell a long
-                # outage from a broken endpoint.
-                if message.get("direction") != "inbound":
+                # ends the walk. Collecting asks the same question the frame
+                # handler will: a row it would drop only inflates the two counts
+                # an operator reads to tell a long outage from a broken
+                # endpoint, and an undispatchable one never enters the record,
+                # so it would re-collect on every reconnect for good.
+                if not _is_replayable(message):
                     continue
                 missed.append(message)
             if reached or not page or not body.get("has_more"):
@@ -1025,11 +1043,18 @@ class PlowChatAdapter(BasePlatformAdapter):
                         and all(isinstance(u, str) for u in uids)):
                     self._seen[chat_uid] = dict.fromkeys(uids)
                 else:
+                    # Two ways in, and naming the container for both reported the
+                    # accepted type as the fault ("got list") when the container
+                    # was right and an element was not.
+                    fault = type(uids).__name__
+                    if isinstance(uids, (list, dict)):
+                        fault = next((f"{type(u).__name__} element" for u in uids
+                                      if not isinstance(u, str)), fault)
                     logger.warning(
                         "[plow_chat] dropping the seen-message record for %r: expected a "
                         "list or map of message uids, got %s — that chat anchors on its "
                         "next walk and skips anything pending in it",
-                        chat_uid, type(uids).__name__,
+                        chat_uid, fault,
                     )
         except (OSError, ValueError) as exc:
             logger.warning(
@@ -1094,7 +1119,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             return
 
         message = frame.get("message") or {}
-        if message.get("direction") != "inbound":
+        if not _is_replayable(message):
             return
         # A ticket is per-chat, but a frame still names its chat. A mismatch is a
         # shape this code does not know, and attributing it to the socket's chat
@@ -1109,8 +1134,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         user_id = sender.get("uid") or sender.get("provider_key") or "member"
         user_name = sender.get("display_name") or user_id
         text = message.get("body") or ""
-        if not text.strip():
-            return
 
         # The vouch is recorded first, because this very frame can be the thing
         # that earns it. Asking _may_approve() before it meant the operator's own
