@@ -1785,3 +1785,21 @@ def test_the_backstop_count_reports_only_what_it_replayed(monkeypatch, caplog):
 
     assert [e.text for e in a.handled] == ["body_3", "body_1"]
     assert "replaying 2 and not looking further back" in caplog.text
+
+
+def test_the_dropped_record_warning_names_the_element_not_the_container(monkeypatch, tmp_path, caplog):
+    """This warning is the only thing telling an operator which chat will
+    silently skip pending messages on its next walk. Reporting the accepted type
+    as the fault — "got list", when the list is fine and an element is not —
+    points them at the wrong thing, and a wrong diagnostic is worse than none."""
+    (tmp_path / "plow-chat-seen.json").write_text(
+        json.dumps({"cht_good": ["ok_uid"], "cht_bad": ["ok_uid", 7]})
+    )
+
+    with caplog.at_level(logging.WARNING):
+        a = _adapter(monkeypatch)
+
+    assert "int element" in caplog.text
+    assert "got list" not in caplog.text
+    assert "cht_bad" in caplog.text
+    assert list(a._seen) == ["cht_good"], "the well-formed sibling survives"
