@@ -283,6 +283,10 @@ def test_groups_parses_uid_equals_name(monkeypatch):
         ("cht_a=Owners,cht_b=owners", "repeats display name"),
         ("cht_a=Plow Chat", "reserved for the home chat"),
         ("cht_a=plow chat", "reserved for the home chat"),
+        # A configured label is published unsuffixed, so it is the only name that
+        # could still equal a derived one — a bare uid, or the `(cht_…)` form.
+        ("cht_a=cht_x", "looks like a chat id"),
+        ("cht_a=Cleaning (cht_x)", "looks like a chat id"),
     ],
 )
 def test_groups_rejects_malformed_entries(monkeypatch, value, message):

@@ -31,6 +31,9 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 DEFAULT_BASE_URL = "https://api.plow.co"
 MAX_MESSAGE_LENGTH = 4_000
 DEFAULT_WELCOME_MESSAGE = "Hi — Plow Chat is connected to Hermes now. Reply here to start chatting."
+# The tail of a derived name, `<title> (<cht_ id>)`. Matched against operator
+# labels so the one tier published unsuffixed cannot imitate one.
+_DERIVED_NAME_SHAPE = re.compile(r"\(cht_[^)]*\)$")
 # The home chat's label, in the registry and in _label and in the enablement seed.
 HOME_CHAT_NAME = "Plow Chat"
 
@@ -218,6 +221,17 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
     if reserved:
         raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {reserved[0]!r} is "
                          f"reserved for the home chat")
+    # A configured label is the only name published without its uid, so it is the
+    # only one that could still equal a derived one. Derived names are a bare uid
+    # or `<title> (<cht_ id>)`; refusing those two shapes here is what makes the
+    # uniqueness claim total instead of "between titles". Caught at config time,
+    # beside the other pinned-tier rules, where the operator is looking at what
+    # they typed.
+    shaped = sorted(group["name"] for group in groups.values()
+                    if group["name"].startswith("cht_") or _DERIVED_NAME_SHAPE.search(group["name"]))
+    if shaped:
+        raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {shaped[0]!r} looks like a chat "
+                         f"id or an auto-generated name; pick a name a person would type")
     # Warned rather than raised: config carries the prompts while the labels live
     # in the untracked dotenv, so an orphan is the *normal* state on a fresh
     # restore. Raising would brick the gateway in the recovery path config exists
@@ -341,7 +355,9 @@ def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: st
     poll nothing records who held it first, and the image resolves the first
     match. Appending the uid makes every unconfigured name unique by
     construction, so no title can equal another room's name, and no ordering,
-    history, or across-reconnect state has to be kept to hold that true.
+    history, or across-reconnect state has to be kept to hold that true. The
+    configured labels -- the one tier published unsuffixed -- are held to the
+    same uniqueness by `_groups`, which refuses a label shaped like either.
 
     It stays addressable, because the image's resolver falls back to an
     unambiguous prefix match: `plow_chat:#Snoqualmie Cabin Cleaning` still
