@@ -693,8 +693,10 @@ def test_one_unclassifiable_chat_does_not_abort_discovery(monkeypatch):
     ([(["+1", "+2"], "+1")], "+1"),                  # company in the home chat, from the start
     ([(["+1"], "+1"), (["+1", "+2"], "+1")], "+1"),  # ...and arriving later
     ([(["+1"], "+1"), (["+2"], "+2")], "+2"),        # the account changed hands
+    ([(["+1", "+2"], "+2")], "+2"),                  # ...and the owner is not the first row
     ([(["+9"], None)], None),                        # nobody here owns the account
-], ids=["company-first-poll", "company-later", "changes-identity", "no-owner"])
+], ids=["company-first-poll", "company-later", "changes-identity", "owner-is-not-first",
+        "no-owner"])
 def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_operator):
     """A crowded home chat used to clear the operator, because the pick was positional
     and choosing among several members would have been a silent escalation. `role` is
@@ -712,6 +714,23 @@ def test_operator_identity_across_polls(monkeypatch, caplog, polls, expected_ope
         # Reported on the first poll too, not only on a transition: None doubles as
         # "unresolved", so an equality check alone stays silent on a fresh install.
         assert "no owner among the home chat's" in caplog.text
+
+
+def test_an_owner_participant_without_a_handle_does_not_abort_the_poll(monkeypatch):
+    """Every read of this user-wide listing is `.get`-based for one reason: an exception
+    escapes `_reconcile_once`, is swallowed as a warning, and costs the whole pass —
+    reach, revocation and vouch hydration — on every poll for the life of the process."""
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    home = _chat("cht_home", "line_1", ["+1"])
+    del home["participants"][1]["provider_key"]
+    a._http_session = PagingSession({
+        "/v1/chats": [home, _chat("cht_good", "line_1", ["+2"])],
+        "/v1/chats/cht_good/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+    assert a.operator_key is None
+    assert "cht_good" in a.chat_uids     # the rest of the pass still ran
 
 
 def test_a_new_operator_does_not_inherit_the_old_ones_vouches(monkeypatch):

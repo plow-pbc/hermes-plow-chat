@@ -221,11 +221,15 @@ def _is_owner(participant: dict) -> bool:
     """Whether a sender or roster participant is the operator who owns this agent.
 
     The single owner of that fact. `role` is the Chat API's own answer
-    (plow-pbc/plow#1381), resolved there against the account's canonical handle
-    and served on both surfaces this adapter reads — message senders and chat
-    participants. Re-deriving it by comparing handles is the drift `role` exists
-    to retire: the roster and the wire spell the same person differently, and
-    the disagreement is silent in both directions.
+    (plow-pbc/plow#1381), served on both surfaces this adapter reads — message
+    senders and chat participants. Re-deriving it by comparing handles is the
+    drift `role` exists to retire: the roster and the wire spell the same person
+    differently, and the disagreement is silent in both directions.
+
+    Load-bearing: it is resolved against the handles the *account* holds, not
+    per-chat, so a room's creator or admin is not an owner. A per-chat `role` on
+    any surface would break this, because vouching trusts the field in rooms the
+    operator does not own.
 
     An absent `role` reads as not-owner: absent data must never elevate. That is
     also what makes this total over the agent's own traffic, which carries none.
@@ -696,8 +700,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             # Every owner-role participant IS the operator, so which one is arbitrary —
             # but the pick has to be stable, or a reordered listing reads as an identity
             # change and revokes every vouch on each poll.
-            next_operator = min((m["provider_key"] for m in home_members if _is_owner(m)),
-                                default=None)
+            owner_keys = [k for m in home_members if _is_owner(m) and (k := m.get("provider_key"))]
+            next_operator = min(owner_keys, default=None)
             if next_operator != self.operator_key or not self._operator_resolved:
                 self._operator_resolved = True
                 # Grants do not outlive the identity that made them. `authorized` only
