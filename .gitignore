@@ -7,3 +7,6 @@ install-report.json
 
 # knightwatch materializes declared review siblings here during a review.
 .siblings/
+
+# Planning artifacts — never committed (see CODING_STANDARDS.md § Don't Commit Plans).
+docs/plans/

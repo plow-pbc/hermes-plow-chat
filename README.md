@@ -55,12 +55,40 @@ URL in git.
 | `PLOW_CHAT_TOKEN` | yes | the session bearer token activation mints |
 | `PLOW_CHAT_CHAT_UID` | yes | the chat this agent serves, `cht_…` |
 | `PLOW_CHAT_BASE_URL` | no | API base, default `https://api.plow.co` |
-| `PLOW_CHAT_GROUP_UIDS` | no | group chats to join, `<cht_id>=<display name>`, comma-separated |
+| `PLOW_CHAT_GROUP_UIDS` | no | grants standing tool authority, and overrides the name, for `<cht_id>=<display name>`, comma-separated |
 | `PLOW_CHAT_HOME_CHANNEL` | no | delivery target for cron, defaults to `PLOW_CHAT_CHAT_UID` |
 | `PLOW_CHAT_WELCOME_MESSAGE` / `PLOW_CHAT_AUTO_WELCOME` | no | one-time message on `chat_active` |
 | `PLOW_CHAT_AUTO_APPROVE_PAIRING` | no | best-effort approval of verified Plow members |
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
+
+### What a group thread is called
+
+Nothing has to be configured for a thread to have a name. Every 60s poll reads
+`GET /v1/chats`, and each chat is named from the best source it has:
+
+1. its `PLOW_CHAT_GROUP_UIDS` entry, when the operator set one;
+2. the chat's own `display_name` — the iMessage thread title, when the thread
+   has been titled;
+3. the members, owner excluded — a name each where Plow has verified them, the
+   handle where it has not;
+4. the `cht_` id, as the floor.
+
+The result is published into the image's own `~/.hermes/channel_aliases.json`
+overlay, which is re-applied on every channel-directory build and every load and
+carries ids that have produced no traffic yet. So a thread is addressable as
+`plow_chat:#<name>` — and visible to `send_message action="list"` — from the
+first poll after it is created, without a restart and without a dotenv edit.
+**That file's `plow_chat` block is written by this adapter**: to change a name,
+retitle the thread in iMessage or list it in `PLOW_CHAT_GROUP_UIDS`, rather than
+hand-editing the block.
+
+Two rules make provider-supplied text safe to consume, and both are asserted in
+the suite. A name **grants nothing** — tool authority stays configured-in-dotenv
+or earned by the operator speaking in the thread. And because an iMessage title
+is renameable by anyone in the thread while the image's resolver takes the first
+matching name, a title that collides with an already-assigned name is given an
+id suffix rather than allowed to shadow the room that holds it.
 
 ## There is a second implementation, and it is not this one
 
