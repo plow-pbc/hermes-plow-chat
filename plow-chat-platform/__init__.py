@@ -950,6 +950,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         if chat_type != "dm":
             event_kwargs["channel_prompt"] = _channel_prompt(self.groups.get(chat_uid), sender)
         await self.handle_message(MessageEvent(source=self.build_source(**source_kwargs), **event_kwargs))
+        # After the dispatch, never before: a turn the gateway refused has not
+        # been seen by the agent, and a cursor past it is a message nobody will
+        # ever replay.
+        self._checkpoint(chat_uid, msg_uid)
 
     def _may_approve(self, chat_uid: str) -> bool:
         """Whether this chat's members may use tools and be paired.

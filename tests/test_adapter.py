@@ -1280,3 +1280,29 @@ def test_a_cursor_write_leaves_no_partial_file(monkeypatch, tmp_path):
         "cht_a": "msg_1",
         "cht_b": "msg_2",
     }
+
+
+def test_the_cursor_advances_only_after_the_turn_is_dispatched(monkeypatch, tmp_path):
+    """A turn the gateway refused has not been seen by the agent. Moving the
+    cursor over it is exactly the loss this file exists to prevent."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class Boom(adapter_mod.PlowChatAdapter):
+        async def handle_message(self, event):
+            raise RuntimeError("gateway rejected the turn")
+
+    a = _adapter(monkeypatch, cls=Boom)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a")))
+
+    assert a._last_uids == {}, "an undelivered turn must stay replayable"
+
+
+def test_a_dispatched_turn_checkpoints(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+
+    asyncio.run(a._handle_ws_frame("cht_a", _inbound("cht_a", uid="msg_1")))
+
+    assert a._last_uids == {"cht_a": "msg_1"}
