@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import pathlib
 import sys
@@ -74,6 +75,37 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "CHECKPOINT", tmp_path / "last_uid")
     return module
+
+
+def test_life_image_extends_the_boot_greeting_into_onboarding(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    config_path = tmp_path / "life-config.json"
+    config_path.write_text(json.dumps({"family": {"owner": {"name": ""}}}))
+    monkeypatch.setattr(module, "LIFE_CONFIG", config_path)
+
+    greeting = module._boot_greeting()
+
+    assert greeting.startswith("👋")
+    assert "name" in greeting.lower()
+
+    config_path.write_text(json.dumps({"family": {"owner": {"name": "Sam"}}}))
+    assert module._boot_greeting() == "👋", "a gateway restart must not restart onboarding"
+
+
+def test_non_life_image_keeps_the_plain_boot_greeting(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "LIFE_CONFIG", tmp_path / "absent.json")
+
+    assert module._boot_greeting() == "👋"
+
+
+def test_registers_home_channel_as_cron_delivery_target(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    context = mock.Mock()
+
+    module.register(context)
+
+    assert context.register_platform.call_args.kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
 
 
 class _WS:

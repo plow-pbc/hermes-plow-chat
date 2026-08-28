@@ -20,6 +20,7 @@ PLATFORM_NAME = "plow_chat"
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down.
 CHECKPOINT = pathlib.Path("/var/lib/hermes/plow_chat_last_uid")
+LIFE_CONFIG = pathlib.Path("/var/lib/hermes/life/config.json")
 log = logging.getLogger(__name__)
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
 _MEMBER_TOOL_BLOCK = {"action": "block", "message": "tools are unavailable on this turn"}
@@ -101,6 +102,16 @@ def _platform():
     below runs after register(), where the name is valid.
     """
     return Platform(PLATFORM_NAME)
+
+
+def _boot_greeting():
+    try:
+        owner_name = json.loads(LIFE_CONFIG.read_text())["family"]["owner"]["name"]
+    except (KeyError, OSError, TypeError, ValueError):
+        return "👋"
+    if isinstance(owner_name, str) and not owner_name.strip():
+        return "👋 I’m your life dashboard. What name should I use for you?"
+    return "👋"
 
 
 class PlowChatAdapter(BasePlatformAdapter):
@@ -497,7 +508,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                                 continue
                             self._boot_greeted.add(chat_uid)
                             try:
-                                await self.send(chat_uid, "👋")
+                                await self.send(chat_uid, _boot_greeting())
                             except Exception as exc:  # noqa: BLE001 - greeting must not tear down a healthy socket
                                 log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
                         for chat_uid in self.chat_uids:
@@ -771,6 +782,7 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", _block_member_tools)
     ctx.register_platform(
         name=PLATFORM_NAME,
+        cron_deliver_env_var="PLOW_HOME_CHANNEL",
         label="Plow Chat",
         adapter_factory=lambda cfg: PlowChatAdapter(cfg),
         check_fn=check_requirements,
