@@ -983,22 +983,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             json={"chat_id": chat_uid},
             headers={"Authorization": f"Bearer {self.token}"},
         ) as resp:
-            if resp.status == 401:
-                # Before the decode, for the reason `_body` states: a 401 from a
-                # proxy or WAF is not JSON, and decoding first loses the status
-                # to a decode error.
-                raise _PlowAuthError(resp.status, f"ticket mint refused for {chat_uid}")
-            if resp.status >= 400:
-                # Same order, same reason: a non-JSON 5xx from a proxy would
-                # otherwise surface as a decode error instead of its status.
-                text = (await resp.text())[:200]
-                try:
-                    err = (json.loads(text) or {}).get("error", {})
-                except ValueError:
-                    err = {}
-                raise RuntimeError(err.get("message") or f"ticket mint failed: {resp.status}")
-            data = await resp.json(content_type=None)
-            return data["ticket"]
+            # `_body` owns this contract -- status before parse, 401 as
+            # _PlowAuthError, everything else a RuntimeError carrying the status.
+            # The mint used to restate it, and restating it is how the two copies
+            # drifted apart twice: once when only the 401 side was reordered, and
+            # again when the rewrite dropped `_body`'s non-dict guard.
+            return (await _body(resp))["ticket"]
 
     async def _websocket_loop(self, chat_uid: str) -> None:
         import aiohttp
