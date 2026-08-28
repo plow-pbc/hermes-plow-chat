@@ -482,11 +482,13 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
         def get(self, url: str, **kwargs: Any) -> _Resp:
             return _Resp({"object": "list", "data": [_chat("cht_b"), _chat("cht_c")], "has_more": False})
 
-    with pytest.raises(RuntimeError, match="not in the\s+credential grant"):
+    with pytest.raises(RuntimeError, match=r"not in the.*credential grant"):
         await adapter._refresh_reach(_GrantHTTP())
     assert adapter.home_chat_uid == "cht_a", "a refused grant must not move the home"
     assert adapter.chat_uids == frozenset({"cht_a", "cht_b"}), "a refused grant must not replace reach"
     assert persisted == []
+
+
 class _SocketHTTP(_HTTP):
     def __init__(self) -> None:
         super().__init__()
@@ -504,7 +506,6 @@ class _SocketHTTP(_HTTP):
     def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
         self.sockets.append(url)
         return _WS()
-
 
 
 async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -873,6 +874,7 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
             with pytest.raises(StopAsyncIteration):
                 await adapter._listen()
     else:
+        module._live = (adapter, None)  # published, as connect() would have
         with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"

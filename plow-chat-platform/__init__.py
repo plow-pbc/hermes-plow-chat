@@ -56,7 +56,7 @@ _SPEAKER_FACT = (
 EXTERNAL_CHANNEL_PROMPT = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and answer their message directly; never emit "
-    "reasoning or tool narration — if you have nothing to say, say nothing. "
+    "[NOOP], reasoning, or tool narration — if you have nothing to say, say nothing. "
     f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
 )
 
