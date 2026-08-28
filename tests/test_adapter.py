@@ -66,13 +66,20 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
+    # The checkpoint base honors the fleet's HERMES_HOME; pin it here so the
+    # module-scope default never points a test at /var/lib/hermes.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLOW_HOME_CHANNEL", "cht_a")
     monkeypatch.setenv("PLOW_AGENT_TOKEN", "plow_tok")  # pragma: allowlist secret — a fixture string
     spec = importlib.util.spec_from_file_location("plow_chat_under_test", PLUGIN)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "CHECKPOINT", tmp_path / "last_uid")
+    # No CHECKPOINT override: with HERMES_HOME pinned above, the module's own
+    # env-derived resolution already lands in tmp_path -- the assert IS the
+    # regression pin for the fleet's checkpoint home (the old hardcoded
+    # /var/lib/hermes made every fleet anchor raise).
+    assert module.CHECKPOINT == tmp_path / "plow_chat_last_uid"
     return module
 
 
@@ -327,7 +334,7 @@ async def test_startup_baseline_cases(
         assert "backfill" in calls, calls
 
     assert adapter._last_uids[adapter.home_chat_uid] == baseline
-    checkpoint = tmp_path / "last_uid"
+    checkpoint = tmp_path / "plow_chat_last_uid"
     if connects:
         # The file's existence is what records "this agent has anchored" — its
         # contents are the cursor, empty when the chat was empty. A restart has
@@ -348,7 +355,7 @@ async def test_a_restart_does_not_re_anchor_over_messages_it_never_handled(monke
     to hermes. The checkpoint file is the one durable owner of that state.
     """
     module = _load(monkeypatch, tmp_path)
-    checkpoint = tmp_path / "last_uid"
+    checkpoint = tmp_path / "plow_chat_last_uid"
     checkpoint.write_text("")  # anchored earlier, on an empty chat
 
     calls: list[str] = []
@@ -444,8 +451,8 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
     assert "first-user onboarding" not in owner_prompt.lower()
     assert config.extra["group_sessions_per_user"] is False
-    assert (tmp_path / "last_uid").read_text() == "msg_a"
-    assert (tmp_path / "last_uid.cht_b").read_text() == "msg_b_member"
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_a"
+    assert (tmp_path / "plow_chat_last_uid.cht_b").read_text() == "msg_b_member"
     assert "outside the grant" in caplog.text
 
 
@@ -587,7 +594,7 @@ async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.Monk
     with pytest.raises(OSError) as error:
         await adapter._anchor(_AnchorHTTP(), "cht_b")
 
-    assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'last_uid.cht_b'}"
+    assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'plow_chat_last_uid.cht_b'}"
 
 
 # --- prompt rules and the group-send tool (ported from the operator-model adapter) ---

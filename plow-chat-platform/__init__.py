@@ -18,8 +18,13 @@ BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 PLATFORM_NAME = "plow_chat"
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
-# backfill, and silently lose whatever arrived while it was down.
-CHECKPOINT = pathlib.Path("/var/lib/hermes/plow_chat_last_uid")
+# backfill, and silently lose whatever arrived while it was down. The gateway's
+# home is that volume on both runtimes: HERMES_HOME is set on the Docker fleet
+# (/opt/data, the bind-mounted home) and unset on the exe.dev image, where the
+# hermes user's home is /var/lib/hermes -- the path this once hardcoded, which
+# on the fleet does not exist and made every anchor raise (agents connected,
+# then tore the socket down five seconds later, mute).
+CHECKPOINT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes") / "plow_chat_last_uid"
 log = logging.getLogger(__name__)
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
 _MEMBER_TOOL_BLOCK = {"action": "block", "message": "tools are unavailable on this turn"}
