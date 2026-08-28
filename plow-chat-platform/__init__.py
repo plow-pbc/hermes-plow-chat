@@ -1089,6 +1089,7 @@ def register(ctx):
         label="Plow Chat",
         adapter_factory=lambda cfg: PlowChatAdapter(cfg),
         check_fn=check_requirements,
+        cron_deliver_env_var="PLOW_HOME_CHANNEL",
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables.",
