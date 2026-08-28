@@ -534,9 +534,12 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
 ) -> None:
     """A hand-off that fails is retried where it sits; everything behind it
     in the chat waits, so nothing ever acks past a message hermes never
-    accepted, and order holds through the retry."""
+    accepted, and order holds through the retry. Its media was fetched once:
+    a retry must not go back to a signed url that may have expired."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[str] = []
 
     async def flaky(event: Any) -> None:
@@ -546,11 +549,12 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
         handled.append(event.text)
 
     monkeypatch.setattr(adapter, "handle_message", flaky)
-    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", attachments=[_attachment()]))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role="member"))
     await _settle(adapter)
 
     assert handled == ["boom", "msg_1", "msg_2"]
+    assert len(http.gets) == 1
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
