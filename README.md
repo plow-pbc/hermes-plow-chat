@@ -66,11 +66,21 @@ drops nothing.
 
 ### What a group thread is called
 
-The retired adapter named threads from `PLOW_CHAT_GROUP_UIDS` and the chats'
-own titles, publishing a channel-alias overlay. The credential-scope adapter
-does not do this yet — re-porting the naming layer is
-[#20](https://github.com/plow-pbc/hermes-plow-chat/issues/20). Until then a
-thread is addressed by its `cht_` id.
+The home chat is always `Plow Chat`. Every other granted thread is named from
+its own iMessage title — `<title> (<cht_ id>)`, the uid suffix making a title
+structurally unable to take another room's name — or by its bare `cht_` id
+when nobody has titled it. Titling the thread in iMessage is how it gets a
+name; there is no name configuration here.
+
+The result is published into the image's `channel_aliases.json` overlay on
+every (re)connect, which is re-applied on every channel-directory build and
+load, so a granted thread is addressable — and visible to `send_message
+action="list"` — before it has ever spoken. The suffix does not get in the way
+of addressing: the image's resolver falls back to an unambiguous prefix match,
+so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
+`Snoqualmie Cabin Cleaning (cht_...)`. A name grants nothing — reach and
+authority stay with the credential's grant. A retitle mid-connection shows up
+on the next reconnect.
 
 ## One implementation, two delivery paths
 
