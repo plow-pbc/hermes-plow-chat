@@ -111,7 +111,13 @@ except ImportError:
                    "importable; group silence falls back to %r", SILENT_REPLY_TOKEN)
 
 class _PlowAuthError(Exception):
-    """A 401/403 from Plow: the credential is gone, not a blip.
+    """A 401 from Plow: the credential is gone, not a blip.
+
+    401 only, deliberately. A 403 is routinely about one resource — a chat this
+    agent was removed from — and `_body` is used for per-chat reads during vouch
+    hydration, so treating 403 as revocation would let one forbidden room latch
+    a permanent fatal and end discovery for every other room. Warn-and-retry is
+    the right answer there; the next pass drops the room through `_set_reach`.
 
     Separate from the RuntimeError `_body` raises for every other status,
     because the poll has to treat it differently. A 502 in front of Plow
@@ -326,7 +332,7 @@ async def _body(resp):
     credential. And an error from something in front of Plow (a proxy 502, a WAF
     429) is not JSON at all, so decoding first loses the status to a decode error.
     """
-    if resp.status in (401, 403):
+    if resp.status == 401:
         raise _PlowAuthError(resp.status, (await resp.text())[:200])
     if resp.status >= 400:
         raise RuntimeError(f"Plow {resp.status}: {(await resp.text())[:200]}")
@@ -934,9 +940,17 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._auth_failed = True
         logger.error("[plow_chat] %s — this agent's credential is revoked or invalid, "
                      "so nothing it does can succeed until it is re-credentialed", exc)
+        # State first, delivery second. Notifying is the step that talks to the
+        # network, and this is the moment the network is least trustworthy — a
+        # raise there used to leave the latch set, the adapter still reporting
+        # itself connected, and no later call able to correct it, which is the
+        # symptom #15 exists to remove.
         self._set_fatal_error("token_revoked", str(exc), retryable=False)
-        await self._notify_fatal_error()
         self._mark_disconnected()
+        try:
+            await self._notify_fatal_error()
+        except Exception:
+            logger.warning("[plow_chat] could not deliver the fatal-error notice", exc_info=True)
 
     async def _reconcile(self) -> None:
         """Adopt the chats nobody configured — polled, because nothing pushes them.
@@ -969,9 +983,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             json={"chat_id": chat_uid},
             headers={"Authorization": f"Bearer {self.token}"},
         ) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status in (401, 403):
+            if resp.status == 401:
+                # Before the decode, for the reason `_body` states: a 401 from a
+                # proxy or WAF is not JSON, and decoding first loses the status
+                # to a decode error.
                 raise _PlowAuthError(resp.status, f"ticket mint refused for {chat_uid}")
+            data = await resp.json(content_type=None)
             if resp.status >= 400:
                 err = data.get("error", {}) if isinstance(data, dict) else {}
                 raise RuntimeError(err.get("message") or f"ticket mint failed: {resp.status}")

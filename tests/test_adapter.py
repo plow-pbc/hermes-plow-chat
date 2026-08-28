@@ -1492,7 +1492,7 @@ class _Resp:
         return json.loads(self._text)
 
 
-@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("status", [401])
 def test_an_auth_status_raises_a_typed_error(status):
     """The status has to survive as data. _body puts it in a message string, and
     a poll cannot tell 'credential revoked' from 'gateway hiccup' by parsing prose."""
@@ -1501,10 +1501,12 @@ def test_an_auth_status_raises_a_typed_error(status):
     assert exc.value.status == status
 
 
-@pytest.mark.parametrize("status", [429, 500])
+@pytest.mark.parametrize("status", [403, 429, 500])
 def test_a_non_auth_status_stays_a_plain_error(status):
-    """Everything else keeps its existing shape — a 502 in front of Plow really is
-    transient, and must keep the retry the reconcile loop gives it."""
+    """Everything else keeps its existing shape. 403 is in here on purpose: it is
+    routinely about one resource — a chat this agent was removed from — and _body
+    serves per-chat reads, so treating it as revocation would let one forbidden
+    room end discovery for every other room."""
     with pytest.raises(RuntimeError) as exc:
         asyncio.run(adapter_mod._body(_Resp(status, "upstream boom")))
     assert not isinstance(exc.value, adapter_mod._PlowAuthError)
@@ -1572,3 +1574,59 @@ def test_the_fatal_report_is_not_repeated_by_a_second_loop(monkeypatch):
     asyncio.run(a._fail_auth(exc))
 
     assert notifications == [1], "reported once, however many loops discover it"
+
+
+class _NonJsonResponse:
+    """A 401 from something in front of Plow — a proxy or WAF — whose body is not
+    JSON. Decoding before checking the status loses the 401 to a decode error."""
+
+    status = 401
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self, content_type=None):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    async def text(self):
+        return "<html>401 Unauthorized</html>"
+
+
+def test_the_ticket_mint_reports_a_revoked_credential_and_stops_the_socket(monkeypatch, caplog):
+    """The socket is the other place the credential is presented, and it had the
+    same forever-backoff. Driven with a NON-JSON body because that is what a proxy
+    returns, and it is what catches a status check placed after the decode."""
+    a = _adapter(monkeypatch, groups=None)
+    a._http_session = types.SimpleNamespace(post=lambda *args, **kwargs: _NonJsonResponse())
+    slept = []
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep",
+                        lambda d: slept.append(d) or asyncio.sleep(0))
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(a._websocket_loop("cht_home"))
+
+    assert a.fatal_error[0][0] == "token_revoked"
+    assert a.is_connected is False
+    assert slept == [], "no backoff against a credential that cannot come back"
+    assert "websocket loop error" not in caplog.text, "reported as revocation, not as a generic loop error"
+
+
+def test_a_failed_notification_still_leaves_the_adapter_marked_disconnected(monkeypatch):
+    """Notifying is the step that touches the network, at the moment the network is
+    least trustworthy. A raise there must not strand the disconnect behind the
+    latch — that is the symptom this change exists to remove."""
+    a = _adapter(monkeypatch, groups=None)
+    a._mark_connected()
+
+    async def _boom():
+        raise RuntimeError("delivery failed")
+
+    a._notify_fatal_error = _boom
+
+    asyncio.run(a._fail_auth(adapter_mod._PlowAuthError(401, "revoked")))
+
+    assert a.fatal_error[0][0] == "token_revoked", "recorded before delivery is attempted"
+    assert a.is_connected is False, "and the disconnect is not stranded behind the failure"
