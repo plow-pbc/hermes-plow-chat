@@ -499,9 +499,18 @@ class PlowChatAdapter(BasePlatformAdapter):
         with display.memory_notifications in the hermes config.
         """
         if os.environ.get("PLOW_STATUS_MESSAGES", "").strip().lower() == "deliver":
-            return await self.send(chat_id, content, metadata=metadata)
-        log.info("[plow_chat] dropped status frame %r for %s: %.80s",
-                 status_key, chat_id, content)
+            refused = self._send_guard(chat_id)
+            if refused is not None:
+                return refused
+            # Not send(): that cancels the typing indicator, and a mid-turn
+            # status must not eat the "working" signal it rides alongside —
+            # a deployment that opts in gets both, not one or the other.
+            async with aiohttp.ClientSession() as http:
+                return await self._post_message(http, chat_id, {"body": content.strip()})
+        # Key and chat only, never the content: status payloads carry upstream
+        # provider detail with no non-secret guarantee, and this frame exists
+        # to be dropped, not persisted into the journal.
+        log.info("[plow_chat] dropped status frame %r for %s", status_key, chat_id)
         return SendResult(success=True)
 
     async def _post_message(self, http, chat_id, payload):

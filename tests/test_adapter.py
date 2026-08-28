@@ -1478,7 +1478,12 @@ async def test_status_frames_are_dropped_unless_the_deployment_opts_into_deliver
     dropped = await adapter.send_or_update_status("cht_a", "compacted", status)
     assert dropped.success and http.posts == []
 
+    # Delivery must not eat the typing indicator: a status arrives mid-turn,
+    # and the opted-in deployment gets both signals, not one or the other.
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
     monkeypatch.setenv("PLOW_STATUS_MESSAGES", "deliver")
     delivered = await adapter.send_or_update_status("cht_a", "compacted", status)
     assert delivered.success
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
+    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
