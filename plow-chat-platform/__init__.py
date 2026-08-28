@@ -124,12 +124,10 @@ class _PlowAuthError(Exception):
     recovers; a revoked token fails identically on every later attempt with the
     same credential, so the retry cadence that serves the first is the thing
     that hides the second.
-    """
 
-    def __init__(self, status: int, detail: str):
-        super().__init__(f"Plow {status}: {detail}")
-        self.status = status
-        self.detail = detail
+    Carries nothing but its message: both consumers discriminate on the type and
+    report with `str(exc)`, so a status attribute would be state no runtime reads.
+    """
 
 
 class _PlowSendError(Exception):
@@ -333,7 +331,7 @@ async def _body(resp):
     429) is not JSON at all, so decoding first loses the status to a decode error.
     """
     if resp.status == 401:
-        raise _PlowAuthError(resp.status, (await resp.text())[:200])
+        raise _PlowAuthError(f"Plow {resp.status}: {(await resp.text())[:200]}")
     if resp.status >= 400:
         raise RuntimeError(f"Plow {resp.status}: {(await resp.text())[:200]}")
     return await resp.json(content_type=None)

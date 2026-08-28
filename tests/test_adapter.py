@@ -914,6 +914,9 @@ class _TextResponse(FakeResponse):
     async def text(self):
         return self._text
 
+    async def json(self, content_type=None):
+        return json.loads(self._text)
+
 
 class _PostRecordingSession(PagingSession):
     """PagingSession plus an async post, for the thread-creation call.
@@ -1478,46 +1481,23 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 
 
-class _Resp:
-    """Minimal aiohttp-response stand-in for _body, usable as a context manager
-    so it also serves the mint path. `json()` parses `text`, so a non-JSON body
-    raises exactly as a proxy's HTML error page does — no separate stub."""
-
-    def __init__(self, status, text):
-        self.status = status
-        self._text = text
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def text(self):
-        return self._text
-
-    async def json(self, content_type=None):
-        return json.loads(self._text)
-
-
-@pytest.mark.parametrize("status", [401])
-def test_an_auth_status_raises_a_typed_error(status):
-    """The status has to survive as data. _body puts it in a message string, and
-    a poll cannot tell 'credential revoked' from 'gateway hiccup' by parsing prose."""
-    with pytest.raises(adapter_mod._PlowAuthError) as exc:
-        asyncio.run(adapter_mod._body(_Resp(status, '{"detail":"Invalid or revoked token"}')))
-    assert exc.value.status == status
-
-
-@pytest.mark.parametrize("status", [403, 429, 500])
-def test_a_non_auth_status_stays_a_plain_error(status):
-    """Everything else keeps its existing shape. 403 is in here on purpose: it is
-    routinely about one resource — a chat this agent was removed from — and _body
-    serves per-chat reads, so treating it as revocation would let one forbidden
-    room end discovery for every other room."""
-    with pytest.raises(RuntimeError) as exc:
-        asyncio.run(adapter_mod._body(_Resp(status, "upstream boom")))
-    assert not isinstance(exc.value, adapter_mod._PlowAuthError)
+@pytest.mark.parametrize("status,expected", [
+    # 401 is the credential itself — nothing this agent does can succeed until it
+    # is replaced, so the poll must stop rather than ask again every 60s.
+    (401, adapter_mod._PlowAuthError),
+    # 403 is routinely about one *resource* — a chat this agent was removed from —
+    # and _body serves per-chat reads during vouch hydration. Treating it as
+    # revocation would let one forbidden room end discovery for every other room.
+    (403, RuntimeError),
+    (429, RuntimeError),
+    (500, RuntimeError),
+])
+def test_body_treats_only_401_as_a_dead_credential(status, expected):
+    # _PlowAuthError is not a RuntimeError subclass, so `raises(RuntimeError)` is
+    # itself the discrimination: a 403 that came back typed would not match.
+    with pytest.raises(expected) as exc:
+        asyncio.run(adapter_mod._body(_TextResponse("upstream boom", status)))
+    assert str(status) in str(exc.value), "the status survives into the message either way"
 
 
 def test_a_revoked_token_is_reported_once_and_stops_the_poll(monkeypatch, caplog):
@@ -1527,7 +1507,7 @@ def test_a_revoked_token_is_reported_once_and_stops_the_poll(monkeypatch, caplog
     a = _adapter(monkeypatch, groups=None)
 
     async def _revoked():
-        raise adapter_mod._PlowAuthError(401, '{"detail":"Invalid or revoked token"}')
+        raise adapter_mod._PlowAuthError("Plow 401: Invalid or revoked token")
 
     a._reconcile_once = _revoked
     slept = []
@@ -1577,7 +1557,7 @@ def test_the_fatal_report_is_not_repeated_by_a_second_loop(monkeypatch):
     notifications = []
     a._notify_fatal_error = lambda: notifications.append(1) or asyncio.sleep(0)
 
-    exc = adapter_mod._PlowAuthError(401, "revoked")
+    exc = adapter_mod._PlowAuthError("Plow 401: revoked")
     asyncio.run(a._fail_auth(exc))
     asyncio.run(a._fail_auth(exc))
 
@@ -1590,7 +1570,7 @@ def test_the_ticket_mint_reports_a_revoked_credential_and_stops_the_socket(monke
     returns, and it is what catches a status check placed after the decode."""
     a = _adapter(monkeypatch, groups=None)
     a._http_session = types.SimpleNamespace(
-        post=lambda *a_, **k_: _Resp(401, "<html>401 Unauthorized</html>"))
+        post=lambda *a_, **k_: _TextResponse("<html>401 Unauthorized</html>", 401))
     slept = []
     real_sleep = asyncio.sleep
 
@@ -1623,7 +1603,7 @@ def test_a_failed_notification_still_leaves_the_adapter_marked_disconnected(monk
 
     a._notify_fatal_error = _boom
 
-    asyncio.run(a._fail_auth(adapter_mod._PlowAuthError(401, "revoked")))
+    asyncio.run(a._fail_auth(adapter_mod._PlowAuthError("Plow 401: revoked")))
 
     assert a.fatal_error[0][0] == "token_revoked", "recorded before delivery is attempted"
     assert a.is_connected is False, "and the disconnect is not stranded behind the failure"
