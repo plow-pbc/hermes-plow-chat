@@ -586,6 +586,33 @@ class PagingSession:
         return None
 
 
+class CursorPagingSession:
+    """A stub for the cursor-paged messages endpoint.
+
+    `pages` maps a `starting_after` value (None for the first request) to
+    `(data, has_more)`. `asked` keeps the cursors requested, in order, so a
+    test can assert the walk actually followed them.
+    """
+
+    def __init__(self, pages):
+        self.pages, self.asked = pages, []
+
+    def get(self, url, **kwargs):
+        after = url.split("starting_after=", 1)[1] if "starting_after=" in url else None
+        self.asked.append(after)
+        data, has_more = self.pages[after]
+        return FakeResponse({"data": data, "has_more": has_more})
+
+    async def close(self):
+        return None
+
+
+def _out(uid, chat_uid="cht_a"):
+    """The agent's own reply, as the message history returns it."""
+    return {"uid": uid, "direction": "outbound", "chat_uid": chat_uid,
+            "body": "agent reply", "sender": {"type": "agent"}}
+
+
 def _chat(uid, line, members, owner="+1"):
     return {"uid": uid, "participants": [
         {"type": "agent", "line": {"uid": line}},
@@ -1535,26 +1562,11 @@ def test_a_gap_deeper_than_one_page_is_recovered_whole(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._mark_seen("cht_a", ["msg_0"])
 
-    pages = {
+    a._http_session = CursorPagingSession({
         None: ([_msg("msg_4", "fourth"), _msg("msg_3", "third")], True),
         "msg_3": ([_msg("msg_2", "second"), _msg("msg_1", "first")], True),
         "msg_1": ([_msg("msg_0", "anchor")], False),
-    }
-
-    class CursorSession:
-        def __init__(self):
-            self.asked = []
-
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            self.asked.append(after)
-            data, has_more = pages[after]
-            return FakeResponse({"data": data, "has_more": has_more})
-
-        async def close(self):
-            return None
-
-    a._http_session = CursorSession()
+    })
 
     asyncio.run(a._backfill("cht_a"))
 
@@ -1570,28 +1582,14 @@ def test_the_walk_stops_at_the_first_message_it_recognises(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._mark_seen("cht_a", ["msg_1"])
 
-    class Counting:
-        def __init__(self):
-            self.calls = 0
-
-        def get(self, url, **kwargs):
-            self.calls += 1
-            return FakeResponse({"data": [
-                _msg("msg_2", "new"),
-                {"uid": "out_1", "direction": "outbound", "chat_uid": "cht_a",
-                 "body": "the agent's own reply", "sender": {"type": "agent"}},
-                _msg("msg_1", "already answered"),
-            ], "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Counting()
+    a._http_session = CursorPagingSession({None: ([
+        _msg("msg_2", "new"), _out("out_1"), _msg("msg_1", "already answered"),
+    ], True)})
 
     asyncio.run(a._backfill("cht_a"))
 
     assert [e.text for e in a.handled] == ["new"]
-    assert a._http_session.calls == 1, "one recognised message ends the walk"
+    assert a._http_session.asked == [None], "one recognised message ends the walk"
 
 
 def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypatch):
@@ -1601,56 +1599,49 @@ def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypa
     message instead of by adoption."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     history = [_msg(f"old_{n}", f"old body {n}") for n in range(50)]
-    deeper = [_msg(f"ancient_{n}", f"ancient body {n}") for n in range(50)]
 
-    class Deep:
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            if after is None:
-                return FakeResponse({"data": newest[:], "has_more": True})
-            return FakeResponse({"data": deeper[:], "has_more": True})
-
-        async def close(self):
-            return None
-
-    newest = history[:]
-    a._http_session = Deep()
+    session = CursorPagingSession({None: (history[:], True)})
+    a._http_session = session
     asyncio.run(a._anchor("cht_a"))
     assert a.handled == [], "adoption dispatches nothing"
 
     # One new message arrives on top of the page that was anchored.
-    newest = [_msg("brand_new", "the only thing that should replay")] + history[:49]
+    session.pages[None] = (
+        [_msg("brand_new", "the only thing that should replay")] + history[:49], True)
     asyncio.run(a._backfill("cht_a"))
 
     assert [e.text for e in a.handled] == ["the only thing that should replay"]
 
 
-def test_an_unbounded_wall_of_unseen_messages_stops_and_says_so(monkeypatch, caplog):
+@pytest.mark.parametrize("wall, replayed", [
+    # All-inbound: every collected row becomes a turn.
+    ({None: ([_msg("m_1", "body_1"), _msg("m_2", "body_2")], True),
+      "m_2": ([_msg("m_3", "body_3"), _msg("m_4", "body_4")], True)},
+     ["body_4", "body_3", "body_2", "body_1"]),
+    # The agent's own replies page the walk but are neither replayed nor
+    # counted — the count is the one number an operator reads to tell a long
+    # outage from a broken endpoint, and rows that cannot become turns
+    # overstate the gap.
+    ({None: ([_msg("m_1", "body_1"), _out("m_2")], True),
+      "m_2": ([_msg("m_3", "body_3"), _out("m_4")], True)},
+     ["body_3", "body_1"]),
+])
+def test_an_unbounded_wall_of_unseen_messages_stops_and_says_so(
+    monkeypatch, caplog, wall, replayed
+):
     """The backstop for a gap longer than anyone expects to recover. Anything
     older is not replayed, and only the operator can tell a long outage from a
     broken endpoint."""
     monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._mark_seen("cht_a", ["msg_never_returned"])
-
-    class Endless:
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            n = int(after.rsplit("_", 1)[1]) if after else 0
-            return FakeResponse({"data": [_msg(f"m_{n + 1}", f"body_{n + 1}"),
-                                          _msg(f"m_{n + 2}", f"body_{n + 2}")],
-                                 "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Endless()
+    a._http_session = CursorPagingSession(wall)
 
     with caplog.at_level(logging.WARNING):
         asyncio.run(a._backfill("cht_a"))
 
-    assert [e.text for e in a.handled] == ["body_4", "body_3", "body_2", "body_1"]
-    assert "not looking further back" in caplog.text
+    assert [e.text for e in a.handled] == replayed
+    assert f"replaying {len(replayed)} and not looking further back" in caplog.text
 
 
 def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
@@ -1659,17 +1650,10 @@ def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._mark_seen("cht_a", ["msg_0"])
 
-    class Stuck:
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            body = [_msg("m_1", "new"), _msg("m_2", "also new")] if after is None else \
-                   [_msg("m_3", "still new"), _msg("m_2", "same tail forever")]
-            return FakeResponse({"data": body, "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Stuck()
+    a._http_session = CursorPagingSession({
+        None: ([_msg("m_1", "new"), _msg("m_2", "also new")], True),
+        "m_2": ([_msg("m_3", "still new"), _msg("m_2", "same tail forever")], True),
+    })
 
     with pytest.raises(RuntimeError, match="did not advance"):
         asyncio.run(a._backfill("cht_a"))
@@ -1812,35 +1796,6 @@ def test_an_attachment_only_message_does_not_re_collect_forever(monkeypatch, cap
         assert "backfilled" not in caplog.text
 
     assert a.handled == []
-
-
-def test_the_backstop_count_reports_only_what_it_replayed(monkeypatch, caplog):
-    """The one number an operator reads to tell a long outage from a broken
-    endpoint. Counting rows that cannot become turns overstates the gap."""
-    monkeypatch.setattr(adapter_mod, "MAX_BACKFILL_PAGES", 2)
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._mark_seen("cht_a", ["never_returned"])
-
-    class Endless:
-        def get(self, url, **kwargs):
-            after = url.split("starting_after=")[1] if "starting_after=" in url else None
-            n = int(after.rsplit("_", 1)[1]) if after else 0
-            return FakeResponse({"data": [
-                _msg(f"m_{n + 1}", f"body_{n + 1}"),
-                {"uid": f"m_{n + 2}", "direction": "outbound", "chat_uid": "cht_a",
-                 "body": "agent reply", "sender": {"type": "agent"}},
-            ], "has_more": True})
-
-        async def close(self):
-            return None
-
-    a._http_session = Endless()
-
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(a._backfill("cht_a"))
-
-    assert [e.text for e in a.handled] == ["body_3", "body_1"]
-    assert "replaying 2 and not looking further back" in caplog.text
 
 
 # ---------------------------------------------------------------------------
