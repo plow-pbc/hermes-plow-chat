@@ -95,9 +95,10 @@ on the next reconnect.
 Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`
 as files in the image's own media cache — the same place the bundled iMessage
 adapter puts them, so the vision path and the skills that say "a texted photo
-arrives as a file path" need nothing new. Each part is fetched once, at
-delivery, through the five-minute Plow-signed content URL and without the
-bearer: the signature is the authorization. A part Plow reports as `failed`, or
+arrives as a file path" need nothing new. Each part is fetched once, begun
+the moment the message arrives — inside the five-minute Plow-signed content
+URL's life, whatever is retrying ahead of it in the chat — and awaited when its
+burst closes; without the bearer: the signature is the authorization. A part Plow reports as `failed`, or
 one whose bytes cannot be fetched, is named in the turn as
 `[attachment: <type> delivery failed | unavailable]` and logged — never dropped
 with the message.
