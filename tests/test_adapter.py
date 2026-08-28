@@ -1462,6 +1462,25 @@ def test_a_chat_born_during_a_gap_replays_its_short_catalogue(monkeypatch, tmp_p
     assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
 
 
+def test_a_chat_whose_record_entry_was_dropped_anchors_not_replays(
+    monkeypatch, tmp_path,
+):
+    """A dropped entry is a chat whose uids WERE seen once — replaying its
+    page re-answers it. Any drop puts the load back in anchor posture, which
+    is what the drop warning promises the operator."""
+    (tmp_path / "plow-chat-seen.json").write_text(
+        json.dumps({"cht_other": ["msg_0"], "cht_a": ["ok_uid", 2]}))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        _msg("msg_2", "already answered"), _msg("msg_1", "also answered"),
+    ]})
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert a.handled == [], "an already-answered chat must not be re-answered"
+    assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
+
+
 def test_a_deep_first_sight_catalogue_is_history_not_a_gap(monkeypatch, tmp_path):
     """Even with a live record, a first-sight chat whose catalogue overflows
     one page is an adopted thread. It anchors: no gap this feature recovers

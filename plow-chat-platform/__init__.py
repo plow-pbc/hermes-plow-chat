@@ -1205,6 +1205,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                         and all(isinstance(u, str) for u in uids)):
                     self._seen[chat_uid] = dict.fromkeys(uids)
                 else:
+                    # A dropped entry means a chat whose uids were seen once is
+                    # now unrecorded, and replaying it re-answers — so any drop
+                    # puts the whole load back in anchor posture, keeping the
+                    # warning below true. Self-healing: the next dispatch
+                    # rewrites the file without the malformed entry.
+                    self._had_record = False
                     # Two ways in, and naming the container for both reported the
                     # accepted type as the fault ("got list") when the container
                     # was right and an element was not.
