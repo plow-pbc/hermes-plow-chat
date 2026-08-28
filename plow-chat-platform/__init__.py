@@ -449,6 +449,23 @@ class PlowChatAdapter(BasePlatformAdapter):
                     async with http.post(f"{BASE}/v1/ws/ticket",
                                          json={},
                                          headers=self.auth) as resp:
+                        # Status BEFORE parse: a 401 from a proxy or WAF is not
+                        # JSON, and decoding first reports it as a decode error.
+                        #
+                        # 401 ONLY, never 403 — revocation is terminal: every
+                        # later mint fails identically until a human
+                        # re-credentials the agent. Observed on the str agent
+                        # 2026-08-27: one WARNING a minute from a revoked
+                        # token, the line dead, the adapter reporting itself
+                        # connected. A 403 is resource-scoped and keeps the
+                        # warn-and-retry below. (Re-port of the old adapter's
+                        # #17 onto this structure.)
+                        if resp.status == 401:
+                            log.error("[plow_chat] token revoked (ticket mint 401) -- "
+                                      "stopping the listen loop; re-credential this agent")
+                            self._mark_disconnected()
+                            return
+                        resp.raise_for_status()
                         ticket = (await resp.json(content_type=None))["ticket"]
                     # The first connection of this agent's life takes its
                     # baseline here, while nothing is arriving. After this the

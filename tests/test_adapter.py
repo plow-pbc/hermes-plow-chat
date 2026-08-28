@@ -110,6 +110,8 @@ class _Session:
 
     def post(self, url: str, **kw: Any) -> "_Resp":
         self.calls.append("ticket")
+        if getattr(self, "ticket_status", 200) != 200:
+            return _Resp({}, status=self.ticket_status)
         return _Resp({"ticket": "tkt"})
 
     def ws_connect(self, url: str, **kw: Any) -> "_WS":
@@ -880,3 +882,42 @@ async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_pu
 
     await live.disconnect()
     assert module._live is None
+
+
+async def test_a_revoked_token_stops_the_listen_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """401 at the ticket mint is terminal, not a blip. The old adapter learned
+    this in production (one WARNING a minute, line dead, adapter reporting
+    itself connected until a human noticed); the loop must stop and say why,
+    because every retry presents the same revoked credential.
+    """
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    calls: list[str] = []
+    session = _Session(calls=calls)
+    session.ticket_status = 401
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: session)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
+        await adapter._listen()  # returns; raising into the sleep would fail
+    assert "ws_connect" not in calls, calls
+
+
+@pytest.mark.parametrize("status", [502, 403])
+async def test_a_non_401_mint_failure_keeps_retrying(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int
+) -> None:
+    """Only revocation is terminal. A 502 in front of Plow is transient, and a
+    403 is resource-scoped (removed from one chat) -- latching either as fatal
+    is the bug #17's own review caught. Widening the guard past 401 turns the
+    403 row red; removing it turns the revoked-token test red."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    calls: list[str] = []
+    session = _Session(calls=calls)
+    session.ticket_status = status
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: session)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await adapter._listen()
+    assert "ws_connect" not in calls, calls
