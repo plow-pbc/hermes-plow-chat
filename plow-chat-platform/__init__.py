@@ -5,6 +5,7 @@ See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
 import contextvars
+import dataclasses
 import json
 import logging
 import mimetypes
@@ -110,17 +111,40 @@ async def _fetch_attachment(item, content_type):
             async with http.get(BASE + item["url"]) as resp:
                 resp.raise_for_status()
                 data = await resp.read()
+            ext = mimetypes.guess_extension(content_type)
+            if content_type.startswith("image/"):
+                return cache_image_from_bytes(data, ext or ".jpg")
+            if content_type.startswith("audio/"):
+                return cache_audio_from_bytes(data, ext or ".m4a")
+            if content_type.startswith("video/"):
+                return cache_video_from_bytes(data, ext or ".mp4")
+            return cache_document_from_bytes(data, item["filename"] or f"{item['uid']}{ext or ''}")
     except Exception as exc:  # noqa: BLE001 - the turn still reaches hermes, minus the bytes
         log.warning("[plow_chat] attachment %s fetch failed: %s", item["uid"], type(exc).__name__)
         return None
-    ext = mimetypes.guess_extension(content_type)
-    if content_type.startswith("image/"):
-        return cache_image_from_bytes(data, ext or ".jpg")
-    if content_type.startswith("audio/"):
-        return cache_audio_from_bytes(data, ext or ".m4a")
-    if content_type.startswith("video/"):
-        return cache_video_from_bytes(data, ext or ".mp4")
-    return cache_document_from_bytes(data, item["filename"] or f"{item['uid']}{ext or ''}")
+
+
+async def _resolve_parts(msg):
+    """One message as its turn will carry it: media paths, their kinds, and
+    the text -- the body plus a note per part that could not be fetched. A
+    failed part (status "failed", url null) is a documented state, not
+    schema drift; a part whose bytes cannot be fetched now is the same to
+    the model: named in the turn, never dropped with it. Parts fetch
+    concurrently, so a stalled one costs one timeout, not one per part."""
+    parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
+             for item in msg["attachments"]]
+    paths = await asyncio.gather(*(
+        _fetch_attachment(item, kind) if item["url"] else asyncio.sleep(0) for item, kind in parts))
+    media_urls, media_types, notes = [], [], []
+    for (item, kind), path in zip(parts, paths):
+        if path:
+            media_urls.append(path)
+            media_types.append(kind)
+        else:
+            if not item["url"]:
+                log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
+            notes.append(f"[attachment: {kind} {'unavailable' if item['url'] else 'delivery failed'}]")
+    return media_urls, media_types, "\n".join(p for p in (msg["body"].strip(), *notes) if p)
 
 
 def _message_type(media_types):
@@ -186,6 +210,28 @@ GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
 # with the handler. The send hops back to this loop instead.
 _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 
+# One person's rapid-fire messages are one turn. iMessage splits a single
+# intent into a text bubble and a link preview; people send a thought as two
+# lines. Each used to reach hermes as its own turn, the second interrupting
+# the first. 2s is what plow#442 measured for the bubble/preview split. A
+# change of speaker closes the burst, so a group's order is never reshuffled.
+INBOUND_DEBOUNCE_SECONDS = 2.0
+HAND_OFF_RETRY_SECONDS = 5.0
+
+
+def _server_died(task):
+    # A chat's server is held for the adapter's life, so a bug that kills it
+    # would otherwise stall that chat with no signal at all.
+    if not task.cancelled() and task.exception():
+        log.error("[plow_chat] chat server died", exc_info=task.exception())
+
+
+@dataclasses.dataclass
+class _Inbound:
+    uid: str
+    sender: dict
+    resolved: asyncio.Task                   # of _resolve_parts: begun on arrival, awaited by the burst
+
 
 class _PlowAuthError(Exception):
     """The credential itself was refused (401). Terminal: every retry presents
@@ -235,6 +281,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchor_lock = asyncio.Lock()
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
+        self._inbound = {}                   # chat uid -> (queue, the task serving it)
         # One durable owner of recovery state. The file existing means "this
         # agent has taken its baseline"; its CONTENTS mean "and it was this uid",
         # empty meaning the chat was empty at the time. A process-local flag
@@ -399,6 +446,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             _live = None
         if self._ws_task:
             self._ws_task.cancel()
+        for _queue, server in self._inbound.values():
+            server.cancel()                  # what it held unacked, the next backfill replays
+        self._inbound.clear()
         for chat_uid in tuple(self._typing):
             self._cancel_typing(chat_uid)
         self._mark_disconnected()
@@ -737,7 +787,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         del self._seen_events[:-512]
 
     async def _on_message(self, msg, chat_uid):
-        """One inbound message, from the socket or from the backfill."""
+        """One inbound message, from the socket or from the backfill, queued
+        for the chat's server."""
         if msg["direction"] != "inbound":
             return                           # the echo of our own send
         sender = msg["sender"]
@@ -746,44 +797,66 @@ class PlowChatAdapter(BasePlatformAdapter):
             # an outbound agent sender carries a `line` object and NO uid key.
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
-        role = sender["role"]
         uid = msg["uid"]
-        message_key = (chat_uid, uid)
-        if message_key in self._seen:
+        if (chat_uid, uid) in self._seen:
             return                           # socket/backfill overlap - never re-fetch
-        # A failed part is a documented state (status "failed", url null), not
-        # schema drift. A part whose bytes cannot be fetched now is the same to
-        # the model: named in the turn, never dropped with it.
-        media_urls, media_types, notes = [], [], []
-        parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
-                 for item in msg["attachments"]]
-        # Fetched concurrently: this runs inside the frame loop, so a stalled
-        # part must cost the line one timeout, not one per part.
-        paths = await asyncio.gather(*(
-            _fetch_attachment(item, content_type) if item["url"] else asyncio.sleep(0)
-            for item, content_type in parts))
-        for (item, content_type), path in zip(parts, paths):
-            if path:
-                media_urls.append(path)
-                media_types.append(content_type)
-            else:
-                if not item["url"]:
-                    log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
-                notes.append(f"[attachment: {content_type} "
-                             f"{'unavailable' if item['url'] else 'delivery failed'}]")
-        text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
-        if not text and media_urls:
-            text = "(attachment)"
-        if not text:
+        if not msg["body"].strip() and not msg["attachments"]:
             return
+        if chat_uid not in self._inbound:
+            queue = asyncio.Queue()
+            server = asyncio.create_task(self._serve_chat(chat_uid, queue))
+            server.add_done_callback(_server_died)
+            self._inbound[chat_uid] = (queue, server)
+        # The fetch starts now, inside the signed urls' five minutes, whatever
+        # is retrying ahead of this message; the burst awaits it once it closes.
+        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, asyncio.create_task(_resolve_parts(msg))))
+        # Seen at enqueue: queued, in flight or delivered, a second copy is the
+        # same overlap. The durable ack is the checkpoint, written after the
+        # hand-off; a replacement adapter starts with an empty `_seen` and its
+        # backfill replays whatever this one still held.
+        self._seen.append((chat_uid, uid))
+        del self._seen[:-512]
+
+    async def _serve_chat(self, chat_uid, queue):
+        """The one owner of a chat's inbound, for the life of the adapter:
+        groups one speaker's burst, hands it off, retries at the head so
+        nothing later acks past a failure, and acks. Order is the queue's."""
+        carry = None
+        while True:
+            burst = [carry or await queue.get()]
+            carry = None
+            while True:
+                try:
+                    nxt = await asyncio.wait_for(queue.get(), INBOUND_DEBOUNCE_SECONDS)
+                except asyncio.TimeoutError:
+                    break
+                if nxt.sender["uid"] != burst[0].sender["uid"]:
+                    carry = nxt              # another voice: what came before goes first
+                    break
+                burst.append(nxt)
+            resolved = [await m.resolved for m in burst]
+            while True:
+                try:
+                    await self._deliver(burst, resolved, chat_uid)
+                    break
+                except Exception:            # noqa: BLE001 - the retry is the recovery; the chat waits behind it
+                    log.exception("[plow_chat] hand-off failed for %s; retrying", chat_uid)
+                    await asyncio.sleep(HAND_OFF_RETRY_SECONDS)
+            for _ in burst:
+                queue.task_done()
+
+    async def _deliver(self, burst, resolved, chat_uid):
+        sender, role = burst[0].sender, burst[0].sender["role"]
+        media_urls = [url for urls, _kinds, _text in resolved for url in urls]
+        media_types = [kind for _urls, kinds, _text in resolved for kind in kinds]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
-            text=text,
+            text="\n\n".join(text for _urls, _kinds, text in resolved if text) or "(attachment)",
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id=sender["uid"],
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
-            message_id=uid,
+            message_id=burst[-1].uid,
             media_urls=media_urls,
             media_types=media_types,
             message_type=_message_type(media_types),
@@ -796,9 +869,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.
-        self._seen.append(message_key)
-        del self._seen[:-512]
-        self._checkpoint(uid, chat_uid)
+        self._checkpoint(burst[-1].uid, chat_uid)
 
 
 class _PlowSendError(Exception):

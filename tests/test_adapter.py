@@ -110,7 +110,27 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     # regression pin for the fleet's checkpoint home (the old hardcoded
     # /var/lib/hermes made every fleet anchor raise).
     assert module.CHECKPOINT == tmp_path / "plow_chat_last_uid"
+    # Zero window and no retry pause under test: a burst still hands off on the
+    # chat's own task, so a test awaits `_settle` where it needs the turn landed.
+    module.INBOUND_DEBOUNCE_SECONDS = 0
+    module.HAND_OFF_RETRY_SECONDS = 0
     return module
+
+
+def _capture_events(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> list[Any]:
+    """Stand in for hermes: every hand-off lands here."""
+    events: list[Any] = []
+
+    async def capture(event: Any) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+    return events
+
+
+async def _settle(adapter: Any) -> None:
+    """Let every chat's server hand off what it holds."""
+    await asyncio.gather(*(queue.join() for queue, _server in adapter._inbound.values()))
 
 
 class _WS:
@@ -289,12 +309,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=status)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     expected_type = (content_type.split(";")[0].strip() if content_type
                      else "application/octet-stream")
@@ -302,6 +317,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
         "evt_media", "cht_a", "msg_media", body=body,
         attachments=[_attachment(content_type=content_type, url=url)],
     ))
+    await _settle(adapter)
 
     event = handled[0]
     assert event["text"] == expected_text
@@ -326,12 +342,7 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     with caplog.at_level(logging.WARNING):
         await adapter._on_frame(_envelope(
@@ -343,6 +354,7 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
             ],
         ))
 
+    await _settle(adapter)
     event = handled[0]
     assert len(event["media_urls"]) == 1
     assert event["media_types"] == ["image/png"]
@@ -360,19 +372,226 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     attachments = [_attachment()]
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_dup", attachments=attachments))
+    await _settle(adapter)
 
     assert len(handled) == 1
     assert len(http.gets) == 1
+
+
+async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The motivating split: a caption bubble, then the photo, then a second
+    photo. One turn, both files, in arrival order, typed from the whole burst."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled = _capture_events(monkeypatch, adapter)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05   # the fetch yields; a zero window would close on it
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="look at these"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="",
+                                      attachments=[_attachment(uid="att_1")]))
+    await adapter._on_frame(_envelope("evt_3", "cht_a", "msg_3", body="",
+                                      attachments=[_attachment(uid="att_2", filename="two.png")]))
+    await _settle(adapter)
+
+    [event] = handled
+    assert event["text"] == "look at these"
+    assert len(event["media_urls"]) == 2 and event["media_types"] == ["image/png", "image/png"]
+    assert event["message_type"].value == "photo"
+    assert event["message_id"] == "msg_3"
+
+
+async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The preview bubble's bytes can take longer to fetch than the window
+    lasts. It joined the burst the moment it arrived; the fetch is the
+    hand-off's to wait for, not the window's."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    release = asyncio.Event()
+
+    async def slow_fetch(item: Any, kind: str) -> str:
+        await release.wait()
+        return "/cache/preview.png"
+
+    monkeypatch.setattr(module, "_fetch_attachment", slow_fetch)
+    handled = _capture_events(monkeypatch, adapter)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="see this"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="", attachments=[_attachment()]))
+    release.set()
+    await _settle(adapter)
+
+    [event] = handled
+    assert (event["text"], event["media_urls"], event["message_id"]) == ("see this", ["/cache/preview.png"], "msg_2")
+
+
+async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A signed url lives five minutes; a hand-off ahead in the chat can stall
+    longer. The fetch is the message's, begun when it arrives -- not the
+    burst's, begun when the chat gets around to it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    entered, release, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    real_get = http.get
+
+    def get(url: str, **kw: Any) -> Any:
+        fetched.set()
+        return real_get(url, **kw)
+
+    http.get = get  # type: ignore[method-assign]
+    handled: list[str] = []
+
+    async def stalled_first_turn(event: Any) -> None:
+        entered.set()
+        await release.wait()
+        handled.append(event.message_id)
+
+    monkeypatch.setattr(adapter, "handle_message", stalled_first_turn)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await entered.wait()                     # msg_1 is in flight and stuck
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="", attachments=[_attachment()]))
+    await asyncio.wait_for(fetched.wait(), timeout=1)   # while the chat is still stuck on msg_1
+    release.set()
+    await _settle(adapter)
+
+    assert handled == ["msg_1", "msg_2"]
+
+
+@pytest.mark.parametrize(
+    "second_role,turns",
+    [
+        ("owner", [("msg_2", "msg_1\n\nmsg_2")]),
+        ("member", [("msg_1", "msg_1"), ("msg_2", "msg_2")]),
+    ],
+    ids=["same sender -> one turn", "another sender -> its own turn"],
+)
+async def test_a_burst_from_one_sender_is_one_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    second_role: str,
+    turns: list[tuple[str, str]],
+) -> None:
+    """iMessage splits one intent into bubble + link preview; a person sends
+    two lines in a row. Both used to reach hermes as separate turns — the
+    second interrupting the first. Inside the window they are one turn whose
+    ack is the LAST uid, so a restart mid-burst backfills the whole burst."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    handled = _capture_events(monkeypatch, adapter)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role=second_role))
+    await adapter._on_frame(_envelope("evt_2_again", "cht_a", "msg_2", role=second_role))
+    await _settle(adapter)
+
+    assert [(event["message_id"], event["text"]) for event in handled] == turns
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
+    # A late duplicate of a handed-off message is dropped, not a new turn.
+    await adapter._on_frame(_envelope("evt_1_late", "cht_a", "msg_1"))
+    await _settle(adapter)
+    assert len(handled) == len(turns)
+
+
+async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A1, B2, A3 inside one window must reach hermes in that order — never
+    B2 then "A1 A3". A change of speaker hands off what came before, and a
+    slow earlier hand-off still acks before a fast later one."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+
+    async def turn(event: Any) -> None:
+        if event.text == "A1":
+            a1_entered.set()
+            await release_a1.wait()
+        order.append(event.text)
+
+    monkeypatch.setattr(adapter, "handle_message", turn)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="A1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="B2", role="member"))
+    await a1_entered.wait()
+    await adapter._on_frame(_envelope("evt_3", "cht_a", "msg_3", body="A3"))
+    assert order == [], "B2 waits behind A1"
+    release_a1.set()
+    await _settle(adapter)
+
+    assert order == ["A1", "B2", "A3"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_3"
+
+
+async def test_a_backfilled_duplicate_of_an_in_flight_uid_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A socket drop mid-hand-off: the uid is unacked, so the reconnect's
+    backfill pages it again while the first hand-off is still in flight. The
+    chat's server delivers in order, so the duplicate reaches it after the
+    ack and is dropped — hermes never sees the message twice."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    entered, release = asyncio.Event(), asyncio.Event()
+    handled: list[str] = []
+
+    async def slow_turn(event: Any) -> None:
+        entered.set()
+        await release.wait()
+        handled.append(event.message_id)
+
+    monkeypatch.setattr(adapter, "handle_message", slow_turn)
+    frame = _envelope("evt_1", "cht_a", "msg_1")
+    await adapter._on_frame(frame)
+    await entered.wait()                     # the hand-off is in flight, unacked
+    await adapter._backfill(_Session(backfill=[frame["data"]["message"]]), "cht_a")
+    release.set()
+    await _settle(adapter)
+
+    assert handled == ["msg_1"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_1"
+
+
+async def test_a_failed_hand_off_is_retried_at_the_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hand-off that fails is retried where it sits; everything behind it
+    in the chat waits, so nothing ever acks past a message hermes never
+    accepted, and order holds through the retry. Its media was fetched once:
+    a retry must not go back to a signed url that may have expired."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[str] = []
+
+    async def flaky(event: Any) -> None:
+        if not handled:
+            handled.append("boom")
+            raise RuntimeError("hermes hiccup")
+        handled.append(event.text)
+
+    monkeypatch.setattr(adapter, "handle_message", flaky)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", attachments=[_attachment()]))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role="member"))
+    await _settle(adapter)
+
+    assert handled == ["boom", "msg_1", "msg_2"]
+    assert len(http.gets) == 1
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -458,6 +677,7 @@ async def test_busy_queued_member_turn_uses_its_own_tool_gate_state(
     await adapter._on_frame(_envelope("evt_owner", "cht_a", "msg_owner"))
     await asyncio.wait_for(owner_started.wait(), timeout=1)
     await adapter._on_frame(_envelope("evt_member", "cht_a", "msg_member", role="member"))
+    await _settle(adapter)
     queued_kept_owner_typing = adapter._typing["cht_a"] is typing_tasks["msg_owner"]
     release_owner.set()
     await asyncio.wait_for(turns_done.wait(), timeout=1)
@@ -605,19 +825,17 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
 
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
     with caplog.at_level(logging.WARNING):
         await adapter._on_frame(_envelope("evt_a", "cht_a", "msg_a"))
         await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b_owner"))
         await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_duplicate"))
         await adapter._on_frame(_envelope("evt_out", "cht_c", "msg_out"))
         await adapter._on_frame(_envelope("evt_b_member", "cht_b", "msg_b_member", role="member"))
+        await _settle(adapter)
 
+    # Chats hand off independently; only the order WITHIN a chat is a contract.
+    handled.sort(key=lambda event: event["source"]["chat_id"])
     assert [(event["source"]["chat_id"], event["message_id"]) for event in handled] == [
         ("cht_a", "msg_a"),
         ("cht_b", "msg_b_owner"),
@@ -812,7 +1030,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
 
     monkeypatch.setattr(adapter, "handle_message", reply_from_member_turn)
     await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b", role="member"))
+    await _settle(adapter)                   # same sender: settle, or it is one turn
     await adapter._on_frame(_envelope("evt_no_reply", "cht_b", "msg_no_reply", role="member"))
+    await _settle(adapter)
     results["after_turn"] = await adapter.send("cht_a", "allowed after B")
     results["outside_grant"] = await adapter.send("cht_c", "not granted")
 
@@ -1093,8 +1313,15 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     await adapter.connect(is_reconnect=True)
     assert module._live is not None and module._live[0] is adapter
     await adapter._ws_task
+    # A retired adapter must not keep serving a chat: its replacement's
+    # backfill replays what this one still held, and two servers on one
+    # chat would hand off twice and race the checkpoint.
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    _queue, server = adapter._inbound["cht_a"]
     await adapter.disconnect()
     assert module._live is None
+    assert server.cancelled() or server.cancelling()
+    assert not adapter._inbound
 
 
 async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoption(
