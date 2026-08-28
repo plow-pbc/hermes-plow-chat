@@ -66,6 +66,23 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _agent_name(chat):
+    """The line's persona name ("Elm"), or None for an unnamed line.
+
+    Read from the chat's own agent participant, so the DB stays the single
+    identity source and a rename needs no reprovision — it lands at the next
+    reach refresh (reconnect or group-send adoption), which is deliberate: a
+    rename is a rare coordinated ops event (it ships a new vCard too), not
+    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
+    of the listing readers: a pre-persona server omits `line`, and an unnamed
+    line omits `display_name`.
+    """
+    for participant in chat.get("participants") or []:
+        if participant.get("type") == "agent":
+            return (participant.get("line") or {}).get("display_name") or None
+    return None
+
+
 def _write_channel_aliases(names):
     """Publish our names into the image's own friendly-name registry.
 
@@ -202,6 +219,19 @@ EXTERNAL_CHANNEL_PROMPT = (
 # exactly the turns most likely to request private material (the same bug this
 # rule's first port fixed, resurfacing at the prompt-selection seam).
 GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
+
+
+def _with_identity(prompt, name):
+    """Prefix the turn prompt with who this agent is, when its line is named.
+
+    "hey Elm" in a group only reads as addressed if the model knows it IS Elm.
+    The name is ops-seeded on the line (not provider- or member-supplied text),
+    so carrying it in the prompt is not the injection seam a sender name would
+    be. Unnamed lines keep the exact prompts they have today.
+    """
+    if name is None:
+        return prompt
+    return f"You are {name}, a Plow assistant; people here address you by that name. {prompt}"
 
 # The connected adapter and the loop its listener task runs on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
@@ -645,7 +675,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         member_count = sum(participant.get("type") == "member" for participant in chat["participants"])
         chat_type = "group" if member_count > 1 else "dm"
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
-        return {"name": name, "type": chat_type, "chat_id": chat_id}
+        return {"name": name, "type": chat_type, "chat_id": chat_id,
+                "agent_name": _agent_name(chat)}
 
     async def _ensure_anchor(self, http, chat_uid):
         """Anchor once, no matter who asks or how concurrently.
@@ -888,10 +919,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             message_type=_message_type(media_types),
-            channel_prompt=(
+            channel_prompt=_with_identity(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
-                else OWNER_CHANNEL_PROMPT
+                else OWNER_CHANNEL_PROMPT,
+                chat["agent_name"],
             ),
         ))
         # Ack AFTER the handoff, never before: a checkpoint advanced first

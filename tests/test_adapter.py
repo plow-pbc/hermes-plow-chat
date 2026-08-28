@@ -198,9 +198,11 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
-def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str, Any]:
+def _chat(uid: str, *, name: str | None = None, group: bool = False,
+          agent_name: str | None = None) -> dict[str, Any]:
     participants = [
-        {"type": "agent"},
+        {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
+        if agent_name else {"type": "agent"},
         {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner"},
     ]
     if group:
@@ -793,6 +795,41 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_a"
     assert (tmp_path / "plow_chat_last_uid.cht_b").read_text() == "msg_b_member"
     assert "outside the grant" in caplog.text
+
+
+@pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
+@pytest.mark.parametrize(
+    ("group", "role", "base"),
+    [
+        pytest.param(False, "owner", "OWNER_CHANNEL_PROMPT", id="dm_owner"),
+        pytest.param(True, "owner", "GROUP_OWNER_CHANNEL_PROMPT", id="group_owner"),
+        pytest.param(True, "member", "EXTERNAL_CHANNEL_PROMPT", id="group_member"),
+    ],
+)
+async def test_named_line_identity_prefixes_every_turn_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    agent_name: str | None,
+    group: bool,
+    role: str,
+    base: str,
+) -> None:
+    """A named line tells the model who it is on every turn — "hey Elm" in a
+    group only reads as addressed if the agent knows it IS Elm. An unnamed
+    line keeps today's prompts exactly."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=group, agent_name=agent_name)])
+
+    handled = _capture_events(monkeypatch, adapter)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", role=role))
+    await _settle(adapter)
+
+    (event,) = handled
+    expected = getattr(module, base)
+    if agent_name:
+        expected = f"You are {agent_name}, a Plow assistant; people here address you by that name. {expected}"
+    assert event["channel_prompt"] == expected
 
 
 class _HTTP:
