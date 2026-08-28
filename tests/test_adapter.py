@@ -230,6 +230,23 @@ async def test_inbound_media_reaches_hermes(
     assert handled[0]["text"] == expected_text
 
 
+async def test_inbound_media_schema_drift_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The API always sends `attachments` (a list, items with content_type and
+    url); a frame without it is schema drift and must raise, not silently drop
+    media."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    monkeypatch.setattr(adapter, "handle_message", mock.AsyncMock())
+
+    envelope = _envelope("evt_drift", "cht_a", "msg_drift", body="hello")
+    del envelope["data"]["message"]["attachments"]
+
+    with pytest.raises(KeyError):
+        await adapter._on_frame(envelope)
+
+
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     hooks: dict[str, Any] = {}
