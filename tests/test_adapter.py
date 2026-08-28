@@ -289,6 +289,19 @@ def test_groups_parses_uid_equals_name(monkeypatch):
         ("cht_home=Owners", "must be a group cht_ ID"),
         ("cht_a=Owners,cht_a=Other", "repeats chat id"),
         ("cht_a=Owners,cht_b=Owners", "repeats display name"),
+        # Both tiers _resolve_chat_names pins: a configured label may not collide
+        # with another one only by case, nor with the home chat's own name.
+        ("cht_a=Owners,cht_b=owners", "repeats display name"),
+        ("cht_a=Plow Chat", "reserved for the home chat"),
+        ("cht_a=plow chat", "reserved for the home chat"),
+        # A configured label is published unsuffixed, so it is the only name that
+        # could still equal a derived one — a bare uid, or the `(cht_…)` form.
+        ("cht_a=cht_x", "looks like a chat id"),
+        ("cht_a=Cleaning (cht_x)", "looks like a chat id"),
+        # Folded before matching, like every other pinned-tier rule here — the
+        # resolver compares case-insensitively, so a case variant is the same paste.
+        ("cht_a=CHT_X", "looks like a chat id"),
+        ("cht_a=Cleaning (CHT_X)", "looks like a chat id"),
     ],
 )
 def test_groups_rejects_malformed_entries(monkeypatch, value, message):
@@ -1795,3 +1808,210 @@ def test_the_backstop_count_reports_only_what_it_replayed(monkeypatch, caplog):
 
     assert [e.text for e in a.handled] == ["body_3", "body_1"]
     assert "replaying 2 and not looking further back" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Naming a thread from what Plow already tells us
+# ---------------------------------------------------------------------------
+
+
+def _titled(uid, display_name=None):
+    """A chat as `GET /v1/chats` serves it. `display_name` is omitted when None,
+    which is how the API reports a thread nobody has titled."""
+    chat = {"uid": uid, "participants": [{"type": "agent", "line": {"uid": "line_1"}},
+                                         {"type": "member", "provider_key": "+1", "role": "owner"}]}
+    if display_name is not None:
+        chat["display_name"] = display_name
+    return chat
+
+
+@pytest.mark.parametrize("chat,groups,expected", [
+    # The operator's own label outranks anything the thread says about itself,
+    # and is the one name published without a uid.
+    (_titled("cht_a", display_name="Renamed By Someone"),
+     {"cht_a": {"name": "Owners", "prompt": None}}, "Owners"),
+    # Plow's own answer -- the iMessage thread title -- always uid-suffixed.
+    (_titled("cht_x", display_name="Snoqualmie Cabin Cleaning Thread"),
+     {}, "Snoqualmie Cabin Cleaning Thread (cht_x)"),
+    # Sparse: absent, empty, and whitespace all mean "nobody titled it".
+    (_titled("cht_x"), {}, "cht_x"),
+    (_titled("cht_x", display_name=""), {}, "cht_x"),
+    (_titled("cht_x", display_name="   "), {}, "cht_x"),
+])
+def test_a_chat_is_named_from_the_best_source_available(chat, groups, expected):
+    # The home chat is always seeded too, so this asks about the chat under test.
+    names = adapter_mod._resolve_chat_names([chat], groups, "cht_home")
+    assert names[chat["uid"]] == expected
+
+
+def test_the_home_chat_keeps_its_name():
+    """The published registry has to agree with _label, or the overlay renames the
+    operator's own DM to its uid."""
+    names = adapter_mod._resolve_chat_names([_titled("cht_home")], {}, "cht_home")
+    assert names["cht_home"] == "Plow Chat"
+
+
+def test_a_title_can_never_take_another_room_s_name():
+    """An iMessage title is chosen by whoever is in the thread, and the image's
+    resolver takes the first exact match. The uid suffix is what makes a title
+    incapable of equalling another room's name -- including on a first poll,
+    where nothing records who held the name first."""
+    chats = [
+        _titled("cht_owners"),
+        _titled("cht_impostor", display_name="STR Owners"),
+        _titled("cht_home_impostor", display_name="Plow Chat"),
+    ]
+    groups = {"cht_owners": {"name": "STR Owners", "prompt": None}}
+
+    names = adapter_mod._resolve_chat_names(chats, groups, "cht_home")
+
+    assert names["cht_owners"] == "STR Owners", "a configured label is never modified"
+    assert names["cht_home"] == "Plow Chat"
+    assert names["cht_impostor"] == "STR Owners (cht_impostor)"
+    assert names["cht_home_impostor"] == "Plow Chat (cht_home_impostor)"
+
+
+def test_naming_depends_on_nothing_but_the_listing():
+    """No ordering, history, or reconnect state — so a reconnect, a reordered
+    listing, and a first poll all produce the same names."""
+    chats = [_titled("cht_b", display_name="Cleaning"), _titled("cht_a", display_name="Cleaning")]
+    first = adapter_mod._resolve_chat_names(chats, {}, "cht_home")
+    second = adapter_mod._resolve_chat_names(list(reversed(chats)), {}, "cht_home")
+    assert first == second
+    assert first["cht_a"] != first["cht_b"]
+
+
+def test_a_name_never_widens_authority(monkeypatch):
+    """The security invariant this whole change rests on. Provider-supplied text
+    decides what a room is CALLED and nothing else; tool access stays configured
+    or operator-vouched."""
+    a = _adapter(monkeypatch, groups="cht_real=STR Owners")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [
+            _chat("cht_home", "line_1", ["+1"]),
+            _chat("cht_real", "line_1", ["+1"]),
+            {**_chat("cht_fake", "line_1", ["+9"]), "display_name": "STR Owners"},
+        ],
+        "/v1/chats/cht_fake/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+
+    assert a._may_approve("cht_real") is True
+    assert a._may_approve("cht_fake") is False, \
+        "naming itself after a configured group must not authorize its members"
+
+
+def test_a_name_carries_no_participant_identifiers():
+    """The channel directory is listable by any member holding tool authority, so a
+    participant-derived name publishes one room's handles to another room's
+    members. A thread nobody titled is its uid instead."""
+    chat = {"uid": "cht_x", "participants": [
+        {"type": "agent", "line": {"uid": "line_1"}},
+        {"type": "member", "provider_key": "+15550001111", "role": "owner", "display_name": "Sam"},
+        {"type": "member", "provider_key": "+15550002222", "role": "member", "display_name": "Gianna"},
+    ]}
+    assert adapter_mod._resolve_chat_names([chat], {}, "cht_home")["cht_x"] == "cht_x"
+
+
+def _stub_hermes_home(monkeypatch, tmp_path):
+    """Stand in for the image's own home resolver, which the suite does not install."""
+    cfg = types.ModuleType("hermes_cli.config")
+    cfg.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
+    return tmp_path / "channel_aliases.json"
+
+
+@pytest.mark.parametrize("existing,expected", [
+    # Absent: the first poll on a fresh home writes the whole file.
+    (None, {"plow_chat": {"cht_a": "Cleaning"}}),
+    # Shared with every other platform on the gateway: we own exactly one key,
+    # and our own block is replaced rather than merged, so a departed chat's
+    # name does not outlive it.
+    ({"slack": {"C123": "engineering"}, "plow_chat": {"cht_old": "Stale"}},
+     {"slack": {"C123": "engineering"}, "plow_chat": {"cht_a": "Cleaning"}}),
+])
+def test_publishing_names_owns_one_key_and_leaves_the_rest(monkeypatch, tmp_path,
+                                                           existing, expected):
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    if existing is not None:
+        path.write_text(json.dumps(existing))
+
+    adapter_mod._write_channel_aliases({"cht_a": "Cleaning"})
+
+    assert json.loads(path.read_text()) == expected
+
+
+def test_a_corrupt_alias_file_is_not_clobbered(monkeypatch, tmp_path):
+    """Refusing to write is the safe direction: the operator's file survives, and the
+    reconcile loop logs the failure every pass until it is fixed."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    path.write_text("{not json")
+    with pytest.raises(ValueError):  # json.JSONDecodeError; NOT a missing-attribute pass
+        adapter_mod._write_channel_aliases({"cht_a": "Cleaning"})
+    assert path.read_text() == "{not json"
+
+
+def test_reconcile_publishes_the_names_it_resolved(monkeypatch, tmp_path):
+    """End to end: the poll learns a title and the registry the image reads carries it."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    a = _adapter(monkeypatch, groups=None)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [
+            _chat("cht_home", "line_1", ["+1"]),
+            {**_chat("cht_clean", "line_1", ["+1"]),
+             "display_name": "Snoqualmie Cabin Cleaning Thread"},
+        ],
+        "/v1/chats/cht_clean/messages": [],
+    })
+    asyncio.run(a._reconcile_once())
+
+    expected = "Snoqualmie Cabin Cleaning Thread (cht_clean)"
+    assert a._label("cht_clean") == (expected, "group")
+    assert json.loads(path.read_text())["plow_chat"]["cht_clean"] == expected
+
+
+def test_a_configured_group_off_this_line_is_never_published(monkeypatch, tmp_path):
+    """send() refuses a destination outside reach, so publishing a group the poll
+    has not seen on this line advertises a name that cannot be selected — and lets
+    it reserve one a reachable room needs."""
+    path = _stub_hermes_home(monkeypatch, tmp_path)
+    a = _adapter(monkeypatch, groups="cht_elsewhere=Owners")
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]),
+                      _chat("cht_elsewhere", "line_9", ["+1"])],
+    })
+    asyncio.run(a._reconcile_once())
+
+    assert "cht_elsewhere" not in a.chat_uids, "it is on a sibling agent's line"
+    assert "cht_elsewhere" not in json.loads(path.read_text())["plow_chat"]
+
+
+def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
+    """Naming is cosmetic; reach is the phone line. A registry write that fails must
+    not cost the agent a subscription, nor make start_group_thread misreport
+    adoption."""
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    broken = types.ModuleType("hermes_cli.config")
+
+    def _boom():
+        raise RuntimeError("no home")
+
+    broken.get_hermes_home = _boom
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", broken)
+
+    a = _adapter(monkeypatch, groups=None)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a._http_session = PagingSession({
+        "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],
+        "/v1/chats/cht_room/messages": [],
+    })
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._reconcile_once())
+
+    assert "cht_room" in a.chat_uids, "reach survives a naming failure"
+    assert "could not publish" in caplog.text, "and the failure is still reported"

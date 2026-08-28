@@ -32,6 +32,11 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 DEFAULT_BASE_URL = "https://api.plow.co"
 MAX_MESSAGE_LENGTH = 4_000
 DEFAULT_WELCOME_MESSAGE = "Hi — Plow Chat is connected to Hermes now. Reply here to start chatting."
+# The tail of a derived name, `<title> (<cht_ id>)`. Matched against operator
+# labels so the one tier published unsuffixed cannot imitate one.
+_DERIVED_NAME_SHAPE = re.compile(r"\(cht_[^)]*\)$")
+# The home chat's label, in the registry and in _label and in the enablement seed.
+HOME_CHAT_NAME = "Plow Chat"
 
 
 def _base_url_from_env_or_config(config) -> str:
@@ -204,13 +209,37 @@ def _groups(extra: dict, home_chat_uid: str) -> dict[str, dict]:
 
     prompts = (extra or {}).get("group_prompts") or {}
     named = {group["name"]: group for group in groups.values()}
+    # Compared case-insensitively, because that is how the resolver these names
+    # are handed to compares them: an exact-string check passed "Owners,owners"
+    # and published two rooms under one resolver-visible name.
+    folded = [group["name"].casefold() for group in groups.values()]
     # Two groups sharing a name defeats the point: the agent cannot tell them
     # apart, a send cannot resolve one, and a prompt keyed by that name would
     # silently reach only whichever was listed last.
-    if len(named) != len(groups):
+    if len(set(folded)) != len(groups):
         names = [group["name"] for group in groups.values()]
-        repeated = sorted({name for name in names if names.count(name) > 1})
+        repeated = sorted({name for name in names if folded.count(name.casefold()) > 1})
         raise ValueError(f"PLOW_CHAT_GROUP_UIDS repeats display name(s) {repeated}")
+    # Configured labels and the home chat are both pinned in _resolve_chat_names,
+    # and a pinned name is assigned unmodified -- which is only safe while no two
+    # of them can collide. This is the half that check cannot do for itself.
+    reserved = sorted(group["name"] for group in groups.values()
+                      if group["name"].casefold() == HOME_CHAT_NAME.casefold())
+    if reserved:
+        raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {reserved[0]!r} is "
+                         f"reserved for the home chat")
+    # A configured label is the only name published without its uid, so it is the
+    # only one that could still equal a derived one. Derived names are a bare uid
+    # or `<title> (<cht_ id>)`; refusing those two shapes here is what makes the
+    # uniqueness claim total instead of "between titles". Caught at config time,
+    # beside the other pinned-tier rules, where the operator is looking at what
+    # they typed.
+    shaped = sorted(group["name"] for group in groups.values()
+                    if (folded_name := group["name"].casefold()).startswith("cht_")
+                    or _DERIVED_NAME_SHAPE.search(folded_name))
+    if shaped:
+        raise ValueError(f"PLOW_CHAT_GROUP_UIDS display name {shaped[0]!r} looks like a chat "
+                         f"id or an auto-generated name; pick a name a person would type")
     # Warned rather than raised: config carries the prompts while the labels live
     # in the untracked dotenv, so an orphan is the *normal* state on a fresh
     # restore. Raising would brick the gateway in the recovery path config exists
@@ -338,6 +367,76 @@ def _agent_line(chat: dict) -> str | None:
     return None
 
 
+def _resolve_chat_names(chats: list[dict], groups: dict[str, dict], home_uid: str) -> dict[str, str]:
+    """uid -> display name.
+
+    The operator's own labels and the home chat keep their exact names. Every
+    other chat is named from its `display_name` -- Plow's own answer, which is
+    the iMessage thread title -- and is *always* published with its uid appended.
+
+    That suffix is what makes this safe rather than tidy, and it is why there is
+    no collision machinery here to read. A thread's title is chosen by whoever
+    is in it, so an unsuffixed one is a name an outsider can pick; on a first
+    poll nothing records who held it first, and the image resolves the first
+    match. Appending the uid makes every unconfigured name unique by
+    construction, so no title can equal another room's name, and no ordering,
+    history, or across-reconnect state has to be kept to hold that true. The
+    configured labels -- the one tier published unsuffixed -- are held to the
+    same uniqueness by `_groups`, which refuses a label shaped like either.
+
+    It stays addressable, because the image's resolver falls back to an
+    unambiguous prefix match: `plow_chat:#Snoqualmie Cabin Cleaning` still
+    reaches `Snoqualmie Cabin Cleaning (cht_...)`, while an exact configured
+    name still wins outright ahead of it.
+
+    A thread with no title is its uid, which is what every adopted thread was
+    before this existed. Participant-derived names are deliberately absent: the
+    directory is listable by any member holding tool authority, so a name built
+    from participants publishes one room's handles to another room's members.
+    """
+    names = {home_uid: HOME_CHAT_NAME}
+    for uid, group in groups.items():
+        names[uid] = group["name"]
+    for chat in chats:
+        uid = chat["uid"]
+        if uid in names:
+            continue
+        title = (chat.get("display_name") or "").strip()
+        names[uid] = f"{title} ({uid})" if title else uid
+    return names
+
+
+def _write_channel_aliases(names: dict[str, str]) -> None:
+    """Publish our names into the image's own friendly-name registry.
+
+    Not a registry of our own: the image re-applies this overlay on every
+    directory build *and* every load, and injects an entry for an id that has
+    produced no traffic yet -- which is what makes a thread addressable by name
+    before it has ever spoken. `send_message` resolves `#name` against the
+    result, and `action="list"` reads it, so writing here is the whole feature.
+
+    The file is shared with every other platform on the gateway, so we replace
+    our own key and leave the rest of it exactly as we found it. A file we
+    cannot parse is left alone rather than overwritten -- the caller logs it
+    every pass until someone fixes it.
+    """
+    from hermes_cli.config import get_hermes_home
+
+    path = get_hermes_home() / "channel_aliases.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    data["plow_chat"] = names
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
 class PlowChatAdapter(BasePlatformAdapter):
     """Plow Chat <-> Hermes gateway adapter."""
 
@@ -371,6 +470,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # None and reports nothing.
         self.operator_key: Optional[str] = None
         self._operator_resolved = False
+        # Poll-established, like operator_key: what each reachable chat is called,
+        # rebuilt wholesale every pass. Empty until the first one, which is why
+        # _label still carries the answers a not-yet-polled process needs.
+        self.chat_names: dict[str, str] = {}
         self._http_session = None
         self._ws_tasks: dict[str, asyncio.Task] = {}
         self._reconcile_task: Optional[asyncio.Task] = None
@@ -598,11 +701,21 @@ class PlowChatAdapter(BasePlatformAdapter):
         return None
 
     def _label(self, chat_id: str) -> tuple[str, str]:
-        """(display name, chat type) — the one answer both callers get."""
+        """(display name, chat type) — the one answer both callers get.
+
+        The poll's names come first: they already fold in the configured labels
+        and the home chat, and they are the only place a thread's own title is
+        known. The two fallbacks below are what a process that has not polled
+        yet still has to answer with — a dispatch can beat the reconciler.
+        """
+        chat_type = "dm" if chat_id == self.chat_uid else "group"
+        name = self.chat_names.get(chat_id)
+        if name:
+            return name, chat_type
         group = self.groups.get(chat_id)
         if group:
             return group["name"], "group"
-        return ("Plow Chat", "dm") if chat_id == self.chat_uid else (chat_id, "group")
+        return (HOME_CHAT_NAME, "dm") if chat_id == self.chat_uid else (chat_id, "group")
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         name, chat_type = self._label(chat_id)
@@ -642,6 +755,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.operator_key = None
         self._operator_resolved = False
         self.operator_vouched.clear()
+        self.chat_names = {}
         await self._set_reach({self.chat_uid})
 
     async def _set_reach(self, wanted: "frozenset[str] | set[str]") -> None:
@@ -673,9 +787,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 logger.info("[plow_chat] joined configured group %s (%s), members authorized",
                             added, group["name"])
             else:
+                # Not "to name it": a titled chat is already named from its own
+                # display_name by the time an operator reads this, so sending them
+                # to the dotenv would ask for the edit and restart this feature
+                # exists to remove. What the entry still buys is an exact name in
+                # place of the derived one, and authority for its members.
                 logger.info(
                     "[plow_chat] adopted %s; add '%s=<display name>' to "
-                    "PLOW_CHAT_GROUP_UIDS to name it and authorize its members",
+                    "PLOW_CHAT_GROUP_UIDS to override its name and authorize its members",
                     added, added)
         self.chat_uids = wanted
 
@@ -807,6 +926,23 @@ class PlowChatAdapter(BasePlatformAdapter):
             if stranded:
                 logger.warning("[plow_chat] configured group(s) not on this agent's line, "
                                "so not joined: %s", stranded)
+
+            # Last, and isolated. Naming is cosmetic where reach is the phone
+            # line, so a registry that cannot be written must not cost a
+            # subscription — nor make start_group_thread, which calls this and
+            # reads chat_uids for its `adoption` field, report a failure that
+            # did not happen.
+            # Reach-filtered: send() refuses a destination outside chat_uids, so
+            # publishing a configured group the poll has not seen on this line
+            # advertises a name that cannot be selected -- and lets it reserve
+            # one that a reachable room needs.
+            reachable = {uid: group for uid, group in self.groups.items()
+                         if uid in self.chat_uids}
+            self.chat_names = _resolve_chat_names(mine, reachable, self.chat_uid)
+            try:
+                _write_channel_aliases(self.chat_names)
+            except Exception as exc:
+                logger.warning("[plow_chat] could not publish channel aliases: %s", exc)
 
     async def _reconcile(self) -> None:
         """Adopt the chats nobody configured — polled, because nothing pushes them.
@@ -1455,7 +1591,7 @@ def _env_enablement() -> dict | None:
         "chat_uid": chat_uid,
     }
     home = os.getenv("PLOW_CHAT_HOME_CHANNEL", "").strip() or chat_uid
-    seed["home_channel"] = {"chat_id": home, "name": "Plow Chat"}
+    seed["home_channel"] = {"chat_id": home, "name": HOME_CHAT_NAME}
     return seed
 
 

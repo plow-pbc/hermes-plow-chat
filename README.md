@@ -55,7 +55,7 @@ URL in git.
 | `PLOW_CHAT_TOKEN` | yes | the session bearer token activation mints |
 | `PLOW_CHAT_CHAT_UID` | yes | the chat this agent serves, `cht_…` |
 | `PLOW_CHAT_BASE_URL` | no | API base, default `https://api.plow.co` |
-| `PLOW_CHAT_GROUP_UIDS` | no | group chats to join, `<cht_id>=<display name>`, comma-separated |
+| `PLOW_CHAT_GROUP_UIDS` | no | grants standing tool authority, and overrides the name, for `<cht_id>=<display name>`, comma-separated |
 | `PLOW_CHAT_HOME_CHANNEL` | no | delivery target for cron, defaults to `PLOW_CHAT_CHAT_UID` |
 | `PLOW_CHAT_WELCOME_MESSAGE` / `PLOW_CHAT_AUTO_WELCOME` | no | one-time message on `chat_active` |
 | `PLOW_CHAT_AUTO_APPROVE_PAIRING` | no | best-effort approval of verified Plow members |
@@ -69,6 +69,42 @@ the Hermes image does, and the adapter refuses to construct without it:
 |---|---|---|
 | `HERMES_HOME` | the image (`/opt/data`) | state root. The adapter keeps `plow-chat-seen.json` there — the message uids it has dispatched per chat, which is what a reconnect asks before replaying. Resolved once at construction and fatal if unset, rather than defaulted to the working directory: a record read from the wrong root reads as a clean start, and a clean start replays nothing. |
 
+### What a group thread is called
+
+Nothing has to be configured for a thread to have a name. Every 60s poll reads
+`GET /v1/chats` and names each reachable chat:
+
+1. its `PLOW_CHAT_GROUP_UIDS` entry, when the operator set one — published
+   exactly as written, and the only name without a uid in it;
+2. otherwise the chat's own `display_name` — the iMessage thread title — always
+   published as `<title> (<cht_ id>)`;
+3. and a thread nobody has titled is its `cht_` id, as before.
+
+The result is published into the image's own `~/.hermes/channel_aliases.json`
+overlay, which is re-applied on every channel-directory build and every load and
+carries ids that have produced no traffic yet. So a thread is addressable — and
+visible to `send_message action="list"` — from the first poll after it is
+created, without a restart and without a dotenv edit. The uid suffix does not
+get in the way of addressing it: the image's resolver falls back to an
+unambiguous prefix match, so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
+`Snoqualmie Cabin Cleaning (cht_…)`. **That file's `plow_chat` block is written
+by this adapter**: to change a name, retitle the thread in iMessage or list it
+in `PLOW_CHAT_GROUP_UIDS`, rather than hand-editing the block.
+
+Two properties make provider-supplied text safe to consume here, and both are
+asserted in the suite. A name **grants nothing** — tool authority stays
+configured-in-dotenv or earned by the operator speaking in the thread. And
+because an iMessage title is chosen by whoever is in the thread while the
+image's resolver takes the first exact match, the uid suffix makes every
+unconfigured name unique *by construction* — no title can equal another room's
+name, so there is no ordering or history to keep in order to hold that true.
+
+A name is deliberately **never derived from the participants**. The channel
+directory is listable by any member holding tool authority, so a name built from
+who is in a room would publish that room's names and handles to the members of
+every other room. An untitled thread shows as its id instead; titling it in
+iMessage is the fix, and it takes effect on the next poll.
+
 ## There is a second implementation, and it is not this one
 
 `plow-pbc/plow`'s `cloud-agents/hermes/plugins/plow_chat/` registers the **same
@@ -81,13 +117,13 @@ different env contract and a different feature set:
 | token / chat env | `PLOW_CHAT_TOKEN` / `PLOW_CHAT_CHAT_UID` | `PLOW_AGENT_TOKEN` / `PLOW_HOME_CHANNEL` |
 | base env | `PLOW_CHAT_BASE_URL` | `PLOW_API_BASE`, **without** `/v1` |
 | group chats | yes | none |
-| persisted checkpoint, history backfill | **none** | yes |
+| persisted checkpoint, history backfill | yes | yes |
 
 So `plugins.enabled: [plow-chat-platform]` means different things depending on
 which side installed it. **Convergence is the goal; this repo is not there yet.**
-Tracked in [`#2`](https://github.com/plow-pbc/hermes-plow-chat/issues/2) (this
-adapter drops inbound turns across a socket gap — the tenant's
-`_anchor`/`_backfill` is the solved prior art) and
+The gap half closed: this adapter's seen-record + backfill (issue
+[`#2`](https://github.com/plow-pbc/hermes-plow-chat/issues/2)) is the port of
+the tenant's `_anchor`/`_backfill` prior art. Full unification is
 [`plow-pbc/plow#1394`](https://github.com/plow-pbc/plow/issues/1394). The first
 was `plow-pbc/seed-hermes-plow#15`; it moved here because an archived repo's
 issues are read-only.
