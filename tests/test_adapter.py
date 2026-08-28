@@ -1471,3 +1471,104 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 
     assert "cht_room" in a.chat_uids, "reach survives a naming failure"
     assert "could not publish" in caplog.text, "and the failure is still reported"
+
+
+# ---------------------------------------------------------------------------
+# A revoked token is terminal, not transient
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    """Minimal aiohttp-response stand-in for _body."""
+
+    def __init__(self, status, text):
+        self.status = status
+        self._text = text
+
+    async def text(self):
+        return self._text
+
+    async def json(self, content_type=None):
+        return json.loads(self._text)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_status_raises_a_typed_error(status):
+    """The status has to survive as data. _body puts it in a message string, and
+    a poll cannot tell 'credential revoked' from 'gateway hiccup' by parsing prose."""
+    with pytest.raises(adapter_mod._PlowAuthError) as exc:
+        asyncio.run(adapter_mod._body(_Resp(status, '{"detail":"Invalid or revoked token"}')))
+    assert exc.value.status == status
+
+
+@pytest.mark.parametrize("status", [429, 500])
+def test_a_non_auth_status_stays_a_plain_error(status):
+    """Everything else keeps its existing shape — a 502 in front of Plow really is
+    transient, and must keep the retry the reconcile loop gives it."""
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(adapter_mod._body(_Resp(status, "upstream boom")))
+    assert not isinstance(exc.value, adapter_mod._PlowAuthError)
+
+
+def test_a_revoked_token_is_reported_once_and_stops_the_poll(monkeypatch, caplog):
+    """The defect this fixes: a revoked credential logged a warning every 60s
+    forever and nothing else, so the agent went deaf silently. It must escalate
+    through the channel a human sees, and stop retrying what cannot succeed."""
+    a = _adapter(monkeypatch, groups=None)
+
+    async def _revoked():
+        raise adapter_mod._PlowAuthError(401, '{"detail":"Invalid or revoked token"}')
+
+    a._reconcile_once = _revoked
+    slept = []
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep",
+                        lambda d: slept.append(d) or asyncio.sleep(0))
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(a._reconcile())
+
+    assert a.fatal_error[0][0] == "token_revoked", "must be reported as fatal, not warned"
+    assert a.fatal_error[1]["retryable"] is False
+    assert a.fatal_notified is True, "and surfaced, not just recorded"
+    assert a.is_connected is False
+    assert slept == [], "no retry cadence — the same token fails identically forever"
+    assert "revoked" in caplog.text
+
+
+def test_a_transient_failure_still_retries(monkeypatch, caplog):
+    """The guard on over-correcting: a 502 or a dropped connection must keep the
+    warn-and-retry behaviour, because that one does recover."""
+    a = _adapter(monkeypatch, groups=None)
+    calls = []
+
+    async def _flaky():
+        calls.append(1)
+        raise RuntimeError("Plow 502: upstream")
+
+    a._reconcile_once = _flaky
+
+    async def _sleep_once(_delay):
+        a._stop_event.set()
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep_once)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._reconcile())
+
+    assert getattr(a, "fatal_error", None) is None, "a transient error is not fatal"
+    assert calls == [1]
+    assert "chat reconcile failed" in caplog.text
+
+
+def test_the_fatal_report_is_not_repeated_by_a_second_loop(monkeypatch):
+    """Every socket sees the same 401, and N notifications for one dead credential
+    is the noise that makes the real signal unreadable."""
+    a = _adapter(monkeypatch, groups=None)
+    notifications = []
+    a._notify_fatal_error = lambda: notifications.append(1) or asyncio.sleep(0)
+
+    exc = adapter_mod._PlowAuthError(401, "revoked")
+    asyncio.run(a._fail_auth(exc))
+    asyncio.run(a._fail_auth(exc))
+
+    assert notifications == [1], "reported once, however many loops discover it"
