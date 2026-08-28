@@ -566,7 +566,10 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
 
     class _YieldingResp(_Resp):
         async def __aenter__(self) -> "_Resp":
-            await asyncio.sleep(0)           # hand control to the racing task
+            # A reach rebuild lands mid-anchor, then control passes to the
+            # racing discoverer -- the two interleavings the lock must absorb.
+            adapter._set_reach([_chat("cht_a")])
+            await asyncio.sleep(0)
             return self
 
     class _HTTPStub:
@@ -583,19 +586,11 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     http = _HTTPStub()
 
     async def discover() -> None:
-        if not adapter._anchored_chats.get("cht_a"):
-            await adapter._anchor(http, "cht_a")
+        await adapter._ensure_anchor(http, "cht_a")
 
     await asyncio.gather(discover(), discover())
     assert sends == ["cht_a"], "concurrent discovery double-sent the disclosure wave"
     assert adapter._load_checkpoint("cht_a") == "msg_1"
-
-    # And a reach rebuild racing an in-flight claim keeps it: with the claim
-    # set but no checkpoint on disk yet, _set_reach must not un-claim.
-    adapter._checkpoint_path("cht_a").unlink()
-    adapter._anchored_chats["cht_a"] = True
-    adapter._set_reach([_chat("cht_a")])
-    assert adapter._anchored_chats["cht_a"] is True, "a reach rebuild un-claimed an anchor in flight"
 
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(

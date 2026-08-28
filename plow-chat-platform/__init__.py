@@ -124,6 +124,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             }
         }
         self._ws_task = None
+        self._anchor_lock = asyncio.Lock()
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
         # One durable owner of recovery state. The file existing means "this
@@ -201,13 +202,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.home_chat_uid = next_home
         self._chats = next_chats
         self.chat_uids = frozenset(next_chats)
-        # OR with the in-memory claim: an anchor in flight has claimed its chat
-        # before its checkpoint exists on disk, and a reach rebuild that reads
-        # only the disk would un-claim it mid-anchor -- reopening the
-        # double-greet race the claim exists to close.
         self._anchored_chats = {
-            chat_uid: self._anchored_chats.get(chat_uid, False)
-            or self._checkpoint_path(chat_uid).exists()
+            chat_uid: self._checkpoint_path(chat_uid).exists()
             for chat_uid in self.chat_uids
         }
         self._last_uids = {
@@ -365,11 +361,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # in all but a heartbeat-sized race; deferring to the reconnect
             # would baseline the NEWEST message instead — silently skipping any
             # reply that arrived in between, the exact drop this prevents.
-            if not self._anchored_chats.get(chat_id):
-                try:
-                    await self._anchor(http, chat_id)
-                except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
-                    data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
+            try:
+                await self._ensure_anchor(http, chat_id)
+            except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
+                data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
     async def _typing_until_reply(self, chat_uid):
@@ -399,6 +394,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         name = chat.get("display_name") or (chat_id if chat_type == "group" else "Plow Chat")
         return {"name": name, "type": chat_type, "chat_id": chat_id}
 
+    async def _ensure_anchor(self, http, chat_uid):
+        """Anchor once, no matter who asks or how concurrently.
+
+        The startup loop and a tool adoption can discover the same chat at the
+        same time; unserialized, the loser sees a half-done anchor as done and
+        starts a cursorless backfill (replaying history as new turns), or
+        double-sends the disclosure wave. One lock, re-checked inside, is the
+        whole mechanism -- anchoring is rare, so contention is nil.
+        """
+        async with self._anchor_lock:
+            if not self._anchored_chats.get(chat_uid):
+                await self._anchor(http, chat_uid)
+
     async def _anchor(self, http, chat_uid):
         """Persist the newest existing uid as this agent's starting baseline.
 
@@ -415,20 +423,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         that starts with no recoverable baseline is exactly the state the
         checkpoint exists to rule out.
         """
-        # Claim before the first await: the startup loop and a tool adoption can
-        # discover the same brand-new chat concurrently, and an unclaimed anchor
-        # double-sends the disclosure wave. A failed anchor releases the claim
-        # so the retry re-enters.
-        self._anchored_chats[chat_uid] = True
-        try:
-            first_meeting = not self._checkpoint_path(chat_uid).exists()
-            async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
-                                headers=self.auth) as resp:
-                _auth_raise_for_status(resp)
-                page = (await resp.json(content_type=None)).get("data") or []
-        except BaseException:
-            self._anchored_chats[chat_uid] = False
-            raise
+        first_meeting = not self._checkpoint_path(chat_uid).exists()
+        async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
+                            headers=self.auth) as resp:
+            _auth_raise_for_status(resp)
+            page = (await resp.json(content_type=None)).get("data") or []
         # An empty chat still records that it anchored, with an empty cursor:
         # nothing is behind us, and the marker is what stops a restart from
         # anchoring a second time over messages that arrived in between.
@@ -438,7 +437,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # would re-anchor over everything since. Raise into `_listen`, which
         # already owns retrying.
         if not self._checkpoint(page[0]["uid"] if page else "", chat_uid):
-            self._anchored_chats[chat_uid] = False
             raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
         # The 👋 is a first-meeting disclosure, sent once ever: the checkpoint
         # file is the durable record of having met this chat, so it rides the
@@ -515,8 +513,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # baseline here, while nothing is arriving. After this the
                     # checkpoint only ever advances through a handled turn.
                     for chat_uid in self.chat_uids:
-                        if not self._anchored_chats[chat_uid]:
-                            await self._anchor(http, chat_uid)
+                        await self._ensure_anchor(http, chat_uid)
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()
