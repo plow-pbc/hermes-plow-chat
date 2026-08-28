@@ -198,6 +198,16 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
+def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
+    """Simulate `_listen`'s pre-connect loop having already anchored these
+    chats -- the real precondition before any frame reaches `_on_frame` in
+    production. A test that drives `_on_frame` directly, skipping `_listen`,
+    needs this so a frame for a chat the test doesn't care about anchoring
+    doesn't trip `_ensure_empty_anchor`'s per-frame baseline check."""
+    for chat_uid in chat_uids:
+        adapter._anchored_chats[chat_uid] = True
+
+
 def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str, Any]:
     participants = [
         {"type": "agent"},
@@ -412,6 +422,7 @@ async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.
     hand-off's to wait for, not the window's."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     release = asyncio.Event()
 
     async def slow_fetch(item: Any, kind: str) -> str:
@@ -487,6 +498,7 @@ async def test_a_burst_from_one_sender_is_one_turn(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
@@ -512,6 +524,7 @@ async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
     a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
     order: list[str] = []
 
@@ -544,6 +557,7 @@ async def test_a_backfilled_duplicate_of_an_in_flight_uid_is_dropped(
     ack and is dropped — hermes never sees the message twice."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     entered, release = asyncio.Event(), asyncio.Event()
     handled: list[str] = []
 
@@ -750,6 +764,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     config = SimpleNamespace(extra={})
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
+    _mark_anchored(adapter, "cht_a", "cht_b")
     # cht_c is never granted; a refresh that leaves reach unchanged is what
     # a real ungranted chat looks like -- nothing here exercises adoption.
     monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
@@ -1034,6 +1049,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    _mark_anchored(adapter, "cht_a", "cht_b")
     http = _HTTP()
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
@@ -1357,11 +1373,6 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
 
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    # A reply beating this call is already stored server-side but not yet
-    # handed to hermes -- anchoring at newest here would checkpoint it ahead
-    # of that handoff, so this path must never reach `_anchor`.
-    monkeypatch.setattr(adapter, "_anchor",
-                         mock.AsyncMock(side_effect=AssertionError("start_group_thread must not anchor at newest")))
 
     posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 

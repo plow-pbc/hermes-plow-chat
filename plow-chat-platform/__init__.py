@@ -824,10 +824,17 @@ class PlowChatAdapter(BasePlatformAdapter):
             if chat_uid not in self.chat_uids:
                 log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
                 return
-            # The frame in hand is that newest message -- see
-            # `_ensure_empty_anchor` for why this baselines empty rather
-            # than through `_ensure_anchor`.
-            await self._ensure_empty_anchor(chat_uid)
+        # Every frame re-checks the baseline, not just a newly-revealed
+        # chat's first one: the refresh above already added chat_uid to
+        # `chat_uids` before this runs, so if `_ensure_empty_anchor` failed
+        # once (a transient checkpoint-write error) the chat reads as
+        # "known" from then on and the block above would never run again --
+        # stranding it unanchored until a restart's `_ensure_anchor`
+        # baselines it at newest instead, silently dropping whatever
+        # arrived in between. Retrying here is idempotent and cheap: the
+        # lock + skip-if-anchored inside `_ensure_empty_anchor` make an
+        # already-anchored chat a lock-and-check, not a write.
+        await self._ensure_empty_anchor(chat_uid)
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]
