@@ -835,7 +835,7 @@ async def test_outbound_media_contract(
         assert calls == [declare, upload, send]
     else:
         assert result.success is False and str(status) in result.error
-        assert calls == [declare] if fail_at == "declare" else [declare, upload]
+        assert calls == ([declare] if fail_at == "declare" else [declare, upload])
 
 
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
