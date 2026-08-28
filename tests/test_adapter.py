@@ -829,6 +829,26 @@ async def test_unknown_chat_frame_adopts_via_one_refresh_then_delivers(
     assert [event["message_id"] for event in handled] == ["msg_new"]
 
 
+async def test_adopt_lets_a_revoked_credential_stay_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """_PlowAuthError raised inside the adopt path must reach _listen's
+    terminal handler -- swallowed, a dead token keeps looking connected
+    (the 2026-08-27 str incident, through a new door)."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._http = object()
+
+    async def fake_refresh(http: Any) -> None:
+        raise module._PlowAuthError()
+
+    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
+
+    with pytest.raises(module._PlowAuthError):
+        await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"))
+
+
 async def test_a_still_unrevealed_chat_is_dropped_after_one_refresh_per_frame(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

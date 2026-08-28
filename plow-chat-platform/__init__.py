@@ -786,6 +786,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             await self._refresh_reach(http)
             if chat_uid in self.chat_uids:
                 await self._ensure_anchor(http, chat_uid)
+        except _PlowAuthError:
+            # Terminal by contract: _listen owns the revoked-credential stop
+            # (the 2026-08-27 str incident). Swallowing it here would keep a
+            # dead token looking connected through this new path.
+            raise
         except Exception as exc:  # noqa: BLE001 - the reconnect backfill recovers a failed adopt
             log.warning("[plow_chat] reach refresh on new chat failed: %s", type(exc).__name__)
 
