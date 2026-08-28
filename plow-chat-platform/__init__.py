@@ -88,6 +88,8 @@ def _write_channel_aliases(names):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     os.replace(tmp, path)
+
+
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
 _MEMBER_TOOL_BLOCK = {"action": "block", "message": "tools are unavailable on this turn"}
 REPLY_TARGET_PROMPT = (
@@ -278,7 +280,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         try:
             _write_channel_aliases(_resolve_chat_names(next_chats.values(), next_home))
         except Exception as exc:             # noqa: BLE001 - cosmetic
-            log.warning("[plow_chat] channel alias publish failed: %s", type(exc).__name__)
+            # Message included, not TYPE only: nothing here carries a ticket or
+            # token, and an OSError's path is what makes the failure fixable.
+            log.warning("[plow_chat] channel alias publish failed: %s: %s",
+                        type(exc).__name__, exc)
 
     async def _refresh_reach(self, http):
         """Discover the token's grant-scoped reach. The home is fixed by
