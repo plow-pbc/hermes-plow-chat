@@ -1479,11 +1479,19 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 
 
 class _Resp:
-    """Minimal aiohttp-response stand-in for _body."""
+    """Minimal aiohttp-response stand-in for _body, usable as a context manager
+    so it also serves the mint path. `json()` parses `text`, so a non-JSON body
+    raises exactly as a proxy's HTML error page does — no separate stub."""
 
     def __init__(self, status, text):
         self.status = status
         self._text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
 
     async def text(self):
         return self._text
@@ -1576,31 +1584,13 @@ def test_the_fatal_report_is_not_repeated_by_a_second_loop(monkeypatch):
     assert notifications == [1], "reported once, however many loops discover it"
 
 
-class _NonJsonResponse:
-    """A 401 from something in front of Plow — a proxy or WAF — whose body is not
-    JSON. Decoding before checking the status loses the 401 to a decode error."""
-
-    status = 401
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def json(self, content_type=None):
-        raise ValueError("Expecting value: line 1 column 1 (char 0)")
-
-    async def text(self):
-        return "<html>401 Unauthorized</html>"
-
-
 def test_the_ticket_mint_reports_a_revoked_credential_and_stops_the_socket(monkeypatch, caplog):
     """The socket is the other place the credential is presented, and it had the
     same forever-backoff. Driven with a NON-JSON body because that is what a proxy
     returns, and it is what catches a status check placed after the decode."""
     a = _adapter(monkeypatch, groups=None)
-    a._http_session = types.SimpleNamespace(post=lambda *args, **kwargs: _NonJsonResponse())
+    a._http_session = types.SimpleNamespace(
+        post=lambda *a_, **k_: _Resp(401, "<html>401 Unauthorized</html>"))
     slept = []
     real_sleep = asyncio.sleep
 
