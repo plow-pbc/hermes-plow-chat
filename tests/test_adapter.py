@@ -58,6 +58,35 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
     base.SendResult = _SendResult  # type: ignore[attr-defined]
+    import enum
+
+    class _MessageType(enum.Enum):
+        TEXT = "text"; PHOTO = "photo"; VIDEO = "video"; VOICE = "voice"; DOCUMENT = "document"
+
+    base.MessageType = _MessageType  # type: ignore[attr-defined]
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    def _cache(kind: str):
+        def write(data: bytes, name: str = "") -> str:
+            path = cache / f"{kind}_{len(list(cache.iterdir()))}{name}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
+    def _cache_doc():
+        # Distinguishable from the image/audio/video stubs above: the second
+        # arg here is a real filename, not a bare extension suffix.
+        def write(data: bytes, filename: str = "") -> str:
+            path = cache / f"doc_{len(list(cache.iterdir()))}_{filename}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
+    base.cache_image_from_bytes = _cache("img")  # type: ignore[attr-defined]
+    base.cache_audio_from_bytes = _cache("aud")  # type: ignore[attr-defined]
+    base.cache_video_from_bytes = _cache("vid")  # type: ignore[attr-defined]
+    base.cache_document_from_bytes = _cache_doc()  # type: ignore[attr-defined]
 
     for name, module in {
         "gateway": types.ModuleType("gateway"),
@@ -190,34 +219,76 @@ def _envelope(
     }
 
 
+class _BytesResp(_Resp):
+    def __init__(self, data: bytes, status: int = 200) -> None:
+        super().__init__(None, status)
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
+class _ContentHTTP:
+    """GET on a signed content URL; records that no bearer header was sent."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(self, url: str, **kw: Any) -> _BytesResp:
+        self.gets.append((url, kw.get("headers")))
+        return _BytesResp(b"\x89PNG", status=self.status)
+
+    async def __aenter__(self) -> "_ContentHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+
+URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
+
+
+def _attachment(**overrides: Any) -> dict[str, Any]:
+    """One inbound part with every key the Plow contract always sends."""
+    return {"uid": "att_photo", "filename": "photo.png", "content_type": "image/png",
+            "url": URL, "size_bytes": 4, "status": "received",
+            "url_expires_at": "2026-08-28T00:05:00Z"} | overrides
+
+
 @pytest.mark.parametrize(
-    ("body", "url", "expected_text"),
+    ("body", "content_type", "url", "status", "expected_text", "expected_kind"),
     [
-        (
-            "",
-            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
-            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
-        ),
-        (
-            "Photo attached",
-            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
-            "Photo attached\n"
-            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
-        ),
-        # status "failed" carries url: null by contract — still surfaced, not dropped.
-        ("", None, "[attachment: image/png delivery failed]"),
+        ("", "image/png", URL, 200, "(attachment)", "photo"),
+        ("Photo attached", "image/png", URL, 200, "Photo attached", "photo"),
+        ("", "audio/x-m4a", URL, 200, "(attachment)", "voice"),
+        ("", "video/mp4", URL, 200, "(attachment)", "video"),
+        ("", "application/pdf", URL, 200, "(attachment)", "document"),
+        # status "failed" carries url: null by contract — surfaced, not dropped.
+        ("", "image/png", None, 200, "[attachment: image/png delivery failed]", "text"),
+        # provider bytes gone (404 from the content route) — surfaced, not dropped.
+        ("", "image/png", URL, 404, "[attachment: image/png unavailable]", "text"),
+        # null content_type falls to application/octet-stream, becomes document.
+        ("", None, URL, 200, "(attachment)", "document"),
+        # a content-type parameter (charset, boundary, ...) must be stripped.
+        ("", "image/jpeg; charset=binary", URL, 200, "(attachment)", "photo"),
     ],
-    ids=["media-only", "captioned-media", "failed-part"],
+    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed", "null-type",
+         "parameterized-type"],
 )
-async def test_inbound_media_reaches_hermes(
+async def test_inbound_media_reaches_hermes_as_local_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     body: str,
+    content_type: str,
     url: str | None,
+    status: int,
     expected_text: str,
+    expected_kind: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=status)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[dict[str, Any]] = []
 
     async def capture(event: dict[str, Any]) -> None:
@@ -225,17 +296,83 @@ async def test_inbound_media_reaches_hermes(
 
     monkeypatch.setattr(adapter, "handle_message", capture)
 
-    await adapter._on_frame(
-        _envelope(
-            "evt_media",
-            "cht_a",
-            "msg_media",
-            body=body,
-            attachments=[{"content_type": "image/png", "url": url}],
-        )
-    )
+    expected_type = (content_type.split(";")[0].strip() if content_type
+                     else "application/octet-stream")
+    await adapter._on_frame(_envelope(
+        "evt_media", "cht_a", "msg_media", body=body,
+        attachments=[_attachment(content_type=content_type, url=url)],
+    ))
 
-    assert handled[0]["text"] == expected_text
+    event = handled[0]
+    assert event["text"] == expected_text
+    assert event["message_type"].value == expected_kind
+    if expected_kind == "text":
+        assert event["media_urls"] == []
+        return
+    assert http.gets == [(module.BASE + URL, None)], "signed URL, no bearer header"
+    (path,) = event["media_urls"]
+    assert pathlib.Path(path).read_bytes() == b"\x89PNG"
+    assert event["media_types"] == [expected_type]
+    if expected_kind == "document":
+        assert pathlib.Path(path).name.endswith("photo.png"), "cached document keeps its filename"
+
+
+async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Plow-failed part (status "failed", url null) is named in the text and
+    logged, without dropping the good part that arrived alongside it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope(
+            "evt_multi", "cht_a", "msg_multi", body="",
+            attachments=[
+                _attachment(uid="att_ok"),
+                _attachment(uid="att_bad", filename="doc.pdf", content_type="application/pdf",
+                            url=None, status="failed", url_expires_at=None),
+            ],
+        ))
+
+    event = handled[0]
+    assert len(event["media_urls"]) == 1
+    assert event["media_types"] == ["image/png"]
+    assert event["message_type"].value == "photo"
+    assert event["text"] == "[attachment: application/pdf delivery failed]"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("att_bad" in r.getMessage() for r in warnings)
+    assert not any("sig=" in r.getMessage() or "http" in r.getMessage() for r in warnings)
+
+
+async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The same message uid arriving twice (socket/backfill overlap, or two
+    distinct wrapping events) must be deduped before the attachment fetch."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    attachments = [_attachment()]
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_dup", attachments=attachments))
+
+    assert len(handled) == 1
+    assert len(http.gets) == 1
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -688,6 +825,69 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
+
+
+@pytest.mark.parametrize(
+    ("method", "fail_at", "status"),
+    [
+        ("send_image_file", None, 200),
+        ("send_voice", None, 200),
+        ("send_video", None, 200),
+        ("send_document", None, 200),
+        ("send_image_file", "declare", 415),
+        ("send_image_file", "upload", 403),
+    ],
+    ids=["image", "voice", "video", "document", "declare-415", "upload-403"],
+)
+async def test_outbound_media_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, method: str, fail_at: str | None, status: int,
+) -> None:
+    """Declare (bearer) -> PUT bytes to the provider URL with exactly the
+    returned headers (no bearer) -> message POST (bearer). A non-2xx at the
+    declare or the upload never reaches the message POST, so no attachment_uid
+    ever points at a half-sent file."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    photo = tmp_path / "map.png"
+    photo.write_bytes(b"\x89PNG")
+    calls: list[tuple[str, str, Any, dict[str, str] | None]] = []
+    upload_url = "https://uploads.example/put?sig=x"
+
+    class _MediaHTTP:
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            calls.append(("POST", url, json, headers))
+            if url.endswith("/attachments"):
+                return _Resp({"uid": "att_1", "upload_url": upload_url,
+                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}},
+                             status=status if fail_at == "declare" else 200)
+            return _Resp({"uid": "msg_sent"})
+
+        def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
+            calls.append(("PUT", url, data, headers))
+            return _Resp({}, status=status if fail_at == "upload" else 200)
+
+        async def __aenter__(self) -> "_MediaHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _MediaHTTP())
+
+    result = await getattr(adapter, method)("cht_a", str(photo), caption="here")
+    refused = await getattr(adapter, method)("cht_zzz", str(photo))
+
+    assert not refused.success, "an ungranted chat sends nothing"
+    declare = ("POST", f"{module.BASE}/v1/chats/cht_a/attachments",
+               {"filename": "map.png", "content_type": "image/png", "size_bytes": 4}, adapter.auth)
+    upload = ("PUT", upload_url, b"\x89PNG", {"Content-Type": "image/png", "Content-Length": "4"})
+    send = ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
+            {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth)
+    if fail_at is None:
+        assert result.success and result.message_id == "msg_sent"
+        assert calls == [declare, upload, send]
+    else:
+        assert result.success is False and str(status) in result.error
+        assert calls == ([declare] if fail_at == "declare" else [declare, upload])
 
 
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

@@ -7,12 +7,17 @@ import asyncio
 import contextvars
 import json
 import logging
+import mimetypes
 import os
 import pathlib
 
 import aiohttp
 from gateway.config import HomeChannel, Platform, persist_home_channel
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter, MessageEvent, MessageType, SendResult,
+    cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
+    cache_video_from_bytes,
+)
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 PLATFORM_NAME = "plow_chat"
@@ -88,6 +93,45 @@ def _write_channel_aliases(names):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     os.replace(tmp, path)
+
+
+async def _fetch_attachment(item, content_type):
+    """Download one inbound part into Hermes' media cache; the local path.
+
+    The content URL is Plow-signed and five minutes old at most, so it is
+    fetched now, without the bearer (the signature IS the authorization), and
+    the bytes land where the image's vision path already looks — the same
+    cache the bundled iMessage adapter fills. None means unavailable: the
+    caller surfaces that in the turn rather than dropping it. Bounded to 30s
+    total: a stalled fetch must not mute the frame loop.
+    """
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
+            async with http.get(BASE + item["url"]) as resp:
+                resp.raise_for_status()
+                data = await resp.read()
+    except Exception as exc:  # noqa: BLE001 - the turn still reaches hermes, minus the bytes
+        log.warning("[plow_chat] attachment %s fetch failed: %s", item["uid"], type(exc).__name__)
+        return None
+    ext = mimetypes.guess_extension(content_type)
+    if content_type.startswith("image/"):
+        return cache_image_from_bytes(data, ext or ".jpg")
+    if content_type.startswith("audio/"):
+        return cache_audio_from_bytes(data, ext or ".m4a")
+    if content_type.startswith("video/"):
+        return cache_video_from_bytes(data, ext or ".mp4")
+    return cache_document_from_bytes(data, item["filename"] or f"{item['uid']}{ext or ''}")
+
+
+def _message_type(media_types):
+    prefixes = {t.split("/")[0] for t in media_types}
+    if "image" in prefixes:
+        return MessageType.PHOTO
+    if "audio" in prefixes:
+        return MessageType.VOICE
+    if "video" in prefixes:
+        return MessageType.VIDEO
+    return MessageType.DOCUMENT if media_types else MessageType.TEXT
 
 
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
@@ -371,22 +415,79 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._cancel_typing(event.source.chat_id)
         self._member_turn_chat.set(None)
 
-    async def send(self, chat_id, content, reply_to=None, metadata=None):
+    def _send_guard(self, chat_id):
+        """The one rule for every outbound call: within the grant, and within
+        the member turn's chat while one is open. None means go."""
         if chat_id not in self.chat_uids:
             return SendResult(success=False, error=f"Plow Chat {chat_id!r} is outside this agent's grant")
         member_turn_chat = self._member_turn_chat.get()
         if member_turn_chat is not None and chat_id != member_turn_chat:
             return SendResult(success=False, error=f"Plow Chat member turn is confined to {member_turn_chat!r}")
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        refused = self._send_guard(chat_id)
+        if refused is not None:
+            return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
         self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
-            async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
-                                 json={"body": content.strip()}, headers=self.auth) as resp:
-                data = await resp.json(content_type=None)
+            return await self._post_message(http, chat_id, {"body": content.strip()})
+
+    async def _post_message(self, http, chat_id, payload):
+        async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
+                             json=payload, headers=self.auth) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
+            return SendResult(success=True, message_id=data.get("uid"))
+
+    async def _send_attachment(self, chat_id, path, *, caption=None, filename=None):
+        """Declare, upload, send — the Plow media contract, in that order.
+
+        The declare and the send carry the bearer; the PUT goes to the
+        provider's upload URL with exactly the headers Plow returned and
+        nothing else — that URL is a write capability, not a Plow endpoint.
+        Hermes routes every model-emitted file through the four hooks below,
+        so without this it fell to the base adapter's "native file send
+        unavailable" notice and the file never left the container.
+        """
+        refused = self._send_guard(chat_id)
+        if refused is not None:
+            return refused
+        filename = filename or os.path.basename(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        self._cancel_typing(chat_id)
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f"{BASE}/v1/chats/{chat_id}/attachments",
+                                 json={"filename": filename, "content_type": content_type,
+                                       "size_bytes": len(data)},
+                                 headers=self.auth) as resp:
+                declared = await resp.json(content_type=None)
                 if resp.status >= 400:
-                    return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
-                return SendResult(success=True, message_id=data.get("uid"))
+                    return SendResult(success=False, error=f"Plow Chat {resp.status}: {declared}")
+            async with http.put(declared["upload_url"], data=data,
+                                headers=declared["upload_headers"]) as resp:
+                if resp.status >= 400:
+                    return SendResult(success=False, error=f"attachment upload {resp.status}")
+            return await self._post_message(
+                http, chat_id,
+                {"body": (caption or "").strip(), "attachment_uids": [declared["uid"]]})
+
+    async def send_image_file(self, chat_id, image_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, image_path, caption=caption)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, audio_path, caption=caption)
+
+    async def send_video(self, chat_id, video_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, video_path, caption=caption)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, **_kwargs):
+        return await self._send_attachment(chat_id, file_path, caption=caption, filename=file_name)
 
     async def start_group_thread(self, thread_handle, body):
         """POST a new Plow/Linq thread, then refresh reach so we listen to it.
@@ -646,16 +747,34 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
         role = sender["role"]
-        # A failed part is a documented state (status "failed", url null), not
-        # schema drift; anything else missing should raise, per REVIEW.md.
-        attachment_text = "\n".join(
-            f"[attachment: {item['content_type']} {BASE + item['url'] if item['url'] else 'delivery failed'}]"
-            for item in msg["attachments"]
-        )
-        text = "\n".join(part for part in (msg["body"].strip(), attachment_text) if part)
         uid = msg["uid"]
         message_key = (chat_uid, uid)
-        if not text or message_key in self._seen:
+        if message_key in self._seen:
+            return                           # socket/backfill overlap - never re-fetch
+        # A failed part is a documented state (status "failed", url null), not
+        # schema drift. A part whose bytes cannot be fetched now is the same to
+        # the model: named in the turn, never dropped with it.
+        media_urls, media_types, notes = [], [], []
+        parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
+                 for item in msg["attachments"]]
+        # Fetched concurrently: this runs inside the frame loop, so a stalled
+        # part must cost the line one timeout, not one per part.
+        paths = await asyncio.gather(*(
+            _fetch_attachment(item, content_type) if item["url"] else asyncio.sleep(0)
+            for item, content_type in parts))
+        for (item, content_type), path in zip(parts, paths):
+            if path:
+                media_urls.append(path)
+                media_types.append(content_type)
+            else:
+                if not item["url"]:
+                    log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
+                notes.append(f"[attachment: {content_type} "
+                             f"{'unavailable' if item['url'] else 'delivery failed'}]")
+        text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
+        if not text and media_urls:
+            text = "(attachment)"
+        if not text:
             return
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
@@ -665,6 +784,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
             message_id=uid,
+            media_urls=media_urls,
+            media_types=media_types,
+            message_type=_message_type(media_types),
             channel_prompt=(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
