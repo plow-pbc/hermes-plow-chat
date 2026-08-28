@@ -558,8 +558,8 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     tmp_path: pathlib.Path,
 ) -> None:
     """The startup loop and a tool adoption can find the same brand-new chat at
-    once; the claim-before-await in _anchor is what keeps the disclosure wave
-    to one send (and one checkpoint write)."""
+    once; _ensure_anchor's lock, re-checked inside, is what keeps the
+    disclosure wave to one send (and one checkpoint write)."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a")])
