@@ -317,6 +317,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=status)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -350,6 +351,7 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
     logged, without dropping the good part that arrived alongside it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -380,6 +382,7 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     distinct wrapping events) must be deduped before the attachment fetch."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -398,6 +401,7 @@ async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatc
     photo. One turn, both files, in arrival order, typed from the whole burst."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -449,6 +453,7 @@ async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
     burst's, begun when the chat gets around to it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     entered, release, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -588,6 +593,7 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
     a retry must not go back to a signed url that may have expired."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[str] = []
@@ -1340,6 +1346,7 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     reporting a disconnected gateway."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _HTTP()
     http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}
