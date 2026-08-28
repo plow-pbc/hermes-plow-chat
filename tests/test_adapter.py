@@ -1602,10 +1602,17 @@ def test_the_ticket_mint_reports_a_revoked_credential_and_stops_the_socket(monke
     a = _adapter(monkeypatch, groups=None)
     a._http_session = types.SimpleNamespace(post=lambda *args, **kwargs: _NonJsonResponse())
     slept = []
-    monkeypatch.setattr(adapter_mod.asyncio, "sleep",
-                        lambda d: slept.append(d) or asyncio.sleep(0))
+    real_sleep = asyncio.sleep
 
-    with caplog.at_level(logging.ERROR):
+    async def _record(delay):
+        slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _record)
+
+    # WARNING, not ERROR: the generic loop handler logs at WARNING, and capturing
+    # only ERROR would make the "not a generic loop error" assertion vacuous.
+    with caplog.at_level(logging.WARNING):
         asyncio.run(a._websocket_loop("cht_home"))
 
     assert a.fatal_error[0][0] == "token_revoked"

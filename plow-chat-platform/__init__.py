@@ -988,10 +988,16 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # proxy or WAF is not JSON, and decoding first loses the status
                 # to a decode error.
                 raise _PlowAuthError(resp.status, f"ticket mint refused for {chat_uid}")
-            data = await resp.json(content_type=None)
             if resp.status >= 400:
-                err = data.get("error", {}) if isinstance(data, dict) else {}
+                # Same order, same reason: a non-JSON 5xx from a proxy would
+                # otherwise surface as a decode error instead of its status.
+                text = (await resp.text())[:200]
+                try:
+                    err = (json.loads(text) or {}).get("error", {})
+                except ValueError:
+                    err = {}
                 raise RuntimeError(err.get("message") or f"ticket mint failed: {resp.status}")
+            data = await resp.json(content_type=None)
             return data["ticket"]
 
     async def _websocket_loop(self, chat_uid: str) -> None:
