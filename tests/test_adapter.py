@@ -1370,15 +1370,22 @@ def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
     assert "could not read the seen-message record" in caplog.text
 
 
+@pytest.mark.parametrize("corrupt", [
+    {"epoch": "2026-08-01T00:00:00Z", "chats": {"cht_a": ["ok_uid", 2]}},
+    # A string value would slip an element-only check: dict.fromkeys over it
+    # yields per-character keys that are all strings.
+    {"epoch": "2026-08-01T00:00:00Z", "chats": {"cht_a": "msg_1"}},
+    # An untyped epoch would load cleanly and then raise inside every walk.
+    {"epoch": 123, "chats": {"cht_a": ["msg_1"]}},
+])
 def test_a_corrupt_record_puts_every_chat_back_in_anchor_posture(
-    monkeypatch, tmp_path, caplog
+    monkeypatch, tmp_path, caplog, corrupt
 ):
     """One writer owns this file, so a malformed anything is corruption, and
     the safe read of a corrupt record is no record: without its epoch a chat
     whose uids were seen once cannot be told from a newborn, and replaying it
     re-answers it."""
-    (tmp_path / "plow-chat-seen.json").write_text(json.dumps(
-        {"epoch": "2026-08-01T00:00:00Z", "chats": {"cht_a": ["ok_uid", 2]}}))
+    (tmp_path / "plow-chat-seen.json").write_text(json.dumps(corrupt))
 
     with caplog.at_level(logging.WARNING):
         a = _adapter(monkeypatch, cls=CapturingAdapter)
@@ -1455,6 +1462,26 @@ def _record(tmp_path, epoch="2026-08-01T00:00:00Z"):
     dates everything this agent has been listening since."""
     (tmp_path / "plow-chat-seen.json").write_text(
         json.dumps({"epoch": epoch, "chats": {"cht_other": ["msg_0"]}}))
+
+
+def test_the_epoch_is_server_time_so_no_startup_chat_can_outdate_it(monkeypatch):
+    """The epoch and created_at must share a clock. Stamped from the local
+    clock, skew re-answers a standing chat or drops a newborn's messages; the
+    birth of the newest dated chat is server time, and by construction no chat
+    in the startup inventory postdates it."""
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._chat_created.update({"cht_a": "2026-08-20T00:00:00Z",
+                            "cht_b": "2026-08-25T00:00:00Z"})
+    a._http_session = PagingSession({
+        "/v1/chats/cht_b/messages": [],
+        "/v1/chats/cht_a/messages": [_msg("m1", "pre-install", chat_uid="cht_a")],
+    })
+
+    asyncio.run(a._backfill("cht_b"))   # the first write stamps the epoch
+    asyncio.run(a._backfill("cht_a"))   # older sibling: inventory, not newborn
+
+    assert a._epoch == "2026-08-25T00:00:00Z"
+    assert a.handled == [], "nothing in the startup inventory replays"
 
 
 def test_a_chat_born_during_a_gap_replays_its_whole_catalogue(monkeypatch, tmp_path):

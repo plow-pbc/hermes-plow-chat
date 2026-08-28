@@ -1178,9 +1178,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._epoch: Optional[str] = None
         try:
             raw = json.loads(self._seen_path().read_text())
-            seen = {uid: dict.fromkeys(uids) for uid, uids in raw["chats"].items()}
-            if not all(isinstance(u, str) for uids in seen.values() for u in uids):
-                raise ValueError("non-string message uid in the record")
+            if not isinstance(raw["epoch"], str):
+                raise ValueError("epoch is not a string")
+            seen = {}
+            for chat_uid, uids in raw["chats"].items():
+                # The list check is load-bearing: dict.fromkeys over a corrupt
+                # *string* value yields per-character keys that all pass the
+                # element check, loading garbage instead of anchoring.
+                if not isinstance(uids, list) or not all(isinstance(u, str) for u in uids):
+                    raise ValueError(f"malformed uid list for {chat_uid!r}")
+                seen[chat_uid] = dict.fromkeys(uids)
             self._epoch = raw["epoch"]
             self._seen = seen
         except FileNotFoundError:
@@ -1217,10 +1224,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             # The record's birth, stamped on the first write and never again.
             # Everything created before this moment predates the record and
             # anchors on first contact; everything after it is a chat this
-            # agent should have been listening to. ISO-8601 UTC, the same form
-            # and zone the API's created_at carries, so the two compare as
-            # strings.
-            self._epoch = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            # agent should have been listening to. Stamped in *server* time —
+            # the birth of the newest chat the poll has dated — so the
+            # comparison against created_at never mixes clocks, and no chat in
+            # the startup inventory can outdate the epoch it just set. Local
+            # UTC is the fallback only when nothing is dated yet; both carry
+            # the API's ISO-8601 Z form, so the two compare as strings.
+            self._epoch = max(self._chat_created.values(),
+                              default=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         path = self._seen_path()
         tmp = path.with_name(path.name + ".tmp")
         # Written on every dispatch, so it stays compact: no indent, and no
