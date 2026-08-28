@@ -70,6 +70,22 @@ EXTERNAL_CHANNEL_PROMPT = (
 _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 
 
+class _PlowAuthError(Exception):
+    """The credential itself was refused (401). Terminal: every retry presents
+    the same revoked token, so the caller must stop, not sleep."""
+
+
+def _auth_raise_for_status(resp):
+    """The one status seam for every request that presents the credential.
+
+    Status BEFORE parse (a proxy 401 is not JSON), and 401 ONLY -- a 403 is
+    resource-scoped (removed from one chat) and keeps warn-and-retry.
+    """
+    if resp.status == 401:
+        raise _PlowAuthError
+    resp.raise_for_status()
+
+
 def _platform():
     """Resolve the Platform member LAZILY, never at import.
 
@@ -110,7 +126,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # pre-existing and never handed to hermes.
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
-        self._home_write_pending = False
         self._typing = {}
         self._member_turn_chat = _MEMBER_TURN_CHAT
 
@@ -164,17 +179,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         next_chats = {chat["uid"]: chat for chat in chats}
         if not next_chats:
             raise RuntimeError("the credential grant has no live chats")
-        next_home = (
-            self._configured_home_chat_uid
-            if self._configured_home_chat_uid in next_chats
-            else next(iter(next_chats))
-        )
-        if next_home != self.home_chat_uid and self._configured_home_chat_uid not in next_chats:
-            log.warning(
-                "[plow_chat] configured home %s is outside the grant; using first granted chat %s as home",
-                self._configured_home_chat_uid,
-                next_home,
-            )
+        # The home is where cron and default output land. A fallback to "some
+        # granted room" pointed the owner's private deliveries at whichever
+        # chat the API listed first -- refuse instead; _listen retries, and the
+        # error names the fix.
+        if self._configured_home_chat_uid not in next_chats:
+            raise RuntimeError(
+                f"configured home {self._configured_home_chat_uid} is not in the "
+                "credential grant -- fix PLOW_HOME_CHANNEL or the grant")
+        next_home = self._configured_home_chat_uid
         for chat_uid in self.chat_uids - next_chats.keys():
             self._cancel_typing(chat_uid)
         self.home_chat_uid = next_home
@@ -190,23 +203,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         }
 
     async def _refresh_reach(self, http):
-        """Discover the token's grant-scoped reach; home is only a preference."""
-        previous_home_chat_uid = self.home_chat_uid
+        """Discover the token's grant-scoped reach. The home is fixed by
+        PLOW_HOME_CHANNEL -- a grant that drops it is refused in _set_reach."""
         try:
             async with http.get(f"{BASE}/v1/chats", headers=self.auth) as resp:
-                resp.raise_for_status()
+                _auth_raise_for_status(resp)
                 body = await resp.json(content_type=None)
             if body["has_more"]:
                 raise RuntimeError("the granted chat listing is truncated")
             self._set_reach(body["data"])
+        except _PlowAuthError:
+            raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
             log.error("[plow_chat] grant read failed: %s", type(exc).__name__)
             raise
-        if self.home_chat_uid != previous_home_chat_uid:
-            self._home_write_pending = True
-        if self._home_write_pending:
-            await self._persist_home()
-            self._home_write_pending = False
 
     async def _persist_home(self):
         """Declare the home channel used for cron and default delivery."""
@@ -237,13 +247,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 await self._ws_task
             except asyncio.CancelledError:
                 pass
-        previous_home_chat_uid = self.home_chat_uid
         async with aiohttp.ClientSession() as http:
             await self._refresh_reach(http)
         # Declare the home channel, so the customer is never asked /sethome.
         # config.yaml is the canonical store /sethome itself writes, and the
-        # cron scheduler reads it back via config.get_home_channel().
-        if not is_reconnect and self.home_chat_uid == previous_home_chat_uid:
+        # cron scheduler reads it back via config.get_home_channel(). The home
+        # cannot move (a grant without it is refused above), so this is a
+        # first-connect write; a failure fails the connect, loudly.
+        if not is_reconnect:
             await self._persist_home()
         # Published for the synchronous tool handler, which bridges its send
         # onto this loop; cleared in disconnect so a tool call can never adopt
@@ -329,7 +340,15 @@ class PlowChatAdapter(BasePlatformAdapter):
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
                 data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
                 return data
-        data["adoption"] = "adopted" if chat_id in self.chat_uids else "not-on-this-agents-line"
+        if chat_id in self.chat_uids:
+            data["adoption"] = "adopted"
+            # Checkpoint the message this send created, unless the chat already
+            # carries a newer one: a reply landing before the next reconnect
+            # must not become _anchor()'s baseline and be silently skipped.
+            if data.get("uid") and not self._last_uids.get(chat_id):
+                self._checkpoint(data["uid"], chat_id)
+        else:
+            data["adoption"] = "not-on-this-agents-line"
         return data
 
     async def _typing_until_reply(self, chat_uid):
@@ -377,7 +396,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         """
         async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
                             headers=self.auth) as resp:
-            resp.raise_for_status()
+            _auth_raise_for_status(resp)
             page = (await resp.json(content_type=None)).get("data") or []
         # An empty chat still records that it anchored, with an empty cursor:
         # nothing is behind us, and the marker is what stops a restart from
@@ -415,7 +434,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             async with http.get(url, headers=self.auth) as resp:
                 # An error page is not an empty page: treating a 401 or a 500
                 # as "nothing missed" would move the baseline past the gap.
-                resp.raise_for_status()
+                _auth_raise_for_status(resp)
                 body = await resp.json(content_type=None)
             page = body.get("data") or []
             reached = False
@@ -449,23 +468,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                     async with http.post(f"{BASE}/v1/ws/ticket",
                                          json={},
                                          headers=self.auth) as resp:
-                        # Status BEFORE parse: a 401 from a proxy or WAF is not
-                        # JSON, and decoding first reports it as a decode error.
-                        #
-                        # 401 ONLY, never 403 — revocation is terminal: every
-                        # later mint fails identically until a human
-                        # re-credentials the agent. Observed on the str agent
-                        # 2026-08-27: one WARNING a minute from a revoked
-                        # token, the line dead, the adapter reporting itself
-                        # connected. A 403 is resource-scoped and keeps the
-                        # warn-and-retry below. (Re-port of the old adapter's
-                        # #17 onto this structure.)
-                        if resp.status == 401:
-                            log.error("[plow_chat] token revoked (ticket mint 401) -- "
-                                      "stopping the listen loop; re-credential this agent")
-                            self._mark_disconnected()
-                            return
-                        resp.raise_for_status()
+                        _auth_raise_for_status(resp)
                         ticket = (await resp.json(content_type=None))["ticket"]
                     # The first connection of this agent's life takes its
                     # baseline here, while nothing is arriving. After this the
@@ -490,6 +493,20 @@ class PlowChatAdapter(BasePlatformAdapter):
                         async for frame in ws:
                             if frame.type == aiohttp.WSMsgType.TEXT:
                                 await self._on_frame(frame.json())
+            except _PlowAuthError:
+                # Revocation is terminal: every retry presents the same dead
+                # credential. Observed on the str agent 2026-08-27 -- one
+                # WARNING a minute, the line dead, the adapter reporting itself
+                # connected. State first, then the tool handle: a confirmed
+                # group send against a retired credential must refuse, not
+                # invoke this adapter. (Re-port of #17 onto this structure.)
+                log.error("[plow_chat] credential refused (401) -- stopping the "
+                          "listen loop; re-credential this agent")
+                self._mark_disconnected()
+                global _live
+                if _live is not None and _live[0] is self:
+                    _live = None
+                return
             except Exception as exc:         # noqa: BLE001 - reconnect, never die
                 # TYPE only: the ticket is a query parameter, so a non-101
                 # handshake raises an exception carrying the whole URL, and

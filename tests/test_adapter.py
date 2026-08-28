@@ -393,39 +393,6 @@ async def test_an_initial_marker_that_will_not_persist_does_not_connect(monkeypa
     assert adapter._last_uids[adapter.home_chat_uid] is None, "state must not claim what the disk does not hold"
 
 
-async def test_a_failed_home_write_is_retried_on_the_next_grant_refresh(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    grant = {
-        "object": "list",
-        "data": [{"uid": "cht_b", "display_name": None, "participants": []}],
-        "has_more": False,
-    }
-
-    class _GrantHTTP:
-        def get(self, url: str, **kwargs: Any) -> _Resp:
-            assert url == f"{module.BASE}/v1/chats"
-            return _Resp(grant)
-
-    persisted: list[str] = []
-
-    def persist(home: dict[str, Any], **kwargs: Any) -> None:
-        persisted.append(home["chat_id"])
-        if len(persisted) == 1:
-            raise OSError("read-only config")
-
-    monkeypatch.setattr(module, "persist_home_channel", persist)
-    with pytest.raises(OSError, match="read-only config"):
-        await adapter._refresh_reach(_GrantHTTP())
-
-    await adapter._refresh_reach(_GrantHTTP())
-
-    assert persisted == ["cht_b", "cht_b"]
-
-
 async def test_one_socket_demuxes_and_checkpoints_two_chats(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -491,38 +458,30 @@ class _HTTP:
         return _Resp({"uid": "msg_sent"})
 
 
-async def test_reconnect_replaces_reach_and_falls_back_when_the_configured_home_was_dropped(
+async def test_a_grant_that_drops_the_configured_home_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """The home is where cron and the owner's default output land. When the
+    grant no longer contains it, the old fallback adopted whichever chat the
+    API listed first -- pointing owner-directed deliveries at an unrelated
+    room. The contract now is refusal: reach stays as it was, nothing is
+    persisted, and _listen retries with an error naming the fix."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
-    http = _HTTP()
-    http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
-        {"object": "list", "data": [_chat("cht_b"), _chat("cht_c")], "has_more": False}
-    )
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
     persisted: list[dict[str, Any]] = []
     monkeypatch.setattr(module, "persist_home_channel", lambda home, **kwargs: persisted.append(home))
 
-    async def listen_once() -> None: ...
+    class _GrantHTTP:
+        def get(self, url: str, **kwargs: Any) -> _Resp:
+            return _Resp({"object": "list", "data": [_chat("cht_b"), _chat("cht_c")], "has_more": False})
 
-    monkeypatch.setattr(adapter, "_listen", listen_once)
-    with caplog.at_level(logging.WARNING):
-        await adapter.connect(is_reconnect=True)
-    await adapter._ws_task
-    await adapter.connect(is_reconnect=True)
-    await adapter._ws_task
-
-    assert adapter.chat_uids == frozenset({"cht_b", "cht_c"})
-    assert set(adapter._chats) == {"cht_b", "cht_c"}
-    assert adapter.home_chat_uid == "cht_b"
-    assert persisted == [{"platform": "plow_chat", "chat_id": "cht_b", "name": "Plow Chat"}]
-    assert "using first granted chat cht_b as home" in caplog.text
-
-
+    with pytest.raises(RuntimeError, match="not in the\s+credential grant"):
+        await adapter._refresh_reach(_GrantHTTP())
+    assert adapter.home_chat_uid == "cht_a", "a refused grant must not move the home"
+    assert adapter.chat_uids == frozenset({"cht_a", "cht_b"}), "a refused grant must not replace reach"
+    assert persisted == []
 class _SocketHTTP(_HTTP):
     def __init__(self) -> None:
         super().__init__()
@@ -540,6 +499,7 @@ class _SocketHTTP(_HTTP):
     def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
         self.sockets.append(url)
         return _WS()
+
 
 
 async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -884,40 +844,34 @@ async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_pu
     assert module._live is None
 
 
-async def test_a_revoked_token_stops_the_listen_loop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize(("status", "retries"), [
+    pytest.param(401, False, id="revoked_is_terminal"),
+    # A 403 is resource-scoped (removed from one chat) and a 502 in front of
+    # Plow is transient -- latching either as fatal is the bug #17's own
+    # review caught. Widening the guard past 401 turns these rows red;
+    # removing it turns the 401 row red.
+    pytest.param(403, True, id="forbidden_keeps_retrying"),
+    pytest.param(502, True, id="transient_keeps_retrying"),
+])
+async def test_ticket_mint_status_decides_terminal_vs_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int, retries: bool
 ) -> None:
-    """401 at the ticket mint is terminal, not a blip. The old adapter learned
-    this in production (one WARNING a minute, line dead, adapter reporting
-    itself connected until a human noticed); the loop must stop and say why,
-    because every retry presents the same revoked credential.
-    """
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    calls: list[str] = []
-    session = _Session(calls=calls)
-    session.ticket_status = 401
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: session)
-    with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
-        await adapter._listen()  # returns; raising into the sleep would fail
-    assert "ws_connect" not in calls, calls
-
-
-@pytest.mark.parametrize("status", [502, 403])
-async def test_a_non_401_mint_failure_keeps_retrying(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int
-) -> None:
-    """Only revocation is terminal. A 502 in front of Plow is transient, and a
-    403 is resource-scoped (removed from one chat) -- latching either as fatal
-    is the bug #17's own review caught. Widening the guard past 401 turns the
-    403 row red; removing it turns the revoked-token test red."""
+    """401 at the ticket mint is terminal, not a blip: every retry presents the
+    same revoked credential (observed in production -- one WARNING a minute,
+    line dead, adapter reporting itself connected). Everything else keeps
+    warn-and-retry."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     calls: list[str] = []
     session = _Session(calls=calls)
     session.ticket_status = status
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: session)
-    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
-        with pytest.raises(StopAsyncIteration):
-            await adapter._listen()
+    if retries:
+        with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+            with pytest.raises(StopAsyncIteration):
+                await adapter._listen()
+    else:
+        with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
+            await adapter._listen()  # returns; raising into the sleep would fail
+        assert module._live is None, "a terminal stop must retire the tool handle"
     assert "ws_connect" not in calls, calls
