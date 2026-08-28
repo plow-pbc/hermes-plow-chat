@@ -20,6 +20,11 @@ requires_env:
     secret: false
     password: false
 optional_env:
+  - name: PLOW_STATUS_MESSAGES
+    description: "Set to 'deliver' to text agent status frames into the chat (default: dropped; typing covers the turn)"
+    prompt: "Deliver status frames? (deliver / unset)"
+    secret: false
+    password: false
   - name: PLOW_API_BASE
     description: "API base URL (default: https://api.plow.co)"
     prompt: "Plow API base URL"

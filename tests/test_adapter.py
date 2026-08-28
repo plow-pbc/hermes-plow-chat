@@ -1455,3 +1455,35 @@ def test_an_unwritable_registry_does_not_cost_the_subscription(
                         mock.Mock(side_effect=OSError("read-only volume")))
     adapter._set_reach([_chat("cht_a")])
     assert adapter.chat_uids == frozenset({"cht_a"})
+
+
+async def test_status_frames_are_dropped_unless_the_deployment_opts_into_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes routes agent status callbacks (compaction notices, retry
+    chatter) through send_or_update_status when an adapter provides it;
+    without the hook they fall back to plain send() and land in the owner's
+    iMessage thread as real messages (#30). The contract: dropped by default
+    -- the typing indicator already covers "working" -- reported as success
+    so the gateway never retries, and delivered only when the deployment
+    sets PLOW_STATUS_MESSAGES=deliver."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    status = "✓ Context compaction complete — continuing turn..."
+
+    dropped = await adapter.send_or_update_status("cht_a", "compacted", status)
+    assert dropped.success and http.posts == []
+
+    # Delivery must not eat the typing indicator: a status arrives mid-turn,
+    # and the opted-in deployment gets both signals, not one or the other.
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
+    monkeypatch.setenv("PLOW_STATUS_MESSAGES", "deliver")
+    delivered = await adapter.send_or_update_status("cht_a", "compacted", status)
+    assert delivered.success
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
+    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()

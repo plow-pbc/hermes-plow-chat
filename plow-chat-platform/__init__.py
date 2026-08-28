@@ -484,6 +484,35 @@ class PlowChatAdapter(BasePlatformAdapter):
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, chat_id, {"body": content.strip()})
 
+    async def send_or_update_status(self, chat_id, status_key, content, metadata=None):
+        """Absorb the gateway's agent status frames instead of texting them.
+
+        Hermes routes every status callback (compaction notices, retry
+        chatter, working heartbeats) here when the adapter provides this hook;
+        without it they fall back to plain send() and land in the owner's
+        thread as real iMessages (#30). Dropped by default -- the typing
+        indicator already runs for the whole turn, so "working" is covered --
+        and reported as success so the gateway treats the frame as handled.
+        PLOW_STATUS_MESSAGES=deliver opts a deployment (one agent, one owner)
+        into receiving them as messages. The 💾 background-review summary
+        takes the gateway's plain send() path, not this hook; silence that
+        with display.memory_notifications in the hermes config.
+        """
+        if os.environ.get("PLOW_STATUS_MESSAGES", "").strip().lower() == "deliver":
+            refused = self._send_guard(chat_id)
+            if refused is not None:
+                return refused
+            # Not send(): that cancels the typing indicator, and a mid-turn
+            # status must not eat the "working" signal it rides alongside —
+            # a deployment that opts in gets both, not one or the other.
+            async with aiohttp.ClientSession() as http:
+                return await self._post_message(http, chat_id, {"body": content.strip()})
+        # Key and chat only, never the content: status payloads carry upstream
+        # provider detail with no non-secret guarantee, and this frame exists
+        # to be dropped, not persisted into the journal.
+        log.info("[plow_chat] dropped status frame %r for %s", status_key, chat_id)
+        return SendResult(success=True)
+
     async def _post_message(self, http, chat_id, payload):
         async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
                              json=payload, headers=self.auth) as resp:
