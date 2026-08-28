@@ -193,6 +193,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         next_chats = {chat["uid"]: chat for chat in chats}
         if not next_chats:
             raise RuntimeError("the credential grant has no live chats")
+        # A pending greet for a chat that left the grant dies with the grant:
+        # firing it on a later re-grant would be a wave into a room long after
+        # the meeting it disclosed.
+        self._greet_pending &= next_chats.keys()
         # The home is where cron and default output land. A fallback to "some
         # granted room" pointed the owner's private deliveries at whichever
         # chat the API listed first -- refuse instead; _listen retries, and the
