@@ -89,6 +89,34 @@ so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
 authority stay with the credential's grant. A retitle mid-connection shows up
 on the next reconnect.
 
+## Media
+
+Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`
+as files in the image's own media cache — the same place the bundled iMessage
+adapter puts them, so the vision path and the skills that say "a texted photo
+arrives as a file path" need nothing new. Each part is fetched once, at
+delivery, through the five-minute Plow-signed content URL and without the
+bearer: the signature is the authorization. A part Plow reports as `failed`, or
+one whose bytes cannot be fetched, is named in the turn as
+`[attachment: <type> delivery failed | unavailable]` and logged — never dropped
+with the message.
+
+Outbound files the model emits go through Hermes' `send_image_file` /
+`send_voice` / `send_video` / `send_document` hooks, which this adapter
+implements as the Plow contract — declare the attachment, PUT the bytes to the
+provider's upload URL with exactly the headers Plow returned, then send the
+message with `attachment_uids`. Content types are limited to what the provider
+accepts; a `415` from the declare comes back as the send's error.
+
+Both halves need the attachments API — `plow-pbc/plow#1435`. Against an older
+API the inbound path sees no `attachments` field (a `KeyError`, loud, per
+REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
+the frame loop on every inbound message, so the socket is torn down and
+reconnected every 5s and the phone line is mute until the API catches up:
+`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
+until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+to.
+
 ## One implementation, two delivery paths
 
 This adapter is the only plow_chat implementation. `agent-mgr` installs it into
