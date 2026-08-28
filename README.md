@@ -64,6 +64,12 @@ every reconnect. Per-chat checkpoints persist under the agent home, and a
 reconnect backfills each granted chat from its checkpoint, so a socket gap
 drops nothing.
 
+One person's rapid-fire messages are one turn: inbound is buffered per
+(chat, sender) for a 2s window that resets on each arrival — iMessage's
+bubble + link-preview split, or a thought sent as two lines, reaches hermes
+as a single message instead of the second interrupting the first. The ack is
+the burst's last uid, so a restart mid-burst backfills the whole burst.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from

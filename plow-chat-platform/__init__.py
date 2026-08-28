@@ -4,6 +4,7 @@ Receives granted-scope WSS events and sends replies through the chat REST API.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
+import dataclasses
 import contextvars
 import json
 import logging
@@ -142,6 +143,27 @@ GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
 # with the handler. The send hops back to this loop instead.
 _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 
+# One person's rapid-fire messages are one turn. iMessage splits a single
+# intent into a text bubble and a link preview; people send a thought as two
+# lines. Each used to reach hermes as its own turn, the second interrupting
+# the first. 2s is what plow#442 measured for the bubble/preview split.
+INBOUND_DEBOUNCE_SECONDS = 2.0
+
+
+def _log_burst_failure(task):
+    # A hand-off runs on its own task, so its failure would otherwise be a
+    # silent "exception was never retrieved" at garbage collection.
+    if not task.cancelled() and task.exception():
+        log.error("[plow_chat] burst hand-off failed", exc_info=task.exception())
+
+
+@dataclasses.dataclass
+class _Burst:
+    sender: dict
+    parts: list
+    uids: list
+    task: asyncio.Task | None = None
+
 
 class _PlowAuthError(Exception):
     """The credential itself was refused (401). Terminal: every retry presents
@@ -190,6 +212,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_task = None
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
+        self._bursts = {}                    # (chat uid, sender uid) -> _Burst
         self._boot_greeted = set()
         # One durable owner of recovery state. The file existing means "this
         # agent has taken its baseline"; its CONTENTS mean "and it was this uid",
@@ -355,6 +378,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             _live = None
         if self._ws_task:
             self._ws_task.cancel()
+        for burst in self._bursts.values():
+            burst.task.cancel()
+        self._bursts.clear()
         for chat_uid in tuple(self._typing):
             self._cancel_typing(chat_uid)
         self._mark_disconnected()
@@ -623,7 +649,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         del self._seen_events[:-512]
 
     async def _on_message(self, msg, chat_uid):
-        """One inbound message, from the socket or from the backfill."""
+        """One inbound message, from the socket or from the backfill. Buffered
+        per sender; the burst hands off when the window closes."""
         if msg["direction"] != "inbound":
             return                           # the echo of our own send
         sender = msg["sender"]
@@ -632,7 +659,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             # an outbound agent sender carries a `line` object and NO uid key.
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
-        role = sender["role"]
         # A failed part is a documented state (status "failed", url null), not
         # schema drift; anything else missing should raise, per REVIEW.md.
         attachment_text = "\n".join(
@@ -641,17 +667,34 @@ class PlowChatAdapter(BasePlatformAdapter):
         )
         text = "\n".join(part for part in (msg["body"].strip(), attachment_text) if part)
         uid = msg["uid"]
-        message_key = (chat_uid, uid)
-        if not text or message_key in self._seen:
+        if not text or (chat_uid, uid) in self._seen:
             return
+        key = (chat_uid, sender["uid"])
+        burst = self._bursts.get(key)
+        if burst is None:
+            burst = self._bursts[key] = _Burst(sender=sender, parts=[], uids=[])
+        elif uid in burst.uids:
+            return                           # backfill and socket overlap
+        else:
+            burst.task.cancel()              # still sleeping: dispatch pops the key first
+        burst.parts.append(text)
+        burst.uids.append(uid)
+        burst.task = asyncio.create_task(self._dispatch_burst(key))
+        burst.task.add_done_callback(_log_burst_failure)
+
+    async def _dispatch_burst(self, key):
+        await asyncio.sleep(INBOUND_DEBOUNCE_SECONDS)
+        burst = self._bursts.pop(key)        # from here on, a new arrival is a new burst
+        chat_uid, _ = key
+        sender, role = burst.sender, burst.sender["role"]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
-            text=text,
+            text="\n\n".join(burst.parts),
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id=sender["uid"],
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
-            message_id=uid,
+            message_id=burst.uids[-1],
             channel_prompt=(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
@@ -661,9 +704,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.
-        self._seen.append(message_key)
+        self._seen.extend((chat_uid, uid) for uid in burst.uids)
         del self._seen[:-512]
-        self._checkpoint(uid, chat_uid)
+        self._checkpoint(burst.uids[-1], chat_uid)
 
 
 class _PlowSendError(Exception):

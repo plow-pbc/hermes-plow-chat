@@ -81,7 +81,16 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     # regression pin for the fleet's checkpoint home (the old hardcoded
     # /var/lib/hermes made every fleet anchor raise).
     assert module.CHECKPOINT == tmp_path / "plow_chat_last_uid"
+    # Zero window under test: a burst still hands off on its own task, so a
+    # test awaits `_settle` where it needs the turn to have landed.
+    module.INBOUND_DEBOUNCE_SECONDS = 0
     return module
+
+
+async def _settle(adapter: Any) -> None:
+    """Let every buffered burst hand off to hermes."""
+    while adapter._bursts:
+        await asyncio.gather(*(burst.task for burst in adapter._bursts.values()))
 
 
 class _WS:
@@ -234,8 +243,51 @@ async def test_inbound_media_reaches_hermes(
             attachments=[{"content_type": "image/png", "url": url}],
         )
     )
+    await _settle(adapter)
 
     assert handled[0]["text"] == expected_text
+
+
+@pytest.mark.parametrize(
+    "second_role,turns",
+    [
+        ("owner", [("msg_2", "msg_1\n\nmsg_2")]),
+        ("member", [("msg_1", "msg_1"), ("msg_2", "msg_2")]),
+    ],
+    ids=["same sender -> one turn", "another sender -> its own turn"],
+)
+async def test_a_burst_from_one_sender_is_one_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    second_role: str,
+    turns: list[tuple[str, str]],
+) -> None:
+    """iMessage splits one intent into bubble + link preview; a person sends
+    two lines in a row. Both used to reach hermes as separate turns — the
+    second interrupting the first. Inside the window they are one turn whose
+    ack is the LAST uid, so a restart mid-burst backfills the whole burst."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role=second_role))
+    await adapter._on_frame(_envelope("evt_2_again", "cht_a", "msg_2", role=second_role))
+    assert handled == [], "nothing hands off before the window closes"
+    await _settle(adapter)
+
+    assert [(event["message_id"], event["text"]) for event in handled] == turns
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
+    # A late duplicate of a handed-off message is dropped, not a new turn.
+    await adapter._on_frame(_envelope("evt_1_late", "cht_a", "msg_1"))
+    await _settle(adapter)
+    assert len(handled) == len(turns)
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -321,6 +373,7 @@ async def test_busy_queued_member_turn_uses_its_own_tool_gate_state(
     await adapter._on_frame(_envelope("evt_owner", "cht_a", "msg_owner"))
     await asyncio.wait_for(owner_started.wait(), timeout=1)
     await adapter._on_frame(_envelope("evt_member", "cht_a", "msg_member", role="member"))
+    await _settle(adapter)
     queued_kept_owner_typing = adapter._typing["cht_a"] is typing_tasks["msg_owner"]
     release_owner.set()
     await asyncio.wait_for(turns_done.wait(), timeout=1)
@@ -480,6 +533,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
         await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_duplicate"))
         await adapter._on_frame(_envelope("evt_out", "cht_c", "msg_out"))
         await adapter._on_frame(_envelope("evt_b_member", "cht_b", "msg_b_member", role="member"))
+        await _settle(adapter)
 
     assert [(event["source"]["chat_id"], event["message_id"]) for event in handled] == [
         ("cht_a", "msg_a"),
@@ -624,7 +678,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
 
     monkeypatch.setattr(adapter, "handle_message", reply_from_member_turn)
     await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b", role="member"))
+    await _settle(adapter)                   # same sender: settle, or it is one turn
     await adapter._on_frame(_envelope("evt_no_reply", "cht_b", "msg_no_reply", role="member"))
+    await _settle(adapter)
     results["after_turn"] = await adapter.send("cht_a", "allowed after B")
     results["outside_grant"] = await adapter.send("cht_c", "not granted")
 
