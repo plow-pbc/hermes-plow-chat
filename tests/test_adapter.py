@@ -430,6 +430,42 @@ async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.
     assert (event["text"], event["media_urls"], event["message_id"]) == ("see this", ["/cache/preview.png"], "msg_2")
 
 
+async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A signed url lives five minutes; a hand-off ahead in the chat can stall
+    longer. The fetch is the message's, begun when it arrives -- not the
+    burst's, begun when the chat gets around to it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    entered, release, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    real_get = http.get
+
+    def get(url: str, **kw: Any) -> Any:
+        fetched.set()
+        return real_get(url, **kw)
+
+    http.get = get  # type: ignore[method-assign]
+    handled: list[str] = []
+
+    async def stalled_first_turn(event: Any) -> None:
+        entered.set()
+        await release.wait()
+        handled.append(event.message_id)
+
+    monkeypatch.setattr(adapter, "handle_message", stalled_first_turn)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await entered.wait()                     # msg_1 is in flight and stuck
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="", attachments=[_attachment()]))
+    await asyncio.wait_for(fetched.wait(), timeout=1)   # while the chat is still stuck on msg_1
+    release.set()
+    await _settle(adapter)
+
+    assert handled == ["msg_1", "msg_2"]
+
+
 @pytest.mark.parametrize(
     "second_role,turns",
     [
