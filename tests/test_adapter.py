@@ -751,6 +751,17 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
 
+    # `cht_c` is outside the grant, and an unknown chat now costs one grant
+    # re-read before it is refused -- the seam that adopts a chat created after
+    # connect. This answers that read without it, so the drop below still holds.
+    class _GrantOnlyHTTP(_HTTP):
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            return _Resp({"object": "list",
+                          "data": [_chat("cht_a"), _chat("cht_b", name="Project room", group=True)],
+                          "has_more": False})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _GrantOnlyHTTP())
+
     handled = _capture_events(monkeypatch, adapter)
     with caplog.at_level(logging.WARNING):
         await adapter._on_frame(_envelope("evt_a", "cht_a", "msg_a"))
@@ -1455,3 +1466,71 @@ def test_an_unwritable_registry_does_not_cost_the_subscription(
                         mock.Mock(side_effect=OSError("read-only volume")))
     adapter._set_reach([_chat("cht_a")])
     assert adapter.chat_uids == frozenset({"cht_a"})
+
+
+async def test_a_chat_created_after_connect_is_adopted_from_its_first_frame(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The socket is account-scoped, so a group the owner opens mid-session
+    arrives on a chat this adapter read its grant before. Dropping that frame
+    lost the room's every message until the next gateway restart -- the trace
+    was one WARNING, and the room read as an agent ignoring it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    grant_reads = 0
+
+    class _AdoptHTTP(_HTTP):
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            nonlocal grant_reads
+            if "/messages" in url:
+                return _Resp({"data": [{"uid": "msg_new"}], "has_more": False})
+            grant_reads += 1
+            return _Resp({"object": "list",
+                          "data": [_chat("cht_a"), _chat("cht_new", group=True)],
+                          "has_more": False})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _AdoptHTTP())
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame(_envelope("evt_1", "cht_new", "msg_new", body="hello from the group"))
+    await _settle(adapter)
+
+    assert [e.text for e in handled] == ["hello from the group"]
+    assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
+    # Baselined on adoption, exactly as a tool-created chat is: without it the
+    # next reconnect would anchor over everything handled since.
+    assert adapter._anchored_chats.get("cht_new") is True
+    assert grant_reads == 1
+
+
+async def test_a_chat_outside_the_grant_costs_one_read_however_long_it_talks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sibling agent's room on a shared line is refused, and stays refused --
+    re-reading the grant per frame would turn one busy room into a request
+    storm against the chats endpoint."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    grant_reads = 0
+
+    class _RefuseHTTP(_HTTP):
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            nonlocal grant_reads
+            grant_reads += 1
+            return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _RefuseHTTP())
+    handled = _capture_events(monkeypatch, adapter)
+
+    for n in range(4):
+        await adapter._on_frame(_envelope(f"evt_{n}", "cht_theirs", f"msg_{n}"))
+    await _settle(adapter)
+
+    assert handled == []
+    assert grant_reads == 1
+    # A grant that actually changes clears the memo, so a chat added later is
+    # adopted without a restart.
+    adapter._set_reach([_chat("cht_a"), _chat("cht_theirs")])
+    assert adapter._refused_chats == set()

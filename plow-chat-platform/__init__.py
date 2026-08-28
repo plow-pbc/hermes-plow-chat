@@ -269,6 +269,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
+        # Chats the socket carries that this credential does not cover, so one
+        # sibling room cannot buy a grant read per message. `_set_reach` clears it.
+        self._refused_chats = set()
         self._chats = {
             self.home_chat_uid: {
                 "uid": self.home_chat_uid,
@@ -351,6 +354,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                 f"configured home {self._configured_home_chat_uid} is not in the "
                 "credential grant -- fix PLOW_HOME_CHANNEL or the grant")
         next_home = self._configured_home_chat_uid
+        if next_chats.keys() != self.chat_uids:
+            # The grant moved, so a chat refused against the old one may be in
+            # this one. Cleared only on a real change: clearing on every read
+            # would undo `_adopt`'s memo and put a refresh back on every frame.
+            self._refused_chats.clear()
         for chat_uid in self.chat_uids - next_chats.keys():
             self._cancel_typing(chat_uid)
         self.home_chat_uid = next_home
@@ -769,11 +777,52 @@ class PlowChatAdapter(BasePlatformAdapter):
                 self._mark_disconnected()
             await asyncio.sleep(5)
 
+    async def _adopt(self, chat_uid):
+        """Re-read the grant for a chat the socket knows about and we do not.
+
+        The ticket is account-scoped, so the socket carries every chat the
+        credential covers -- including one created after this connection
+        opened, which is what an owner starting a group mid-session produces.
+        Reach was read once, at connect, so that chat is not in `chat_uids`
+        and every frame it ever sends was dropped until the next restart. The
+        messages are not replayable and the only trace is a WARNING, so the
+        room reads as an agent that ignores it.
+
+        Same two steps `start_group_thread` uses for a chat this agent creates
+        -- refresh, then baseline -- because it is the same adoption. Anchoring
+        does not cost the frame that triggered it: the baseline gates
+        `_backfill`, never the socket, and the caller goes on to handle this
+        message. It is also what sends the first-meeting disclosure into a room
+        the owner just opened.
+
+        Once per unknown chat, not once per frame. A chat genuinely outside the
+        grant -- a sibling agent's room on a shared line -- must cost one
+        refresh, not one for every message it carries while it keeps talking.
+        `_set_reach` clears the memo whenever the grant actually changes, so a
+        chat added later is still adopted without a restart.
+        """
+        if chat_uid in self._refused_chats:
+            return False
+        try:
+            async with aiohttp.ClientSession() as http:
+                await self._refresh_reach(http)
+                if chat_uid not in self.chat_uids:
+                    self._refused_chats.add(chat_uid)
+                    return False
+                await self._ensure_anchor(http, chat_uid)
+        except _PlowAuthError:
+            raise                            # terminal; _listen owns the stop
+        except Exception as exc:             # noqa: BLE001 - drop this frame; the reconnect retries
+            log.warning("[plow_chat] adopting %s failed: %s", chat_uid, type(exc).__name__)
+            return False
+        log.info("[plow_chat] adopted %s from the socket", chat_uid)
+        return True
+
     async def _on_frame(self, frame):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
-        if chat_uid not in self.chat_uids:
+        if chat_uid not in self.chat_uids and not await self._adopt(chat_uid):
             log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
             return
         if frame["event_type"] != "message_received":
