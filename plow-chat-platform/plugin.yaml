@@ -1,50 +1,27 @@
 name: plow-chat-platform
 label: Plow Chat
 kind: platform
-version: 0.2.0
+version: 2.0.0
 description: >
   Plow Chat gateway adapter for Hermes Agent. Registers a Hermes platform named
-  plow_chat backed by the Plow Chat REST API and WebSocket stream.
+  plow_chat backed by the Plow Chat REST API and a granted-scope WebSocket
+  stream: chat membership comes from the credential's grants, not client-side
+  configuration.
 author: Plow / Hermes Agent seed
 requires_env:
-  - name: PLOW_CHAT_CHAT_UID
-    description: "Plow chat uid, e.g. cht_..."
-    prompt: "Plow chat uid"
-    secret: false
-    password: false
-  - name: PLOW_CHAT_TOKEN
-    description: "Plow session Bearer token returned by activation redeem"
-    prompt: "Plow session token"
+  - name: PLOW_AGENT_TOKEN
+    description: "Chat-scoped agent bearer token minted by Plow"
+    prompt: "Plow agent token"
     secret: true
     password: true
-optional_env:
-  - name: PLOW_CHAT_BASE_URL
-    description: "API base URL (default: https://api.plow.co)"
-    prompt: "Plow Chat base URL"
-    secret: false
-    password: false
-  - name: PLOW_CHAT_GROUP_UIDS
-    description: "Names and authorizes group chats, comma-separated `<cht_ id>=<display name>`. Group chats are handled by default; this does not enable or disable discovery."
-    prompt: "Plow group chats"
-    secret: false
-    password: false
-  - name: PLOW_CHAT_HOME_CHANNEL
-    description: "Default delivery chat uid (defaults to PLOW_CHAT_CHAT_UID)"
+  - name: PLOW_HOME_CHANNEL
+    description: "Home chat uid (cht_...) used for cron and default delivery"
     prompt: "Home chat uid"
     secret: false
     password: false
-  - name: PLOW_CHAT_WELCOME_MESSAGE
-    description: "Optional setup-success message sent once when Plow emits chat_active"
-    prompt: "Welcome message"
-    secret: false
-    password: false
-  - name: PLOW_CHAT_AUTO_WELCOME
-    description: "Set false to disable the automatic chat_active welcome message"
-    prompt: "Auto welcome enabled"
-    secret: false
-    password: false
-  - name: PLOW_CHAT_AUTO_APPROVE_PAIRING
-    description: "Set false to disable best-effort approval of verified Plow members in Hermes pairing"
-    prompt: "Auto approve pairing enabled"
+optional_env:
+  - name: PLOW_API_BASE
+    description: "API base URL (default: https://api.plow.co)"
+    prompt: "Plow API base URL"
     secret: false
     password: false
