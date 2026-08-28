@@ -1294,6 +1294,7 @@ def test_a_failed_handshake_does_not_write_the_ticket_to_the_log(monkeypatch, ca
     """
     ticket = "tkt_live_value_do_not_log"
     a = _adapter(monkeypatch)
+    a._seen["cht_home"] = {}   # past first contact; the handshake is the subject
 
     def fail_handshake(url, **kwargs):
         raise RuntimeError(
@@ -1396,7 +1397,7 @@ def test_a_corrupt_record_puts_every_chat_back_in_anchor_posture(
     # newborn claim.
     a._chat_created["cht_new"] = "2026-08-15T00:00:00Z"
     a._http_session = PagingSession({"/v1/chats/cht_new/messages": [_msg("m1", chat_uid="cht_new")]})
-    asyncio.run(a._backfill("cht_new"))
+    asyncio.run(a._first_contact("cht_new"))
     assert a.handled == []
 
 
@@ -1451,7 +1452,7 @@ def test_a_first_sight_chat_anchors_without_replaying_its_history(
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": history})
 
-    asyncio.run(a._anchor("cht_a"))
+    asyncio.run(a._first_contact("cht_a"))
 
     assert list(a._seen.get("cht_a", {})) == expected
     assert a.handled == []
@@ -1477,55 +1478,42 @@ def test_the_epoch_is_server_time_so_no_startup_chat_can_outdate_it(monkeypatch)
         "/v1/chats/cht_a/messages": [_msg("m1", "pre-install", chat_uid="cht_a")],
     })
 
-    asyncio.run(a._backfill("cht_b"))   # the first write stamps the epoch
-    asyncio.run(a._backfill("cht_a"))   # older sibling: inventory, not newborn
+    asyncio.run(a._first_contact("cht_b"))   # the first write stamps the epoch
+    asyncio.run(a._first_contact("cht_a"))   # older sibling: inventory, not newborn
 
     assert a._epoch == "2026-08-25T00:00:00Z"
     assert a.handled == [], "nothing in the startup inventory replays"
 
 
-def test_a_chat_born_during_a_gap_replays_its_whole_catalogue(monkeypatch, tmp_path):
-    """The goal case: the operator created a group while the agent had no
-    socket. Its created_at postdates the record's epoch, so the catalogue IS
-    the gap — replayed oldest-first instead of being anchored away."""
-    _record(tmp_path)
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._chat_created["cht_a"] = "2026-08-02T00:00:00Z"
-    # Newest-first, as the API answers.
-    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
-        _msg("msg_2", "second"), _msg("msg_1", "first"),
-    ]})
-
-    asyncio.run(a._backfill("cht_a"))
-
-    assert [e.text for e in a.handled] == ["first", "second"]
-    assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
-    # And the adoption survives a restart even before the next dispatch.
-    assert "cht_a" in _adapter(monkeypatch)._seen
-
-
-@pytest.mark.parametrize("created", [
-    "2026-07-01T00:00:00Z",   # a standing thread this line was added to
-    None,                     # a chat the poll has not dated
+@pytest.mark.parametrize(("created", "expected"), [
+    # Born after the epoch — the goal case: the operator created a group while
+    # the agent had no socket, so the catalogue IS the gap, replayed
+    # oldest-first (the API answers newest-first).
+    ("2026-08-02T00:00:00Z", ["first", "second"]),
+    # A standing thread this line was added to: inheritance, not a gap —
+    # replaying it re-answers conversations that were already had.
+    ("2026-07-01T00:00:00Z", []),
+    # A chat the poll has not dated: no date, no newborn claim.
+    (None, []),
 ])
-def test_a_chat_that_predates_the_record_anchors_not_replays(
-    monkeypatch, tmp_path, created
-):
-    """First contact with anything older than the record — or undatable — is
-    inheritance, not a gap: replaying it re-answers conversations that were
-    already had (or fires an adopted thread's history at the agent)."""
+def test_first_contact_uses_the_record_epoch(monkeypatch, tmp_path, created, expected):
+    """One lifecycle rule, run through the real sequence — the pre-socket
+    first-contact decision, then the connected walk."""
     _record(tmp_path)
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     if created:
         a._chat_created["cht_a"] = created
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
-        _msg("msg_2", "already had"), _msg("msg_1", "also had"),
+        _msg("msg_2", "second"), _msg("msg_1", "first"),
     ]})
 
+    asyncio.run(a._first_contact("cht_a"))
     asyncio.run(a._backfill("cht_a"))
 
-    assert a.handled == []
+    assert [e.text for e in a.handled] == expected
     assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
+    # And the decision survives a restart even before the next dispatch.
+    assert "cht_a" in _adapter(monkeypatch)._seen
 
 
 def test_backfill_replays_the_gap_oldest_first(monkeypatch):
@@ -1629,7 +1617,7 @@ def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypa
 
     session = CursorPagingSession({None: (history[:], True)})
     a._http_session = session
-    asyncio.run(a._anchor("cht_a"))
+    asyncio.run(a._first_contact("cht_a"))
     assert a.handled == [], "adoption dispatches nothing"
 
     # One new message arrives on top of the page that was anchored.
@@ -1687,8 +1675,11 @@ def test_a_page_that_does_not_advance_raises_instead_of_spinning(monkeypatch):
 
 
 def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
-    """Backfill runs AFTER the socket is up, so anything landing mid-backfill
-    arrives over the socket and the same record absorbs the overlap."""
+    """First contact is settled BEFORE the socket exists — anchoring from
+    inside a connected one let a live turn enter the snapshot and lose its own
+    frame to the uid dedupe. Backfill runs AFTER the socket is up, so anything
+    landing mid-backfill arrives over the socket and the same record absorbs
+    the overlap."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     order = []
 
@@ -1714,6 +1705,11 @@ def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
 
     a._mint_ws_ticket = _mint
 
+    async def _first_contact(chat_uid):
+        order.append("first-contact")
+
+    a._first_contact = _first_contact
+
     async def _backfill(chat_uid):
         order.append(f"backfilled:{chat_uid}")
 
@@ -1726,13 +1722,16 @@ def test_reconnecting_backfills_before_serving_live_frames(monkeypatch):
 
     asyncio.run(a._websocket_loop("cht_home"))
 
-    assert order == ["connected", "backfilled:cht_home"]
+    assert order == ["first-contact", "connected", "backfilled:cht_home"]
 
 
 def test_a_failing_backfill_still_serves_live_frames(monkeypatch, caplog):
     """Losing a replay costs a late answer; losing the socket costs every
     answer. A deterministic backfill failure must not mute the room."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
+    # Past first contact already — the pre-socket decision is a separate
+    # gate, and an unresolved one keeps the socket closed by design.
+    a._seen["cht_home"] = {}
 
     class Socket:
         async def __aenter__(self):

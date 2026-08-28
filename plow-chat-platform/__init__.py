@@ -549,19 +549,25 @@ class PlowChatAdapter(BasePlatformAdapter):
         _live = (self, asyncio.get_running_loop())
         self._http_session = aiohttp.ClientSession()
         self._stop_event.clear()
-        # One socket per chat: a ws ticket is scoped to a single chat, so reach is
-        # the number of sockets. Reach is {home} at this point on every path — the
-        # poll below is what adds the rest, and it adds their sockets with them.
-        self._ws_tasks = {
-            uid: asyncio.create_task(self._websocket_loop(uid)) for uid in self.chat_uids
-        }
-        # Once, before returning: reach and authority both come from this call, so
-        # a delivery aimed at a group in the first seconds after a restart would
-        # otherwise fail as an unknown destination.
+        # The poll runs BEFORE any socket exists, for two reasons. Reach and
+        # authority both come from it, so a delivery aimed at a group in the
+        # first seconds after a restart would otherwise fail as an unknown
+        # destination. And every socket loop opens with a first-contact
+        # decision that reads the creation dates this poll collects — dated
+        # after the record's epoch means newborn, replay — so a socket started
+        # first could stamp the epoch from the local-clock fallback before any
+        # chat is dated.
         try:
             await self._reconcile_once()
         except Exception as exc:
             logger.warning("[plow_chat] initial reconcile failed: %s", exc)
+        # One socket per chat: a ws ticket is scoped to a single chat, so reach
+        # is the number of sockets. The poll's _set_reach socketed only what it
+        # *added*; home — in reach on every path, even when that poll failed —
+        # is socketed here.
+        for uid in self.chat_uids:
+            if uid not in self._ws_tasks:
+                self._ws_tasks[uid] = asyncio.create_task(self._websocket_loop(uid))
         self._reconcile_task = asyncio.create_task(self._reconcile())
         return True
 
@@ -980,6 +986,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         backoff = 1.0
         while not self._stop_event.is_set():
             try:
+                # First contact is settled while there is still no socket.
+                # Anchoring from inside a connected one let a turn arriving
+                # after the connect enter the snapshot — persisted without
+                # dispatch, its own live frame then swallowed by the uid
+                # dedupe. Out here that window does not exist: anything
+                # landing after the snapshot is unseen, and the walk below
+                # replays it like any other gap. A failure retries behind the
+                # same backoff with nothing half-open.
+                await self._first_contact(chat_uid)
                 ticket = await self._mint_ws_ticket(chat_uid)
                 ws_url = _ws_url_for(self.base_url, ticket)
                 async with self._http_session.ws_connect(ws_url, heartbeat=30) as ws:
@@ -1046,15 +1061,30 @@ class PlowChatAdapter(BasePlatformAdapter):
         ) as resp:
             return await _body(resp)
 
-    async def _anchor(self, chat_uid: str) -> None:
-        """Mark a first-contact chat's current history as seen, dispatching nothing.
+    async def _first_contact(self, chat_uid: str) -> None:
+        """Decide, once per chat and before its socket exists, what history is owed.
 
-        For every chat that predates the record — the whole inventory on a
-        fresh install, a standing thread this line was added to, anything whose
-        creation the poll has not dated. Replaying one of those re-answers
-        conversations that were already had; the newborn case that genuinely
-        deserves replay is decided in _backfill, on the chat's own created_at.
+        A chat created after the record's epoch is a newborn — this agent
+        should have been listening from its first message, so its entire
+        catalogue is the gap: it is adopted with an empty seen-set and the
+        connected walk replays everything, bounded by the same backstop as any
+        other gap. Everything else — the whole inventory on a fresh install
+        (no epoch yet), a standing thread this line was added to, a chat the
+        poll has not dated — anchors: its current history is marked seen,
+        dispatching nothing, because a duplicated answer in a room of real
+        people costs more than a late one.
         """
+        # Deliberately not cleared when a chat leaves reach, unlike its vouch
+        # and its socket: a vouch is a grant that must not outlive the room,
+        # while what this agent has already answered is a fact that does not
+        # expire. Dropping it would make a chat that flaps out of a paged
+        # listing and back re-answer everything it had already handled.
+        if chat_uid in self._seen:
+            return
+        created = self._chat_created.get(chat_uid) or ""
+        if self._epoch is not None and created > self._epoch:
+            self._mark_seen(chat_uid, [])
+            return
         page = (await self._messages_page(chat_uid, None)).get("data") or []
         self._mark_seen(chat_uid, [m["uid"] for m in page])
 
@@ -1079,29 +1109,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         seconds.
 
         Runs AFTER the socket is connected: anything arriving mid-backfill then
-        comes over the socket too, and the same set absorbs the overlap.
+        comes over the socket too, and the same set absorbs the overlap. First
+        contact was settled before that socket existed, so the chat is always
+        in the record here — a missing entry is a caller's bug and raises.
         """
-        # Deliberately not cleared when a chat leaves reach, unlike its vouch and
-        # its socket: a vouch is a grant that must not outlive the room, while
-        # what this agent has already answered is a fact that does not expire.
-        # Dropping it would make a chat that flaps out of a paged listing and
-        # back re-answer everything it had already handled.
-        if chat_uid not in self._seen:
-            # First contact. A chat created after the record's epoch is a
-            # newborn — this agent should have been listening from its first
-            # message, so its entire catalogue is the gap: adopt it with an
-            # empty seen-set and let the walk below replay everything, bounded
-            # by the same backstop as any other gap. Everything else — the
-            # fresh-install inventory (no epoch yet), a standing thread this
-            # line was added to, a chat the poll has not dated — anchors: a
-            # duplicated answer in a room of real people costs more than a
-            # late one.
-            created = self._chat_created.get(chat_uid) or ""
-            if self._epoch is not None and created > self._epoch:
-                self._mark_seen(chat_uid, [])
-            else:
-                await self._anchor(chat_uid)
-                return
         missed: list[dict] = []
         cursor: Optional[str] = None
         for _ in range(MAX_BACKFILL_PAGES):
