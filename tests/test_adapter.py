@@ -874,7 +874,7 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
             with pytest.raises(StopAsyncIteration):
                 await adapter._listen()
     else:
-        module._live = (adapter, None)  # published, as connect() would have
+        monkeypatch.setattr(module, "_live", (adapter, None))  # published, as connect() would have
         with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"
