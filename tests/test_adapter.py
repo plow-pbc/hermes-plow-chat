@@ -599,6 +599,57 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     assert sorted(greetings) == ["cht_a", "cht_b"], "each chat is latched before its one greeting attempt"
     assert {url.split("/v1/chats/")[1].split("/")[0] for url in http.gets} == {"cht_a", "cht_b"}
 
+    # A NEW process over the same checkpoints must not greet again: the wave is
+    # a first-meeting disclosure, and an in-memory latch alone re-sent it to
+    # every granted chat on every gateway restart.
+    restarted = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    restarted._set_reach([_chat("cht_a"), _chat("cht_b")])
+    monkeypatch.setattr(restarted, "send", greet)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await restarted._listen()
+    assert sorted(greetings) == ["cht_a", "cht_b"], "a restart re-greeted an already-met chat"
+
+
+async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The startup loop and a tool adoption can find the same brand-new chat at
+    once; _ensure_anchor's lock, re-checked inside, is what keeps the
+    disclosure wave to one send (and one checkpoint write)."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+
+    class _YieldingResp(_Resp):
+        async def __aenter__(self) -> "_Resp":
+            # A reach rebuild lands mid-anchor, then control passes to the
+            # racing discoverer -- the two interleavings the lock must absorb.
+            adapter._set_reach([_chat("cht_a")])
+            await asyncio.sleep(0)
+            return self
+
+    class _HTTPStub:
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            return _YieldingResp({"data": [{"uid": "msg_1"}], "has_more": False})
+
+    sends: list[str] = []
+
+    async def send(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        sends.append(chat_id)
+        return _SendResult(success=True)
+
+    monkeypatch.setattr(adapter, "send", send)
+    http = _HTTPStub()
+
+    async def discover() -> None:
+        await adapter._ensure_anchor(http, "cht_a")
+
+    await asyncio.gather(discover(), discover())
+    assert sends == ["cht_a"], "concurrent discovery double-sent the disclosure wave"
+    assert adapter._load_checkpoint("cht_a") == "msg_1"
+
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(
     monkeypatch: pytest.MonkeyPatch,
@@ -878,9 +929,16 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
     data = await adapter.start_group_thread("+15550001111", "hello")
 
+    # The linq send, then the first-meeting 👋 the adoption anchor fires --
+    # the greeting rides the anchor, so a tool-created chat is disclosed even
+    # though the socket is already up.
     assert posts == [(
         f"{module.BASE}/channels/linq/send",
         {"thread_handle": "+15550001111", "text": "hello"},
+        adapter.auth,
+    ), (
+        f"{module.BASE}/v1/chats/cht_new/messages",
+        {"body": "👋"},
         adapter.auth,
     )]
     assert data["adoption"] == "adopted"
