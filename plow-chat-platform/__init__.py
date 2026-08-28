@@ -201,8 +201,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.home_chat_uid = next_home
         self._chats = next_chats
         self.chat_uids = frozenset(next_chats)
+        # OR with the in-memory claim: an anchor in flight has claimed its chat
+        # before its checkpoint exists on disk, and a reach rebuild that reads
+        # only the disk would un-claim it mid-anchor -- reopening the
+        # double-greet race the claim exists to close.
         self._anchored_chats = {
-            chat_uid: self._checkpoint_path(chat_uid).exists()
+            chat_uid: self._anchored_chats.get(chat_uid, False)
+            or self._checkpoint_path(chat_uid).exists()
             for chat_uid in self.chat_uids
         }
         self._last_uids = {
