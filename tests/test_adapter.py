@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import pathlib
 import sys
@@ -886,3 +887,101 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"
     assert "ws_connect" not in calls, calls
+
+
+# ---------------------------------------------------------------------------
+# Naming: publish granted-thread titles into the image's alias registry
+# (re-port of #14's naming slice onto the credential-scope adapter)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chat,expected", [
+    # Plow's own answer -- the iMessage thread title -- always uid-suffixed.
+    (_chat("cht_x", name="Snoqualmie Cabin Cleaning Thread"),
+     "Snoqualmie Cabin Cleaning Thread (cht_x)"),
+    # Sparse: absent, empty, and whitespace all mean "nobody titled it".
+    (_chat("cht_x"), "cht_x"),
+    (_chat("cht_x", name=""), "cht_x"),
+    (_chat("cht_x", name="   "), "cht_x"),
+])
+def test_a_chat_is_named_from_its_own_title_or_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    chat: dict[str, Any],
+    expected: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._resolve_chat_names([chat], "cht_home")[chat["uid"]] == expected
+
+
+def test_the_home_chat_keeps_its_name_and_no_title_can_take_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The home is the one fixed, unsuffixed name. A title is chosen by whoever
+    is in the thread, so the uid suffix is what makes a title incapable of
+    equalling another room's name -- including the home's."""
+    module = _load(monkeypatch, tmp_path)
+    chats = [_chat("cht_home", name="Renamed By Someone"),
+             _chat("cht_impostor", name="Plow Chat")]
+    names = module._resolve_chat_names(chats, "cht_home")
+    assert names["cht_home"] == "Plow Chat"
+    assert names["cht_impostor"] == "Plow Chat (cht_impostor)"
+
+
+def test_publishing_names_owns_one_key_and_leaves_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The file is shared with every other platform on the gateway: replace our
+    key wholesale (stale entries are how names rot) and touch nothing else."""
+    module = _load(monkeypatch, tmp_path)
+    path = tmp_path / "channel_aliases.json"
+    path.write_text(json.dumps({"telegram": {"1": "Ops"},
+                                "plow_chat": {"cht_stale": "Old Name"}}))
+    module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
+    assert json.loads(path.read_text()) == {
+        "telegram": {"1": "Ops"},
+        "plow_chat": {"cht_a": "Cleaning (cht_a)"},
+    }
+
+
+def test_a_corrupt_alias_file_is_not_clobbered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    path = tmp_path / "channel_aliases.json"
+    path.write_text("[]")
+    with pytest.raises(ValueError):
+        module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
+    assert path.read_text() == "[]"
+
+
+def test_reach_publishes_the_names_it_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Writing the registry is the whole feature: the image re-applies the
+    overlay on every directory build and load, which is what makes a granted
+    thread addressable as plow_chat:#<name> before it has ever spoken."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Cleaning", group=True)])
+    data = json.loads((tmp_path / "channel_aliases.json").read_text())
+    assert data["plow_chat"] == {"cht_a": "Plow Chat", "cht_b": "Cleaning (cht_b)"}
+
+
+def test_an_unwritable_registry_does_not_cost_the_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Naming is cosmetic where reach is the credential grant. A registry that
+    cannot be written must not fail _set_reach, or one read-only file tears
+    down the line it decorates."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    monkeypatch.setattr(module, "_write_channel_aliases",
+                        mock.Mock(side_effect=OSError("read-only volume")))
+    adapter._set_reach([_chat("cht_a")])
+    assert adapter.chat_uids == frozenset({"cht_a"})

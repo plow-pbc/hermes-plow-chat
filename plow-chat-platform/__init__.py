@@ -25,7 +25,69 @@ PLATFORM_NAME = "plow_chat"
 # on the fleet does not exist and made every anchor raise (agents connected,
 # then tore the socket down five seconds later, mute).
 CHECKPOINT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes") / "plow_chat_last_uid"
+HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
+
+
+def _resolve_chat_names(chats, home_uid):
+    """uid -> display name for the alias registry.
+
+    The home chat keeps the one fixed, unsuffixed name. Every other chat is
+    named from its `display_name` -- Plow's own answer, the iMessage thread
+    title -- and is *always* published with its uid appended. That suffix is
+    what makes this safe rather than tidy: a title is chosen by whoever is in
+    the thread, and the image's resolver takes the first match, so an
+    unsuffixed title is a name an outsider can pick. Appending the uid makes
+    every derived name unique by construction -- no ordering, history, or
+    across-reconnect state has to be kept to hold that true. It stays
+    addressable, because the resolver falls back to an unambiguous prefix
+    match: `plow_chat:#Snoqualmie Cabin Cleaning` still reaches
+    `Snoqualmie Cabin Cleaning (cht_...)`.
+
+    A thread with no title is its uid; titling it in iMessage is how it gets a
+    name. Participant-derived names are deliberately absent: the directory is
+    listable by any member holding tool authority, so a name built from
+    participants would publish one room's handles to another room's members.
+    """
+    names = {}
+    for chat in chats:
+        uid = chat["uid"]
+        if uid == home_uid:
+            names[uid] = HOME_CHAT_NAME
+            continue
+        title = (chat.get("display_name") or "").strip()
+        names[uid] = f"{title} ({uid})" if title else uid
+    return names
+
+
+def _write_channel_aliases(names):
+    """Publish our names into the image's own friendly-name registry.
+
+    Not a registry of our own: the image re-applies this overlay on every
+    directory build *and* every load, and injects an entry for an id that has
+    produced no traffic yet -- which is what makes a granted thread
+    addressable by name before it has ever spoken. `send_message` resolves
+    `#name` against the result, and `action="list"` reads it, so writing here
+    is the whole feature.
+
+    The file is shared with every other platform on the gateway, so we replace
+    our own key and leave the rest exactly as we found it. A file we cannot
+    parse is left alone rather than overwritten -- the caller logs it every
+    pass until someone fixes it.
+    """
+    path = CHECKPOINT.parent / "channel_aliases.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    data[PLATFORM_NAME] = names
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
 _MEMBER_TOOL_BLOCK = {"action": "block", "message": "tools are unavailable on this turn"}
 REPLY_TARGET_PROMPT = (
@@ -210,6 +272,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             chat_uid: self._load_checkpoint(chat_uid)
             for chat_uid in self.chat_uids
         }
+        # Published last and isolated: naming is cosmetic where reach is the
+        # credential grant, so a registry that cannot be written must not cost
+        # the subscription.
+        try:
+            _write_channel_aliases(_resolve_chat_names(next_chats.values(), next_home))
+        except Exception as exc:             # noqa: BLE001 - cosmetic
+            log.warning("[plow_chat] channel alias publish failed: %s", type(exc).__name__)
 
     async def _refresh_reach(self, http):
         """Discover the token's grant-scoped reach. The home is fixed by
@@ -392,7 +461,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat = self._chats[chat_id]
         member_count = sum(participant.get("type") == "member" for participant in chat["participants"])
         chat_type = "group" if member_count > 1 else "dm"
-        name = chat.get("display_name") or (chat_id if chat_type == "group" else "Plow Chat")
+        name = chat.get("display_name") or (chat_id if chat_type == "group" else HOME_CHAT_NAME)
         return {"name": name, "type": chat_type, "chat_id": chat_id}
 
     async def _anchor(self, http, chat_uid):
