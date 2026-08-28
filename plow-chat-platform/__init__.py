@@ -6,10 +6,6 @@ what `agent-mgr` installs into every agent in the fleet -- it is the phone line,
 not a sketch of one. Inbound arrives on a WebSocket this dials out on; outbound
 and cron delivery go back through the chat REST API. Covered by tests/.
 
-One known gap, tracked rather than hidden: there is no persisted checkpoint and
-no history backfill, so turns that arrive while the socket is down are not
-recovered. See issue #2 in this repo -- plow's own tenant adapter has the solved
-form.
 """
 
 from __future__ import annotations
@@ -482,20 +478,17 @@ class PlowChatAdapter(BasePlatformAdapter):
         # answers to "have I handled this", and every way they disagreed was a
         # message either dropped or answered twice.
         self._seen: dict[str, dict[str, None]] = {}
-        # Resolved once, here, so there is exactly one answer to "where does
-        # state live" and a missing setting is a startup failure with a name on
-        # it. Read per call it was worse than useless: the load path caught the
-        # KeyError and warned benignly, then every dispatched message raised the
-        # same KeyError past handle_message into the socket's generic handler,
-        # tearing the connection down and re-backfilling once per inbound
-        # message. A required setting must stop the agent, not flap it.
-        try:
-            self._state_root = pathlib.Path(os.environ["HERMES_HOME"])
-        except KeyError:
-            raise RuntimeError(
-                "HERMES_HOME is unset; the Plow Chat adapter stores its message "
-                "cursor there and cannot tell a first run from a lost one without it"
-            ) from None
+        # When each chat was created, from the reconcile poll's own listing —
+        # the lifecycle signal that decides replay-vs-anchor on first contact.
+        self._chat_created: dict[str, str] = {}
+        # The gateway's one state-root seam, same as the alias overlay below and
+        # every other file the image persists. Resolved once, at construction:
+        # read per call, a failing resolution surfaced as a KeyError per inbound
+        # message, tearing the socket down once per turn instead of failing the
+        # start.
+        from hermes_cli.config import get_hermes_home
+
+        self._state_root = get_hermes_home()
         self._load_seen()
         self._stop_event = asyncio.Event()
         # The 60s poll and the tool's post-send pass both reconcile. Without this
@@ -826,6 +819,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                     chats.append(chat)
                 else:
                     logger.warning("[plow_chat] skipping listing entry with no uid")
+            # update(), never replace: a chat that scrolls off a truncated page
+            # keeps its date, the same way reach survives paging. The walk's
+            # newborn decision reads this — an undated chat anchors.
+            self._chat_created.update(
+                {c["uid"]: c["created_at"] for c in chats if c.get("created_at")})
             home = [chat for chat in chats if chat["uid"] == self.chat_uid]
             if not home:
                 # The home chat anchors both halves of this: which line is ours, and who
@@ -1048,33 +1046,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         ) as resp:
             return await _body(resp)
 
-    async def _first_contact(self, chat_uid: str) -> None:
-        """Replay a chat this record has never seen, or anchor it.
+    async def _anchor(self, chat_uid: str) -> None:
+        """Mark a first-contact chat's current history as seen, dispatching nothing.
 
-        A chat can be absent from the record for two reasons, and they pull in
-        opposite directions. Created while this agent had no socket — and its
-        short catalogue IS the gap: dropping it is exactly the loss this file
-        exists to close, and it is the first thing an operator's brand-new
-        group thread does. Or it predates the record — a fresh install, a
-        thread this line was added to — and replaying that history re-answers
-        conversations that were already had.
-
-        Two signals separate them, and replay needs both. A record that
-        existed at load means this agent has been live before, so a chat it
-        never recorded is new, not inherited — and a fresh install anchors
-        everything exactly once, instead of firing each standing thread's
-        catalogue at the agent on deploy day. And a catalogue that overflows
-        one page is history, not a gap — no outage this feature can recover
-        from accumulates PAGE_SIZE turns in a single thread. Everything else
-        anchors: a duplicated answer in a room of real people costs more than
-        a late one.
+        For every chat that predates the record — the whole inventory on a
+        fresh install, a standing thread this line was added to, anything whose
+        creation the poll has not dated. Replaying one of those re-answers
+        conversations that were already had; the newborn case that genuinely
+        deserves replay is decided in _backfill, on the chat's own created_at.
         """
-        body = await self._messages_page(chat_uid, None)
-        page = body.get("data") or []
-        if self._had_record and not body.get("has_more"):
-            for message in reversed([m for m in page if _is_replayable(m)]):
-                await self._handle_ws_frame(
-                    chat_uid, {"type": "message_received", "message": message})
+        page = (await self._messages_page(chat_uid, None)).get("data") or []
         self._mark_seen(chat_uid, [m["uid"] for m in page])
 
     async def _backfill(self, chat_uid: str) -> None:
@@ -1106,8 +1087,21 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Dropping it would make a chat that flaps out of a paged listing and
         # back re-answer everything it had already handled.
         if chat_uid not in self._seen:
-            await self._first_contact(chat_uid)
-            return
+            # First contact. A chat created after the record's epoch is a
+            # newborn — this agent should have been listening from its first
+            # message, so its entire catalogue is the gap: adopt it with an
+            # empty seen-set and let the walk below replay everything, bounded
+            # by the same backstop as any other gap. Everything else — the
+            # fresh-install inventory (no epoch yet), a standing thread this
+            # line was added to, a chat the poll has not dated — anchors: a
+            # duplicated answer in a room of real people costs more than a
+            # late one.
+            created = self._chat_created.get(chat_uid) or ""
+            if self._epoch is not None and created > self._epoch:
+                self._mark_seen(chat_uid, [])
+            else:
+                await self._anchor(chat_uid)
+                return
         missed: list[dict] = []
         cursor: Optional[str] = None
         for _ in range(MAX_BACKFILL_PAGES):
@@ -1170,64 +1164,33 @@ class PlowChatAdapter(BasePlatformAdapter):
         return self._state_root / "plow-chat-seen.json"
 
     def _load_seen(self) -> None:
-        """Adopt the seen-sets, or start empty and say so.
+        """Adopt the record, or start from the anchor posture and say so.
 
         Never raises. This runs at construction, and an unreadable or malformed
         file must not be the thing that stops an unattended agent from starting:
-        losing it costs one anchored chat, a raise here costs every message.
-        Warned rather than swallowed, because the cost is real — an anchored
-        chat skips whatever was pending in it.
-
-        Only the file's own contents are forgiven. A missing HERMES_HOME is
-        raised at construction instead — see __init__.
+        losing it costs anchored chats, a raise here costs every message.
+        Strict about shape, all-or-nothing: this adapter is the file's only
+        writer, so a malformed anything is corruption, and the safe read of a
+        corrupt record is "no record" — epoch gone, every first-contact chat
+        anchors, because replaying a chat whose uids were seen once re-answers
+        it. Warned rather than swallowed, because that cost is real.
         """
-        # Whether any record was readable at load — the "has this agent been
-        # live before" half of _first_contact's replay decision. A corrupt file
-        # deliberately reads as no record: its chats must anchor, not replay,
-        # because their uids were seen once and replaying re-answers them.
-        self._had_record = False
+        self._epoch: Optional[str] = None
         try:
-            path = self._seen_path()
-            if not path.exists():
-                return
-            loaded = json.loads(path.read_text())
-            if not isinstance(loaded, dict):
-                raise ValueError(f"expected a map of chat uid to message uids, got {type(loaded).__name__}")
-            self._had_record = True
-            # Per entry, keeping what parses. All-or-nothing meant one malformed
-            # chat discarded every chat's record, and each of those then anchors
-            # on its next walk and silently skips whatever was pending in it —
-            # the loss named above, multiplied by the whole file. A list is
-            # accepted alongside a mapping because `dict.fromkeys` reads both
-            # and an older file holds the list shape.
-            for chat_uid, uids in loaded.items():
-                if (isinstance(chat_uid, str) and isinstance(uids, (list, dict))
-                        and all(isinstance(u, str) for u in uids)):
-                    self._seen[chat_uid] = dict.fromkeys(uids)
-                else:
-                    # A dropped entry means a chat whose uids were seen once is
-                    # now unrecorded, and replaying it re-answers — so any drop
-                    # puts the whole load back in anchor posture, keeping the
-                    # warning below true. Self-healing: the next dispatch
-                    # rewrites the file without the malformed entry.
-                    self._had_record = False
-                    # Two ways in, and naming the container for both reported the
-                    # accepted type as the fault ("got list") when the container
-                    # was right and an element was not.
-                    fault = type(uids).__name__
-                    if isinstance(uids, (list, dict)):
-                        fault = next((f"{type(u).__name__} element" for u in uids
-                                      if not isinstance(u, str)), fault)
-                    logger.warning(
-                        "[plow_chat] dropping the seen-message record for %r: expected a "
-                        "list or map of message uids, got %s — that chat anchors on its "
-                        "next walk and skips anything pending in it",
-                        chat_uid, fault,
-                    )
-        except (OSError, ValueError) as exc:
+            raw = json.loads(self._seen_path().read_text())
+            seen = {uid: dict.fromkeys(uids) for uid, uids in raw["chats"].items()}
+            if not all(isinstance(u, str) for uids in seen.values() for u in uids):
+                raise ValueError("non-string message uid in the record")
+            self._epoch = raw["epoch"]
+            self._seen = seen
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            self._seen = {}
             logger.warning(
-                "[plow_chat] could not read the seen-message record, starting from "
-                "an anchor instead — anything pending in a chat is skipped: %s", exc
+                "[plow_chat] could not read the seen-message record, anchoring "
+                "everything instead — anything pending in a known chat is "
+                "skipped: %s", exc,
             )
 
     def _mark_seen(self, chat_uid: str, uids: list[str]) -> None:
@@ -1250,13 +1213,22 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._seen[chat_uid] = dict.fromkeys([*uids, *known])
         for old_uid in list(self._seen[chat_uid])[SEEN_LIMIT:]:
             del self._seen[chat_uid][old_uid]
+        if self._epoch is None:
+            # The record's birth, stamped on the first write and never again.
+            # Everything created before this moment predates the record and
+            # anchors on first contact; everything after it is a chat this
+            # agent should have been listening to. ISO-8601 UTC, the same form
+            # and zone the API's created_at carries, so the two compare as
+            # strings.
+            self._epoch = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         path = self._seen_path()
         tmp = path.with_name(path.name + ".tmp")
         # Written on every dispatch, so it stays compact: no indent, and no
         # sort_keys, which would reorder the uids and destroy the age the trim
         # reads. One write per message is the durability — a crash mid-backfill
         # must not re-dispatch what it already delivered.
-        tmp.write_text(json.dumps(self._seen))
+        tmp.write_text(json.dumps(
+            {"epoch": self._epoch, "chats": {uid: list(m) for uid, m in self._seen.items()}}))
         os.replace(tmp, path)
 
     async def _handle_ws_frame(self, chat_uid: str, frame: dict[str, Any]) -> None:

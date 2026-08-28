@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import importlib.util
 import io
 import logging
@@ -78,13 +79,19 @@ spec.loader.exec_module(adapter_mod)
 
 @pytest.fixture(autouse=True)
 def _isolated_state_root(monkeypatch, tmp_path):
-    """Every adapter gets its own HERMES_HOME.
+    """Every adapter gets its own state root.
 
-    Autouse because the adapter reads its message cursor at construction: without
-    this a suite run in a directory holding a real `plow-chat-seen.json` would
-    adopt it, and tests would pass or fail on the developer's filesystem.
+    Autouse because the adapter reads its message record at construction:
+    without this a suite run against a real `plow-chat-seen.json` would adopt
+    it, and tests would pass or fail on the developer's filesystem. The stub
+    mirrors production's resolution — get_hermes_home honours HERMES_HOME —
+    and individual tests re-stub `hermes_cli.config` for their own scenarios.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = types.ModuleType("hermes_cli.config")
+    cfg.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
 
 
 class DummyConfig:
@@ -1316,7 +1323,7 @@ def test_a_failed_write_leaves_the_last_good_record_intact(monkeypatch, tmp_path
     finally:
         adapter_mod.os.replace = real_replace
 
-    assert json.loads((tmp_path / "plow-chat-seen.json").read_text()) == {"cht_a": {"msg_1": None}}
+    assert json.loads((tmp_path / "plow-chat-seen.json").read_text())["chats"] == {"cht_a": ["msg_1"]}
     assert _adapter(monkeypatch)._seen == {"cht_a": {"msg_1": None}}, "and it still loads"
 
 
@@ -1336,45 +1343,27 @@ def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
     assert "could not read the seen-message record" in caplog.text
 
 
-# `{"uid": <anything>}` is deliberately absent: only the keys are read, so a
-# mapping with junk values is a valid record, not a malformed one.
-@pytest.mark.parametrize("bad, fault", [
-    (1, "int"),
-    # A sound container holding an unsound element. Naming the container here
-    # ("got list") points an operator at the half that was fine.
-    # The offender sits behind a valid uid: pins that the fault scan skips
-    # good elements rather than naming whatever is first.
-    (["ok_uid", 2], "int element"),
-    ("a bare string", "str"),
-    (None, "NoneType"),
-])
-def test_one_malformed_chat_does_not_discard_every_other_chats_record(
-    monkeypatch, tmp_path, caplog, bad, fault
+def test_a_corrupt_record_puts_every_chat_back_in_anchor_posture(
+    monkeypatch, tmp_path, caplog
 ):
-    """All-or-nothing meant a single bad entry anchored every chat on the box,
-    each silently skipping whatever was pending in it. The warning is the only
-    thing telling an operator which chat that was, and why — so it has to name
-    the actual fault, not the type it happened to accept."""
-    (tmp_path / "plow-chat-seen.json").write_text(
-        json.dumps({"cht_good": {"msg_1": None}, "cht_bad": bad})
-    )
+    """One writer owns this file, so a malformed anything is corruption, and
+    the safe read of a corrupt record is no record: without its epoch a chat
+    whose uids were seen once cannot be told from a newborn, and replaying it
+    re-answers it."""
+    (tmp_path / "plow-chat-seen.json").write_text(json.dumps(
+        {"epoch": "2026-08-01T00:00:00Z", "chats": {"cht_a": ["ok_uid", 2]}}))
 
     with caplog.at_level(logging.WARNING):
-        a = _adapter(monkeypatch)
+        a = _adapter(monkeypatch, cls=CapturingAdapter)
+    assert a._seen == {}
+    assert "could not read the seen-message record" in caplog.text
 
-    assert a._seen == {"cht_good": {"msg_1": None}}
-    assert "cht_bad" in caplog.text
-    assert "cht_good" not in caplog.text
-    assert f"got {fault}" in caplog.text
-
-
-def test_a_record_written_as_a_list_still_loads(monkeypatch, tmp_path):
-    """The shape changed from a list to a mapping. Reading only the new one
-    would anchor every chat once, on exactly the upgrade that was supposed to
-    preserve them."""
-    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_a": ["msg_2", "msg_1"]}))
-
-    assert list(_adapter(monkeypatch)._seen["cht_a"]) == ["msg_2", "msg_1"]
+    # A chat created after the (discarded) epoch still anchors: no epoch, no
+    # newborn claim.
+    a._chat_created["cht_new"] = "2026-08-15T00:00:00Z"
+    a._http_session = PagingSession({"/v1/chats/cht_new/messages": [_msg("m1", chat_uid="cht_new")]})
+    asyncio.run(a._backfill("cht_new"))
+    assert a.handled == []
 
 
 def test_the_record_keeps_the_newest_and_survives_the_round_trip(monkeypatch):
@@ -1391,16 +1380,6 @@ def test_the_record_keeps_the_newest_and_survives_the_round_trip(monkeypatch):
 
     assert list(a._seen["cht_a"]) == ["m_4", "m_3", "m_2"], "newest kept, oldest trimmed"
     assert list(_adapter(monkeypatch)._seen["cht_a"]) == ["m_4", "m_3", "m_2"], "and it reloads in order"
-
-
-def test_a_missing_state_root_stops_the_agent_by_name(monkeypatch):
-    """Not a per-message KeyError. Read at each call site this warned benignly
-    at construction and then raised past handle_message on every inbound
-    message, tearing the socket down and re-backfilling once per turn."""
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-
-    with pytest.raises(RuntimeError, match="HERMES_HOME"):
-        _adapter(monkeypatch)
 
 
 def test_only_a_dispatched_turn_is_recorded_as_seen(monkeypatch):
@@ -1433,24 +1412,31 @@ def test_only_a_dispatched_turn_is_recorded_as_seen(monkeypatch):
 def test_a_first_sight_chat_anchors_without_replaying_its_history(
     monkeypatch, history, expected
 ):
-    """On a fresh install (no record at load), adopting a chat must not fire
-    its back catalogue at the agent — every standing thread anchors once."""
+    """On a fresh install (no epoch yet), adopting a chat must not fire its
+    back catalogue at the agent — every standing thread anchors once."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": history})
 
-    asyncio.run(a._first_contact("cht_a"))
+    asyncio.run(a._anchor("cht_a"))
 
     assert list(a._seen.get("cht_a", {})) == expected
     assert a.handled == []
 
 
-def test_a_chat_born_during_a_gap_replays_its_short_catalogue(monkeypatch, tmp_path):
-    """The operator created a group while the container was down. The record
-    has been live (it knows another chat), this one is absent from it, and the
-    catalogue fits one page — so the catalogue IS the gap, and it arrives
-    oldest-first instead of being anchored away."""
-    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_other": ["msg_0"]}))
+def _record(tmp_path, epoch="2026-08-01T00:00:00Z"):
+    """A live record from an earlier run: one known chat, and the epoch that
+    dates everything this agent has been listening since."""
+    (tmp_path / "plow-chat-seen.json").write_text(
+        json.dumps({"epoch": epoch, "chats": {"cht_other": ["msg_0"]}}))
+
+
+def test_a_chat_born_during_a_gap_replays_its_whole_catalogue(monkeypatch, tmp_path):
+    """The goal case: the operator created a group while the agent had no
+    socket. Its created_at postdates the record's epoch, so the catalogue IS
+    the gap — replayed oldest-first instead of being anchored away."""
+    _record(tmp_path)
     a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._chat_created["cht_a"] = "2026-08-02T00:00:00Z"
     # Newest-first, as the API answers.
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
         _msg("msg_2", "second"), _msg("msg_1", "first"),
@@ -1460,40 +1446,32 @@ def test_a_chat_born_during_a_gap_replays_its_short_catalogue(monkeypatch, tmp_p
 
     assert [e.text for e in a.handled] == ["first", "second"]
     assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
+    # And the adoption survives a restart even before the next dispatch.
+    assert "cht_a" in _adapter(monkeypatch)._seen
 
 
-def test_a_chat_whose_record_entry_was_dropped_anchors_not_replays(
-    monkeypatch, tmp_path,
+@pytest.mark.parametrize("created", [
+    "2026-07-01T00:00:00Z",   # a standing thread this line was added to
+    None,                     # a chat the poll has not dated
+])
+def test_a_chat_that_predates_the_record_anchors_not_replays(
+    monkeypatch, tmp_path, created
 ):
-    """A dropped entry is a chat whose uids WERE seen once — replaying its
-    page re-answers it. Any drop puts the load back in anchor posture, which
-    is what the drop warning promises the operator."""
-    (tmp_path / "plow-chat-seen.json").write_text(
-        json.dumps({"cht_other": ["msg_0"], "cht_a": ["ok_uid", 2]}))
+    """First contact with anything older than the record — or undatable — is
+    inheritance, not a gap: replaying it re-answers conversations that were
+    already had (or fires an adopted thread's history at the agent)."""
+    _record(tmp_path)
     a = _adapter(monkeypatch, cls=CapturingAdapter)
+    if created:
+        a._chat_created["cht_a"] = created
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
-        _msg("msg_2", "already answered"), _msg("msg_1", "also answered"),
+        _msg("msg_2", "already had"), _msg("msg_1", "also had"),
     ]})
 
     asyncio.run(a._backfill("cht_a"))
 
-    assert a.handled == [], "an already-answered chat must not be re-answered"
-    assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
-
-
-def test_a_deep_first_sight_catalogue_is_history_not_a_gap(monkeypatch, tmp_path):
-    """Even with a live record, a first-sight chat whose catalogue overflows
-    one page is an adopted thread. It anchors: no gap this feature recovers
-    from accumulates a full page in a single thread."""
-    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_other": ["msg_0"]}))
-    a = _adapter(monkeypatch, cls=CapturingAdapter)
-    a._http_session = PagingSession(
-        {"/v1/chats/cht_a/messages": [_msg("old_1", "old")]}, has_more=True)
-
-    asyncio.run(a._backfill("cht_a"))
-
     assert a.handled == []
-    assert "old_1" in a._seen["cht_a"]
+    assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
 
 
 def test_backfill_replays_the_gap_oldest_first(monkeypatch):
@@ -1637,7 +1615,7 @@ def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypa
 
     newest = history[:]
     a._http_session = Deep()
-    asyncio.run(a._first_contact("cht_a"))
+    asyncio.run(a._anchor("cht_a"))
     assert a.handled == [], "adoption dispatches nothing"
 
     # One new message arrives on top of the page that was anchored.
@@ -2049,6 +2027,10 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
     """Naming is cosmetic; reach is the phone line. A registry write that fails must
     not cost the agent a subscription, nor make start_group_thread misreport
     adoption."""
+    a = _adapter(monkeypatch, groups=None)
+
+    # Broken only after construction: the state root resolved fine when the
+    # adapter started, and it is the later *registry write* that fails here.
     monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
     broken = types.ModuleType("hermes_cli.config")
 
@@ -2057,8 +2039,6 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 
     broken.get_hermes_home = _boom
     monkeypatch.setitem(sys.modules, "hermes_cli.config", broken)
-
-    a = _adapter(monkeypatch, groups=None)
     a._websocket_loop = lambda uid: asyncio.sleep(0)
     a._http_session = PagingSession({
         "/v1/chats": [_chat("cht_home", "line_1", ["+1"]), _chat("cht_room", "line_1", ["+1"])],

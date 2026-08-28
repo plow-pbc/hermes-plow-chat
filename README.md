@@ -62,12 +62,14 @@ URL in git.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
-One variable is **not** in `plugin.yaml`, because the operator does not set it —
-the Hermes image does, and the adapter refuses to construct without it:
-
-| var | set by | meaning |
-|---|---|---|
-| `HERMES_HOME` | the image (`/opt/data`) | state root. The adapter keeps `plow-chat-seen.json` there — the message uids it has dispatched per chat, which is what a reconnect asks before replaying. Resolved once at construction and fatal if unset, rather than defaulted to the working directory: a record read from the wrong root reads as a clean start, and a clean start replays nothing. |
+The adapter also persists one file of its own, beside the rest of the agent's
+state: `plow-chat-seen.json` — the message uids it has dispatched per chat,
+which is what a reconnect asks before replaying, plus the record's epoch, which
+is what tells a newborn chat (created during a gap — replay it) from an
+inherited one (anchor it). Its directory comes from the image's own
+`get_hermes_home()` — the same seam every other persisted gateway file uses
+(`HERMES_HOME`, `/opt/data` in the image) — so this record can never resolve to
+a different root than the state beside it.
 
 ### What a group thread is called
 
