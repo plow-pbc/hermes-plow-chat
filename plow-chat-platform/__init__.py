@@ -147,15 +147,9 @@ _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 # One person's rapid-fire messages are one turn. iMessage splits a single
 # intent into a text bubble and a link preview; people send a thought as two
 # lines. Each used to reach hermes as its own turn, the second interrupting
-# the first. 2s is what plow#442 measured for the bubble/preview split.
+# the first. 2s is what plow#442 measured for the bubble/preview split. A
+# change of speaker closes the burst, so a group's order is never reshuffled.
 INBOUND_DEBOUNCE_SECONDS = 2.0
-
-
-def _log_burst_failure(task):
-    # A hand-off runs on its own task, so its failure would otherwise be a
-    # silent "exception was never retrieved" at garbage collection.
-    if not task.cancelled() and task.exception():
-        log.error("[plow_chat] burst hand-off failed", exc_info=task.exception())
 
 
 @dataclasses.dataclass
@@ -213,7 +207,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_task = None
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
-        self._bursts = {}                    # (chat uid, sender uid) -> _Burst
+        self._bursts = {}                    # chat uid -> the open _Burst
+        self._stalled = set()                # chats whose hand-off failed, until backfilled
+        self._ws = None
         # Hand-offs and the backfill take turns per chat: acks then land in
         # window-close order, which is uid order, and a reconnect's backfill
         # cannot page a uid whose hand-off is still in flight and unacked.
@@ -549,6 +545,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # checkpoint to stop at the loop simply pages to exhaustion, which for a
         # chat that started empty is the handful of messages actually missed.
         async with self._chat_locks[chat_uid]:
+            self._stalled.discard(chat_uid)  # everything unacked is replayed from here
             await self._page_missed(http, chat_uid)
 
     async def _page_missed(self, http, chat_uid):
@@ -604,6 +601,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                             await self._anchor(http, chat_uid)
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
+                        self._ws = ws
                         self._mark_connected()
                         log.info("[plow_chat] websocket connected")
                         for chat_uid in self.chat_uids:
@@ -678,27 +676,46 @@ class PlowChatAdapter(BasePlatformAdapter):
         uid = msg["uid"]
         if not text or (chat_uid, uid) in self._seen:
             return
-        key = (chat_uid, sender["uid"])
-        burst = self._bursts.get(key)
-        if burst is None:
-            burst = self._bursts[key] = _Burst(sender=sender, parts=[], uids=[])
-        elif uid in burst.uids:
+        burst = self._bursts.get(chat_uid)
+        if burst is not None and uid in burst.uids:
             return                           # backfill and socket overlap
-        else:
-            burst.task.cancel()              # still sleeping: dispatch pops the key first
+        if burst is not None and burst.sender["uid"] != sender["uid"]:
+            self._close_burst(chat_uid)      # another voice: what came before goes first
+            burst = None
+        elif burst is not None:
+            burst.task.cancel()              # still sleeping: the task pops the key first
+        if burst is None:
+            burst = self._bursts[chat_uid] = _Burst(sender=sender, parts=[], uids=[])
         burst.parts.append(text)
         burst.uids.append(uid)
-        burst.task = asyncio.create_task(self._dispatch_burst(key))
-        burst.task.add_done_callback(_log_burst_failure)
+        burst.task = asyncio.create_task(self._dispatch_burst(chat_uid))
 
-    async def _dispatch_burst(self, key):
+    def _close_burst(self, chat_uid):
+        burst = self._bursts.pop(chat_uid)
+        burst.task.cancel()
+        burst.task = asyncio.create_task(self._hand_off(burst, chat_uid))
+
+    async def _dispatch_burst(self, chat_uid):
         await asyncio.sleep(INBOUND_DEBOUNCE_SECONDS)
-        burst = self._bursts.pop(key)        # from here on, a new arrival is a new burst
-        chat_uid, _ = key
-        async with self._chat_locks[chat_uid]:
-            await self._hand_off(burst, chat_uid)
+        await self._hand_off(self._bursts.pop(chat_uid), chat_uid)
 
     async def _hand_off(self, burst, chat_uid):
+        async with self._chat_locks[chat_uid]:
+            if chat_uid in self._stalled:
+                return                       # unacked: the backfill replays it, in order
+            try:
+                await self._deliver(burst, chat_uid)
+            except Exception:                # noqa: BLE001 - the reconnect is the retry
+                # The hand-off ran on its own task, so nothing else carries this
+                # failure to the listener. Stall the chat so no later burst acks
+                # past the failed uid, and drop the socket: the listener
+                # reconnects and its backfill replays from the checkpoint.
+                log.exception("[plow_chat] hand-off failed for %s; reconnecting", chat_uid)
+                self._stalled.add(chat_uid)
+                if self._ws is not None:
+                    await self._ws.close()
+
+    async def _deliver(self, burst, chat_uid):
         sender, role = burst.sender, burst.sender["role"]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(

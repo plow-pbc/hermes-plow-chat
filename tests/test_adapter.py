@@ -92,7 +92,8 @@ async def _settle(adapter: Any) -> None:
     while True:
         dispatching = [
             task for task in asyncio.all_tasks()
-            if task.get_coro().__qualname__.endswith("_dispatch_burst") and not task.done()
+            if task.get_coro().__qualname__.split(".")[-1] in {"_dispatch_burst", "_hand_off"}
+            and not task.done()
         ]
         if not dispatching:
             return
@@ -285,7 +286,6 @@ async def test_a_burst_from_one_sender_is_one_turn(
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role=second_role))
     await adapter._on_frame(_envelope("evt_2_again", "cht_a", "msg_2", role=second_role))
-    assert handled == [], "nothing hands off before the window closes"
     await _settle(adapter)
 
     assert [(event["message_id"], event["text"]) for event in handled] == turns
@@ -296,34 +296,36 @@ async def test_a_burst_from_one_sender_is_one_turn(
     assert len(handled) == len(turns)
 
 
-async def test_hand_offs_in_one_chat_ack_in_order(
+async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """Two people's bursts in one chat hand off on their own tasks. A slow
-    earlier hand-off must not let a fast later one ack first and then have
-    the checkpoint walk BACKWARDS over it."""
+    """A1, B2, A3 inside one window must reach hermes in that order — never
+    B2 then "A1 A3". A change of speaker hands off what came before, and a
+    slow earlier hand-off still acks before a fast later one."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
-    release_owner = asyncio.Event()
+    a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
     order: list[str] = []
 
-    async def slow_owner_turn(event: Any) -> None:
-        if event.message_id == "msg_1":
-            await release_owner.wait()
-        order.append(event.message_id)
+    async def turn(event: Any) -> None:
+        if event.text == "A1":
+            a1_entered.set()
+            await release_a1.wait()
+        order.append(event.text)
 
-    monkeypatch.setattr(adapter, "handle_message", slow_owner_turn)
-    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
-    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role="member"))
-    await asyncio.sleep(0.01)
-    assert order == [], "the member's turn waits behind the owner's"
-    release_owner.set()
+    monkeypatch.setattr(adapter, "handle_message", turn)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="A1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="B2", role="member"))
+    await a1_entered.wait()
+    await adapter._on_frame(_envelope("evt_3", "cht_a", "msg_3", body="A3"))
+    assert order == [], "B2 waits behind A1"
+    release_a1.set()
     await _settle(adapter)
 
-    assert order == ["msg_1", "msg_2"]
-    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
+    assert order == ["A1", "B2", "A3"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_3"
 
 
 async def test_a_backfill_waits_for_the_hand_off_in_flight(
@@ -335,19 +337,20 @@ async def test_a_backfill_waits_for_the_hand_off_in_flight(
     hand hermes the same message twice."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    release = asyncio.Event()
+    entered, release = asyncio.Event(), asyncio.Event()
     handled: list[str] = []
 
     async def slow_turn(event: Any) -> None:
+        entered.set()
         await release.wait()
         handled.append(event.message_id)
 
     monkeypatch.setattr(adapter, "handle_message", slow_turn)
     frame = _envelope("evt_1", "cht_a", "msg_1")
     await adapter._on_frame(frame)
-    await asyncio.sleep(0.01)                # the window closed; the hand-off is waiting
+    await entered.wait()                     # the hand-off holds the chat
     backfill = asyncio.create_task(adapter._backfill(_Session(backfill=[frame["data"]["message"]]), "cht_a"))
-    await asyncio.sleep(0.01)
+    await asyncio.sleep(0)
     assert not backfill.done(), "the backfill waits behind the hand-off"
     release.set()
     await backfill
@@ -355,6 +358,49 @@ async def test_a_backfill_waits_for_the_hand_off_in_flight(
 
     assert handled == ["msg_1"]
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_1"
+
+
+async def test_a_failed_hand_off_is_replayed_by_the_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hand-off runs on its own task, so a failure there has no listener to
+    fall into. It must drop the socket — the reconnect's backfill is the retry
+    — and until that backfill, nothing in the chat may ack past the failed
+    uid: a later burst is dropped unacked, and the backfill replays both."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    ws = SimpleNamespace(closed=False)
+
+    async def close() -> None:
+        ws.closed = True
+
+    ws.close = close
+    adapter._ws = ws
+    handled: list[str] = []
+
+    async def flaky(event: Any) -> None:
+        if not handled:
+            handled.append("boom")
+            raise RuntimeError("hermes hiccup")
+        handled.append(event.text)
+
+    monkeypatch.setattr(adapter, "handle_message", flaky)
+    first, second = _envelope("evt_1", "cht_a", "msg_1"), _envelope("evt_2", "cht_a", "msg_2")
+    await adapter._on_frame(first)
+    await _settle(adapter)
+    assert ws.closed and handled == ["boom"]
+    await adapter._on_frame(second)
+    await _settle(adapter)
+    assert handled == ["boom"], "nothing acks past the failed uid before the backfill"
+    assert not (tmp_path / "plow_chat_last_uid").exists()
+
+    page = [second["data"]["message"], first["data"]["message"]]   # newest-first
+    await adapter._backfill(_Session(backfill=page), "cht_a")
+    await _settle(adapter)
+
+    assert handled == ["boom", "msg_1\n\nmsg_2"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -602,6 +648,8 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
         await adapter._on_frame(_envelope("evt_b_member", "cht_b", "msg_b_member", role="member"))
         await _settle(adapter)
 
+    # Chats hand off independently; only the order WITHIN a chat is a contract.
+    handled.sort(key=lambda event: event["source"]["chat_id"])
     assert [(event["source"]["chat_id"], event["message_id"]) for event in handled] == [
         ("cht_a", "msg_a"),
         ("cht_b", "msg_b_owner"),
