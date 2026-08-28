@@ -326,6 +326,37 @@ async def test_hand_offs_in_one_chat_ack_in_order(
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
+async def test_a_backfill_waits_for_the_hand_off_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A socket drop mid-hand-off: the uid is unacked, so the reconnect's
+    backfill pages it again. It must wait for the ack, then drop it — not
+    hand hermes the same message twice."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    release = asyncio.Event()
+    handled: list[str] = []
+
+    async def slow_turn(event: Any) -> None:
+        await release.wait()
+        handled.append(event.message_id)
+
+    monkeypatch.setattr(adapter, "handle_message", slow_turn)
+    frame = _envelope("evt_1", "cht_a", "msg_1")
+    await adapter._on_frame(frame)
+    await asyncio.sleep(0.01)                # the window closed; the hand-off is waiting
+    backfill = asyncio.create_task(adapter._backfill(_Session(backfill=[frame["data"]["message"]]), "cht_a"))
+    await asyncio.sleep(0.01)
+    assert not backfill.done(), "the backfill waits behind the hand-off"
+    release.set()
+    await backfill
+    await _settle(adapter)
+
+    assert handled == ["msg_1"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_1"
+
+
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     hooks: dict[str, Any] = {}
