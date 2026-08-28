@@ -69,10 +69,13 @@ def _resolve_chat_names(chats, home_uid):
 def _agent_name(chat):
     """The line's persona name ("Elm"), or None for an unnamed line.
 
-    Read from the chat's own agent participant on every turn, so the DB stays
-    the single identity source and a rename propagates on the next sweep with
-    no reprovision. `.get`-tolerant like the rest of the listing readers: a
-    pre-persona server omits `line`, and an unnamed line omits `display_name`.
+    Read from the chat's own agent participant, so the DB stays the single
+    identity source and a rename needs no reprovision — it lands at the next
+    reach refresh (reconnect or group-send adoption), which is deliberate: a
+    rename is a rare coordinated ops event (it ships a new vCard too), not
+    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
+    of the listing readers: a pre-persona server omits `line`, and an unnamed
+    line omits `display_name`.
     """
     for participant in chat.get("participants") or []:
         if participant.get("type") == "agent":
