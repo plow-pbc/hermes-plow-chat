@@ -1342,7 +1342,9 @@ def test_an_unreadable_record_starts_empty_rather_than_stopping_the_agent(
     (1, "int"),
     # A sound container holding an unsound element. Naming the container here
     # ("got list") points an operator at the half that was fine.
-    ([2], "int element"),
+    # The offender sits behind a valid uid: pins that the fault scan skips
+    # good elements rather than naming whatever is first.
+    (["ok_uid", 2], "int element"),
     ("a bare string", "str"),
     (None, "NoneType"),
 ])
