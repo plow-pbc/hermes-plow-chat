@@ -126,12 +126,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_task = None
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
-        # Chats whose FIRST-EVER anchor happened in this process -- the only
-        # ones the connect loop greets. The checkpoint file is the durable
-        # record of having met a chat before: an in-memory set re-greeted every
-        # granted chat on every gateway restart, which on a fleet agent with
-        # real group threads was a wave of noise into other people's rooms.
-        self._greet_pending = set()
         # One durable owner of recovery state. The file existing means "this
         # agent has taken its baseline"; its CONTENTS mean "and it was this uid",
         # empty meaning the chat was empty at the time. A process-local flag
@@ -193,10 +187,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         next_chats = {chat["uid"]: chat for chat in chats}
         if not next_chats:
             raise RuntimeError("the credential grant has no live chats")
-        # A pending greet for a chat that left the grant dies with the grant:
-        # firing it on a later re-grant would be a wave into a room long after
-        # the meeting it disclosed.
-        self._greet_pending &= next_chats.keys()
         # The home is where cron and default output land. A fallback to "some
         # granted room" pointed the owner's private deliveries at whichever
         # chat the API listed first -- refuse instead; _listen retries, and the
@@ -420,8 +410,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         that starts with no recoverable baseline is exactly the state the
         checkpoint exists to rule out.
         """
-        if not self._checkpoint_path(chat_uid).exists():
-            self._greet_pending.add(chat_uid)
+        first_meeting = not self._checkpoint_path(chat_uid).exists()
         async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
                             headers=self.auth) as resp:
             _auth_raise_for_status(resp)
@@ -436,6 +425,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         # already owns retrying.
         if not self._checkpoint(page[0]["uid"] if page else "", chat_uid):
             raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
+        # The 👋 is a first-meeting disclosure, sent once ever: the checkpoint
+        # file is the durable record of having met this chat, so it rides the
+        # anchor that creates it -- an in-memory latch re-greeted every granted
+        # chat on every gateway restart, a wave of noise into real rooms.
+        if first_meeting:
+            try:
+                await self.send(chat_uid, "👋")
+            except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
+                log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
     async def _backfill(self, http, chat_uid):
         """Process what arrived while the socket was down.
@@ -508,14 +506,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()
                         log.info("[plow_chat] websocket connected")
-                        for chat_uid in self.chat_uids:
-                            if chat_uid not in self._greet_pending:
-                                continue
-                            self._greet_pending.discard(chat_uid)
-                            try:
-                                await self.send(chat_uid, "👋")
-                            except Exception as exc:  # noqa: BLE001 - greeting must not tear down a healthy socket
-                                log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
                         for chat_uid in self.chat_uids:
                             await self._backfill(http, chat_uid)
                         async for frame in ws:

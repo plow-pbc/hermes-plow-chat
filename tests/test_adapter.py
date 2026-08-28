@@ -831,9 +831,16 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
     data = await adapter.start_group_thread("+15550001111", "hello")
 
+    # The linq send, then the first-meeting 👋 the adoption anchor fires --
+    # the greeting rides the anchor, so a tool-created chat is disclosed even
+    # though the socket is already up.
     assert posts == [(
         f"{module.BASE}/channels/linq/send",
         {"thread_handle": "+15550001111", "text": "hello"},
+        adapter.auth,
+    ), (
+        f"{module.BASE}/v1/chats/cht_new/messages",
+        {"body": "👋"},
         adapter.auth,
     )]
     assert data["adoption"] == "adopted"
