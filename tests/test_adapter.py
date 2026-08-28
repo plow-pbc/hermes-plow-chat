@@ -430,7 +430,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
         ("cht_b", "msg_b_member"),
     ]
     owner_source, member_source = handled[1]["source"], handled[2]["source"]
-    assert (owner_source["chat_name"], owner_source["chat_type"]) == ("Project room", "group")
+    assert (owner_source["chat_name"], owner_source["chat_type"]) == ("Project room (cht_b)", "group")
     assert (owner_source["chat_id"], owner_source["chat_type"]) == (
         member_source["chat_id"],
         member_source["chat_type"],

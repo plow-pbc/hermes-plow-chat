@@ -466,7 +466,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat = self._chats[chat_id]
         member_count = sum(participant.get("type") == "member" for participant in chat["participants"])
         chat_type = "group" if member_count > 1 else "dm"
-        name = chat.get("display_name") or (chat_id if chat_type == "group" else HOME_CHAT_NAME)
+        name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
         return {"name": name, "type": chat_type, "chat_id": chat_id}
 
     async def _anchor(self, http, chat_uid):
