@@ -121,8 +121,7 @@ def test_life_image_extends_the_boot_greeting_into_onboarding(monkeypatch: pytes
 
     greeting = module._boot_greeting()
 
-    assert greeting.startswith("👋")
-    assert "name" in greeting.lower()
+    assert "what name should i use for you?" in greeting.lower()
 
     config_path.write_text(json.dumps({"family": {"owner": {"name": "Sam"}}}))
     assert module._boot_greeting() == "👋", "a gateway restart must not restart onboarding"

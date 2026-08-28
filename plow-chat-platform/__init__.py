@@ -223,7 +223,7 @@ def _boot_greeting():
     except (KeyError, OSError, TypeError, ValueError):
         return "👋"
     if isinstance(owner_name, str) and not owner_name.strip():
-        return "👋 I’m your life dashboard. What name should I use for you?"
+        return "I'm set up now — what name should I use for you?"
     return "👋"
 
 
