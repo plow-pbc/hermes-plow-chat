@@ -88,9 +88,15 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
 
 
 async def _settle(adapter: Any) -> None:
-    """Let every buffered burst hand off to hermes."""
-    while adapter._bursts:
-        await asyncio.gather(*(burst.task for burst in adapter._bursts.values()))
+    """Let every buffered or in-flight burst hand off to hermes."""
+    while True:
+        dispatching = [
+            task for task in asyncio.all_tasks()
+            if task.get_coro().__qualname__.endswith("_dispatch_burst") and not task.done()
+        ]
+        if not dispatching:
+            return
+        await asyncio.gather(*dispatching, return_exceptions=True)  # a reset timer is a cancelled task
 
 
 class _WS:
@@ -288,6 +294,36 @@ async def test_a_burst_from_one_sender_is_one_turn(
     await adapter._on_frame(_envelope("evt_1_late", "cht_a", "msg_1"))
     await _settle(adapter)
     assert len(handled) == len(turns)
+
+
+async def test_hand_offs_in_one_chat_ack_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two people's bursts in one chat hand off on their own tasks. A slow
+    earlier hand-off must not let a fast later one ack first and then have
+    the checkpoint walk BACKWARDS over it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    release_owner = asyncio.Event()
+    order: list[str] = []
+
+    async def slow_owner_turn(event: Any) -> None:
+        if event.message_id == "msg_1":
+            await release_owner.wait()
+        order.append(event.message_id)
+
+    monkeypatch.setattr(adapter, "handle_message", slow_owner_turn)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role="member"))
+    await asyncio.sleep(0.01)
+    assert order == [], "the member's turn waits behind the owner's"
+    release_owner.set()
+    await _settle(adapter)
+
+    assert order == ["msg_1", "msg_2"]
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

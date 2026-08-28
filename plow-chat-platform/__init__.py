@@ -4,8 +4,9 @@ Receives granted-scope WSS events and sends replies through the chat REST API.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
-import dataclasses
+import collections
 import contextvars
+import dataclasses
 import json
 import logging
 import os
@@ -213,6 +214,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
         self._bursts = {}                    # (chat uid, sender uid) -> _Burst
+        # Hand-offs and the backfill take turns per chat: acks then land in
+        # window-close order, which is uid order, and a reconnect's backfill
+        # cannot page a uid whose hand-off is still in flight and unacked.
+        self._chat_locks = collections.defaultdict(asyncio.Lock)
         self._boot_greeted = set()
         # One durable owner of recovery state. The file existing means "this
         # agent has taken its baseline"; its CONTENTS mean "and it was this uid",
@@ -543,6 +548,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # chat, if the socket dropped before hermes accepted it. With no
         # checkpoint to stop at the loop simply pages to exhaustion, which for a
         # chat that started empty is the handful of messages actually missed.
+        async with self._chat_locks[chat_uid]:
+            await self._page_missed(http, chat_uid)
+
+    async def _page_missed(self, http, chat_uid):
         missed, cursor = [], None
         while True:
             url = f"{BASE}/v1/chats/{chat_uid}/messages?limit=50"
@@ -686,6 +695,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         await asyncio.sleep(INBOUND_DEBOUNCE_SECONDS)
         burst = self._bursts.pop(key)        # from here on, a new arrival is a new burst
         chat_uid, _ = key
+        async with self._chat_locks[chat_uid]:
+            await self._hand_off(burst, chat_uid)
+
+    async def _hand_off(self, burst, chat_uid):
         sender, role = burst.sender, burst.sender["role"]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
