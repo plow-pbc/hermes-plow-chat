@@ -633,7 +633,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
         role = sender["role"]
-        text, uid = msg["body"].strip(), msg["uid"]
+        # A failed part is a documented state (status "failed", url null), not
+        # schema drift; anything else missing should raise, per REVIEW.md.
+        attachment_text = "\n".join(
+            f"[attachment: {item['content_type']} {BASE + item['url'] if item['url'] else 'delivery failed'}]"
+            for item in msg["attachments"]
+        )
+        text = "\n".join(part for part in (msg["body"].strip(), attachment_text) if part)
+        uid = msg["uid"]
         message_key = (chat_uid, uid)
         if not text or message_key in self._seen:
             return
