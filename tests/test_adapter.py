@@ -541,6 +541,17 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     assert sorted(greetings) == ["cht_a", "cht_b"], "each chat is latched before its one greeting attempt"
     assert {url.split("/v1/chats/")[1].split("/")[0] for url in http.gets} == {"cht_a", "cht_b"}
 
+    # A NEW process over the same checkpoints must not greet again: the wave is
+    # a first-meeting disclosure, and an in-memory latch alone re-sent it to
+    # every granted chat on every gateway restart.
+    restarted = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    restarted._set_reach([_chat("cht_a"), _chat("cht_b")])
+    monkeypatch.setattr(restarted, "send", greet)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await restarted._listen()
+    assert sorted(greetings) == ["cht_a", "cht_b"], "a restart re-greeted an already-met chat"
+
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(
     monkeypatch: pytest.MonkeyPatch,
