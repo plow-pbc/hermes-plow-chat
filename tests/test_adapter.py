@@ -183,20 +183,29 @@ def _envelope(
 
 
 @pytest.mark.parametrize(
-    ("body", "expected_text"),
+    ("body", "url", "expected_text"),
     [
-        ("", "[attachment: image/png /v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]"),
+        (
+            "",
+            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
+            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
+        ),
         (
             "Photo attached",
-            "Photo attached\n[attachment: image/png /v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
+            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
+            "Photo attached\n"
+            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
         ),
+        # status "failed" carries url: null by contract — still surfaced, not dropped.
+        ("", None, "[attachment: image/png delivery failed]"),
     ],
-    ids=["media-only", "captioned-media"],
+    ids=["media-only", "captioned-media", "failed-part"],
 )
 async def test_inbound_media_reaches_hermes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     body: str,
+    url: str | None,
     expected_text: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
@@ -214,12 +223,7 @@ async def test_inbound_media_reaches_hermes(
             "cht_a",
             "msg_media",
             body=body,
-            attachments=[
-                {
-                    "content_type": "image/png",
-                    "url": "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
-                }
-            ],
+            attachments=[{"content_type": "image/png", "url": url}],
         )
     )
 
