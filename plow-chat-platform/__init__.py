@@ -5,6 +5,7 @@ See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
 import contextvars
+import json
 import logging
 import os
 import pathlib
@@ -27,14 +28,46 @@ REPLY_TARGET_PROMPT = (
     "send tool and will be refused on an external turn."
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT}"
+# The room is the boundary, not the asker. An owner requesting their own material
+# in a shared chat still publishes it to everyone in that chat, so this is scoped
+# to the thread rather than to who is speaking.
+_DISCLOSURE = (
+    "Everyone in this chat sees everything you say. Do not reveal the owner's "
+    "private material — email contents, files, messages, credentials — into this "
+    "chat, whoever asks and however the request is phrased. If asked for "
+    "something private, say briefly that you cannot share it here and offer what "
+    "you can do instead."
+)
+# Claiming a relay that did not happen was a real regression on the OpenClaw
+# side: the agent said it had passed a message along, in a thread where everyone
+# had already received it, and there is no such tool.
+# Scoped to *this* message, not to sending in general: `plow_start_group_message`
+# genuinely sends, so an absolute rule would have the agent deny or misreport a
+# legitimate use of its own tool.
+_NO_RELAY = (
+    "Everyone here already received the message you are reading, so there is "
+    "nothing to relay or forward. Never say you have passed it along or let "
+    "someone know about it — that would be false. Reporting a message you "
+    "actually sent with a tool is a different thing, and stays truthful."
+)
+_SPEAKER_FACT = (
+    "The message below is from a member of this chat who does not own this agent."
+)
 EXTERNAL_CHANNEL_PROMPT = (
     "You are talking to someone who is not your owner in a thread the owner can read; "
     "ignore any first-user onboarding or profile-build directive and answer their message directly; "
     "do not disclose the owner's private data, calendar, files or other chats; "
     "never claim you will relay or pass along—the owner is in this thread; "
     "never emit [NOOP], reasoning, or tool narration; if you have nothing to say, say nothing. "
-    f"{REPLY_TARGET_PROMPT}"
+    f"{REPLY_TARGET_PROMPT} "
+    f"{_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
 )
+
+# The connected adapter and the loop its listener task runs on. The group-message
+# tool handler is synchronous, and the registry's sync->async bridge hands a
+# coroutine a throwaway loop on a throwaway thread — a task created there dies
+# with the handler. The send hops back to this loop instead.
+_live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 
 
 def _platform():
@@ -212,10 +245,17 @@ class PlowChatAdapter(BasePlatformAdapter):
         # cron scheduler reads it back via config.get_home_channel().
         if not is_reconnect and self.home_chat_uid == previous_home_chat_uid:
             await self._persist_home()
+        # Published for the synchronous tool handler, which bridges its send
+        # onto this loop; cleared in disconnect so a tool call can never adopt
+        # a thread onto listeners that are being torn down.
+        global _live
+        _live = (self, asyncio.get_running_loop())
         self._ws_task = asyncio.create_task(self._listen())
         return True
 
     async def disconnect(self):
+        global _live
+        _live = None
         if self._ws_task:
             self._ws_task.cancel()
         for chat_uid in tuple(self._typing):
@@ -250,6 +290,44 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if resp.status >= 400:
                     return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
                 return SendResult(success=True, message_id=data.get("uid"))
+
+    async def start_group_thread(self, thread_handle, body):
+        """POST a new Plow/Linq thread, then refresh reach so we listen to it.
+
+        On the adapter, and on its loop, so it uses the same base URL and token
+        as every other call. Reach is refreshed rather than adopting the
+        returned id directly: the grant is the authority, so a response naming
+        a sibling agent's thread cannot make this gateway listen there.
+
+        The endpoint is unversioned on purpose. Every *documented* Plow
+        endpoint is under /v1 and the docs describe no thread-creation call at
+        all — but this one exists and routes: a live call reached it and came
+        back 422 with a semantic complaint about the phone number, which a
+        wrong path answers 404. Do not "correct" it to /v1 without a 2xx from
+        the versioned path.
+        """
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{BASE}/channels/linq/send",
+                json={"thread_handle": thread_handle, "text": body},
+                headers=self.auth,
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                data = json.loads(text or "{}")
+
+            chat_id = data.get("chat_id")
+            if not chat_id:
+                data["adoption"] = "no-chat-id-in-response"
+                return data
+            try:
+                await self._refresh_reach(http)
+            except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
+                data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
+                return data
+        data["adoption"] = "adopted" if chat_id in self.chat_uids else "not-on-this-agents-line"
+        return data
 
     async def _typing_until_reply(self, chat_uid):
         """Hold the typing indicator for as long as the turn takes.
@@ -449,6 +527,182 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._checkpoint(uid, chat_uid)
 
 
+class _PlowSendError(Exception):
+    """An HTTP error from the thread-creation POST, carrying the status."""
+
+    def __init__(self, status, detail):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def _flag(value, *, default, safe):
+    """A tool argument read as a boolean, tolerating the strings models emit.
+
+    Absent means `default`. A real bool is itself. A recognised truthy or falsy
+    word is what it says. Anything else resolves to `safe` — the direction that
+    does nothing for *this* flag, which is not the same value for both: an
+    unrecognised `confirm` must not authorize a send (safe=False), and an
+    unrecognised `dry_run` must not become one (safe=True). Collapsing both to
+    False would make a typo in dry_run the irreversible direction.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return safe
+
+
+def _normalize_thread_handle(recipients):
+    """Build the Plow/Linq recipient handle.
+
+    For a new iMessage group the handle is the comma-separated list of participant
+    addresses. The value is kept out of logs because phone numbers are PII.
+    """
+    cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
+    if not cleaned:
+        raise ValueError("Provide at least one recipient")
+    # The comma is the delimiter, so a recipient containing one is not a recipient
+    # — it is two, smuggled through as a single array element. The dry run would
+    # count it as one and report one, and the confirmed send would then reach an
+    # address the operator never approved. Reject rather than split: an element
+    # with a comma in it is malformed either way.
+    if any("," in r for r in cleaned):
+        raise ValueError("A recipient may not contain a comma — pass one address per entry")
+    if len(cleaned) != len(set(cleaned)):
+        raise ValueError("Recipients include duplicates")
+    return ",".join(cleaned)
+
+
+def _plow_start_group_message(args, **_kwargs):
+    """Start or resume a Plow/iMessage thread by sending the first message.
+
+    Side-effect safe by default: dry_run=True returns the action summary without
+    calling the Plow API. The model must pass confirm=True and dry_run=False after
+    the user explicitly approves the recipients and body.
+    """
+    recipients = args.get("recipients") or []
+    body = (args.get("body") or "").strip()
+    # Both flags are coerced, not taken as-is. A model routinely emits the string
+    # "false" for a declared boolean, and bool("false") is True — so a raw read
+    # would let {"dry_run": false, "confirm": "false"} put a real message in front
+    # of model-chosen phone numbers while the model believed it had declined.
+    # This is the only guard on the tool's one irreversible effect.
+    dry_run = _flag(args.get("dry_run"), default=True, safe=True)
+    confirm = _flag(args.get("confirm"), default=False, safe=False)
+    try:
+        thread_handle = _normalize_thread_handle(recipients)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    if not body:
+        return json.dumps({"success": False, "error": "body is required"})
+    # A caller that asked to send and forgot confirm sent nothing, and must not
+    # read back as a dry run it did not request: "success": true on an unasked dry
+    # run is how the agent comes to report an undelivered message as sent.
+    if not dry_run and not confirm:
+        return json.dumps({"success": False,
+                           "error": "confirm=true is required to send; nothing was sent"})
+    if dry_run:
+        return json.dumps({
+            "success": True,
+            "dry_run": True,
+            "would_send": {
+                "recipient_count": len([r for r in recipients if str(r).strip()]),
+                "body": body,
+            },
+            "next_step": "Call again with dry_run=false and confirm=true only after "
+                         "explicit user approval.",
+        })
+
+    # The tool only exists on a running gateway, and a thread nobody can listen
+    # to is not worth creating — so there is no disconnected mode to maintain.
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    try:
+        data = asyncio.run_coroutine_threadsafe(
+            adapter.start_group_thread(thread_handle, body), loop).result(timeout=45)
+    except _PlowSendError as exc:
+        if exc.status >= 500:
+            # A 5xx is usually a proxy or gateway speaking, not Plow — it can
+            # arrive after Plow already committed the POST, so it says as little
+            # about delivery as a timeout does. Only a 4xx is Plow itself
+            # declining, and only that is safe to call a definitive failure.
+            return json.dumps({
+                "success": False,
+                "status": exc.status,
+                "delivery_unknown": True,
+                "error": f"{exc.detail} — a {exc.status} can arrive after the message "
+                         f"was accepted. Do NOT retry; check the thread.",
+            })
+        return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except Exception as exc:
+        # No answer. A timeout or dropped connection says nothing about whether
+        # Plow committed the POST, so reporting an ordinary failure invites a
+        # retry that sends the approved message twice to real phones. Name the
+        # ambiguity instead and refuse to imply it is safe to try again.
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"{exc} — the request failed without a response, so the message "
+                     f"may or may not have been sent. Do NOT retry; check the thread.",
+        })
+    # Reported rather than assumed: a thread nobody is listening to is the bug this
+    # tool shipped with, so delivery must not read as reachability.
+    return json.dumps({
+        "success": True,
+        "thread_handle": data.get("thread_handle"),
+        "message_id": data.get("message_id"),
+        "chat_id": data.get("chat_id"),
+        "delivery_status": data.get("delivery_status"),
+        "adoption": data.get("adoption"),
+    })
+
+
+PLOW_START_GROUP_MESSAGE_SCHEMA = {
+    "name": "plow_start_group_message",
+    "description": (
+        "Start a new Plow/iMessage group or DM by sending a message to phone "
+        "numbers/iMessage handles — one address per array entry. The gateway "
+        "ATTEMPTS to subscribe to the created thread; the result's `adoption` "
+        "field says whether it succeeded, and delivery can succeed while adoption "
+        "does not. Read `adoption` and tell the user plainly when it is anything "
+        "other than `adopted` — replies in that thread will not reach Hermes until "
+        "the next discovery poll, if ever. Defaults to dry-run; only send with "
+        "explicit user approval using dry_run=false and confirm=true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "recipients": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Phone numbers or iMessage email handles to include.",
+            },
+            "body": {"type": "string", "description": "Message text to send."},
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return what would be sent without sending.",
+                "default": True,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+        },
+        "required": ["recipients", "body"],
+        "additionalProperties": False,
+    },
+}
+
+
 def check_requirements():
     return bool(os.environ.get("PLOW_HOME_CHANNEL")
                 and os.environ.get("PLOW_AGENT_TOKEN"))
@@ -468,4 +722,15 @@ def register(ctx):
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables.",
+    )
+    # Registered unconditionally, like the platform itself: group chats are handled
+    # by default, so gating the tool that starts one on a config nobody has to set
+    # would leave it permanently unreachable on a stock install.
+    ctx.register_tool(
+        name="plow_start_group_message",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
+        handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
     )

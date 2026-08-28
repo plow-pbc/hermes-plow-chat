@@ -620,3 +620,244 @@ async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.Monk
         await adapter._anchor(_AnchorHTTP(), "cht_b")
 
     assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'last_uid.cht_b'}"
+
+
+# --- prompt rules and the group-send tool (ported from the operator-model adapter) ---
+
+
+def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The three canonical group rules ride every external turn: the room-scoped
+    disclosure boundary, the no-relay fact, and who owns this agent."""
+    module = _load(monkeypatch, tmp_path)
+    p = module.EXTERNAL_CHANNEL_PROMPT.lower()
+    assert "do not reveal" in p           # disclosure
+    assert "already" in p                 # no-relay: they already received it
+    assert "does not own" in p            # speaker-ownership fact
+
+
+def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert "owner" in module.OWNER_CHANNEL_PROMPT.lower()
+
+
+class _ToolContext:
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+
+    def register_hook(self, name: str, callback: Any) -> None: ...
+    def register_platform(self, **kwargs: Any) -> None: ...
+
+    def register_tool(self, **kwargs: Any) -> None:
+        self.tools.append(kwargs)
+
+
+def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    ctx = _ToolContext()
+    module.register(ctx)
+    assert [t["name"] for t in ctx.tools] == ["plow_start_group_message"]
+    tool = ctx.tools[0]
+    assert tool["schema"]["name"] == "plow_start_group_message"
+    assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert tool["check_fn"]()
+
+
+def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, raises=None, record=None):
+    """Publish a live adapter whose start_group_thread is stubbed.
+
+    The tool goes through the adapter's own seam, so there is no standalone
+    POST to patch: a disconnected gateway cannot send at all.
+    """
+    import threading
+
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def stub(thread_handle: str, body: str) -> dict[str, Any]:
+        if record is not None:
+            record.append((thread_handle, body))
+        if raises is not None:
+            raise raises
+        return dict(result or {})
+
+    adapter.start_group_thread = stub
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr(module, "_live", (adapter, loop))
+    return adapter
+
+
+def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, raises=AssertionError("dry run must not reach the API"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi"}))
+    assert out["success"] is True and out["dry_run"] is True
+    assert out["would_send"]["recipient_count"] == 1
+
+
+def test_group_message_requires_confirm_to_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """A caller that asked to send and forgot confirm must not read back as a
+    dry run it did not request."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, raises=AssertionError("must not send without confirm"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False}))
+    assert out["success"] is False
+    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
+
+
+@pytest.mark.parametrize("recipients,message", [
+    ([], "at least one recipient"),
+    (["+1", "+1"], "duplicates"),
+    # The comma is the delimiter: one array element carrying two addresses would
+    # be approved as one recipient and delivered to two.
+    (["+15550001111,+15559999999"], "may not contain a comma"),
+])
+def test_group_message_rejects_bad_recipients(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, recipients: list[str], message: str
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": recipients, "body": "hi"}))
+    assert out["success"] is False and message in out["error"]
+
+
+@pytest.mark.parametrize("confirm", [False, "false", "no", "0", 0, None, "", "off", "maybe"])
+def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, confirm: Any
+) -> None:
+    """bool("false") is True, and a model emits that string for a declared bool.
+    This is the only guard on the tool's one irreversible effect."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, raises=AssertionError("must not send"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
+    assert out["success"] is False
+    assert "confirm" in out["error"]
+
+
+@pytest.mark.parametrize("dry_run", ["false", "no", "0", 0, "off"])
+def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, dry_run: Any
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    sent: list[tuple[str, str]] = []
+    _live_tool(module, monkeypatch, result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": dry_run, "confirm": True}))
+    assert out["success"] is True and "dry_run" not in out
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("junk", ["tru", "maybe"])
+def test_unparseable_dry_run_stays_a_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, junk: str
+) -> None:
+    """Unrecognised input must fall to the direction that does nothing, and for
+    dry_run that is True — otherwise a typo becomes the irreversible branch."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, raises=AssertionError("must not send"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
+    assert out["success"] is True and out["dry_run"] is True
+
+
+def test_group_message_reports_adoption_separately_from_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A thread nobody is listening to is the bug this tool shipped with, so
+    delivery must not read as reachability."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, result={
+        "chat_id": "cht_new", "message_id": "m1", "delivery_status": "sent",
+        "thread_handle": "+15550001111", "adoption": "not-on-this-agents-line"})
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is True
+    assert out["delivery_status"] == "sent"
+    assert out["adoption"] == "not-on-this-agents-line"
+
+
+def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    assert module._live is None
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False and "not connected" in out["error"]
+
+
+async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The tool handler is synchronous and bridges onto the adapter's loop via
+    `_live`; a connect that never publishes it leaves the tool permanently
+    reporting a disconnected gateway."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _HTTP()
+    http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
+        {"object": "list", "data": [_chat("cht_a")], "has_more": False}
+    )
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    async def listen_once() -> None: ...
+
+    monkeypatch.setattr(adapter, "_listen", listen_once)
+    await adapter.connect(is_reconnect=True)
+    assert module._live is not None and module._live[0] is adapter
+    await adapter._ws_task
+    await adapter.disconnect()
+    assert module._live is None
+
+
+async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The thread-creation POST goes to the unversioned /channels/linq/send with
+    the agent bearer, and adoption is judged by the refreshed grant — a response
+    naming a sibling agent's thread must not make this gateway claim it."""
+    import json as jsonlib
+
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+
+    class _TextResp(_Resp):
+        async def text(self) -> str:
+            return jsonlib.dumps(self._payload)
+
+    class _SendHTTP(_HTTP):
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            posts.append((url, json, headers))
+            return _TextResp({"chat_id": "cht_new", "message_id": "m1"})
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_new")], "has_more": False})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
+    data = await adapter.start_group_thread("+15550001111", "hello")
+
+    assert posts == [(
+        f"{module.BASE}/channels/linq/send",
+        {"thread_handle": "+15550001111", "text": "hello"},
+        adapter.auth,
+    )]
+    assert data["adoption"] == "adopted"
+    assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
