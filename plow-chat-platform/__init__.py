@@ -410,11 +410,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         that starts with no recoverable baseline is exactly the state the
         checkpoint exists to rule out.
         """
-        first_meeting = not self._checkpoint_path(chat_uid).exists()
-        async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
-                            headers=self.auth) as resp:
-            _auth_raise_for_status(resp)
-            page = (await resp.json(content_type=None)).get("data") or []
+        # Claim before the first await: the startup loop and a tool adoption can
+        # discover the same brand-new chat concurrently, and an unclaimed anchor
+        # double-sends the disclosure wave. A failed anchor releases the claim
+        # so the retry re-enters.
+        self._anchored_chats[chat_uid] = True
+        try:
+            first_meeting = not self._checkpoint_path(chat_uid).exists()
+            async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
+                                headers=self.auth) as resp:
+                _auth_raise_for_status(resp)
+                page = (await resp.json(content_type=None)).get("data") or []
+        except BaseException:
+            self._anchored_chats[chat_uid] = False
+            raise
         # An empty chat still records that it anchored, with an empty cursor:
         # nothing is behind us, and the marker is what stops a restart from
         # anchoring a second time over messages that arrived in between.
@@ -424,6 +433,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # would re-anchor over everything since. Raise into `_listen`, which
         # already owns retrying.
         if not self._checkpoint(page[0]["uid"] if page else "", chat_uid):
+            self._anchored_chats[chat_uid] = False
             raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
         # The 👋 is a first-meeting disclosure, sent once ever: the checkpoint
         # file is the durable record of having met this chat, so it rides the
