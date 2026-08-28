@@ -394,6 +394,34 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     assert len(http.gets) == 1
 
 
+async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The motivating split: a caption bubble, then the photo, then a second
+    photo. One turn, both files, in arrival order, typed from the whole burst."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05   # the fetch yields; a zero window would close on it
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="look at these"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="",
+                                      attachments=[_attachment(uid="att_1")]))
+    await adapter._on_frame(_envelope("evt_3", "cht_a", "msg_3", body="",
+                                      attachments=[_attachment(uid="att_2", filename="two.png")]))
+    await _settle(adapter)
+
+    [event] = handled
+    assert event["text"] == "look at these\n\n(attachment)\n\n(attachment)"
+    assert len(event["media_urls"]) == 2 and event["media_types"] == ["image/png", "image/png"]
+    assert event["message_type"].value == "photo"
+    assert event["message_id"] == "msg_3"
+
+
 @pytest.mark.parametrize(
     "second_role,turns",
     [
