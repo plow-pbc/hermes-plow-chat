@@ -750,6 +750,9 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     config = SimpleNamespace(extra={})
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
+    # cht_c is never granted; a refresh that leaves reach unchanged is what
+    # a real ungranted chat looks like -- nothing here exercises adoption.
+    monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
 
     handled = _capture_events(monkeypatch, adapter)
     with caplog.at_level(logging.WARNING):
@@ -795,38 +798,67 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert "outside the grant" in caplog.text
 
 
-async def test_unknown_chat_frame_adopts_via_one_refresh_then_delivers(
+@pytest.mark.parametrize(
+    ("event_type", "reveals", "expect_delivered"),
+    [
+        pytest.param("message_received", True, True, id="revealed-message"),
+        pytest.param("message_received", False, False, id="unrevealed-message"),
+        pytest.param("chat_created", True, False, id="revealed-chat-created"),
+    ],
+)
+async def test_unknown_chat_frame_adoption_cases(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    event_type: str,
+    reveals: bool,
+    expect_delivered: bool,
 ) -> None:
     """A line-granted socket can carry a chat this agent has never seen --
     one created after connect, or a sibling's room on the shared line. One
-    reach refresh either reveals it (adopted, this very frame delivered) or
-    it stays outside the grant."""
+    reach refresh either reveals it (adopted; a carried message is delivered)
+    or it stays outside the grant (dropped, logged, costing one refresh).
+
+    A revealed chat must NOT be anchored at its newest existing message --
+    that message IS the frame already in hand, stored server-side before
+    this process ever saw it. Anchoring it would checkpoint it ahead of the
+    handoff below, so a crash in between would drop the chat's first turn;
+    `_ensure_anchor` raising here pins that it is never called."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._http = object()  # the listen loop's live session, stood in for
+    http = object()  # the listen loop's live session, opaque to a mocked refresh
     refresh_calls: list[Any] = []
 
-    async def fake_refresh(http: Any) -> None:
-        refresh_calls.append(http)
-        adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
+    async def fake_refresh(refresh_http: Any) -> None:
+        refresh_calls.append(refresh_http)
+        if reveals:
+            adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
 
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    anchored: list[str] = []
-
-    async def fake_anchor(http: Any, chat_uid: str) -> None:
-        anchored.append(chat_uid)
-
-    monkeypatch.setattr(adapter, "_ensure_anchor", fake_anchor)
+    monkeypatch.setattr(adapter, "_ensure_anchor",
+                         mock.AsyncMock(side_effect=AssertionError("adoption must not anchor at newest")))
     handled = _capture_events(monkeypatch, adapter)
 
-    await adapter._on_frame(_envelope("evt_new", "cht_new", "msg_new"))
+    frame = (_envelope("evt_new", "cht_new", "msg_new") if event_type == "message_received"
+             else {"event_id": "evt_created", "event_type": "chat_created", "chat_id": "cht_new", "data": {}})
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(frame, http)
     await _settle(adapter)
 
-    assert refresh_calls == [adapter._http]
-    assert anchored == ["cht_new"], "the frame in hand is the first message; anchoring baselines it"
-    assert [event["message_id"] for event in handled] == ["msg_new"]
+    assert refresh_calls == [http]
+    assert ("cht_new" in adapter.chat_uids) == reveals
+    assert [event["message_id"] for event in handled] == (["msg_new"] if expect_delivered else [])
+    assert ("outside the grant" in caplog.text) == (not reveals)
+    if reveals:
+        # Recovery semantics, not a newest-message anchor: the baseline is
+        # empty until the ack-after-handoff checkpoint (written in
+        # `_deliver`) advances it, so a crash before that handoff leaves
+        # `_backfill` paging to exhaustion instead of stopping at a message
+        # hermes never accepted.
+        assert adapter._load_checkpoint("cht_new") == ("msg_new" if expect_delivered else None)
+    else:
+        assert not adapter._checkpoint_path("cht_new").exists()
 
 
 async def test_adopt_lets_a_revoked_credential_stay_terminal(
@@ -838,7 +870,6 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
     (the 2026-08-27 str incident, through a new door)."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._http = object()
 
     async def fake_refresh(http: Any) -> None:
         raise module._PlowAuthError()
@@ -846,73 +877,7 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
 
     with pytest.raises(module._PlowAuthError):
-        await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"))
-
-
-async def test_a_still_unrevealed_chat_is_dropped_after_one_refresh_per_frame(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A chat the refresh does not reveal (a sibling agent's room on the same
-    line) stays dropped -- costing exactly one refresh, not a retry loop
-    within the frame, and not zero on the next frame (no cooldown memo)."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._http = object()
-    refresh_calls: list[Any] = []
-
-    async def fake_refresh(http: Any) -> None:
-        refresh_calls.append(http)  # reach unchanged -- cht_out is never revealed
-
-    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    handled = _capture_events(monkeypatch, adapter)
-
-    with caplog.at_level(logging.WARNING):
-        await adapter._on_frame(_envelope("evt_out", "cht_out", "msg_out"))
-    assert len(refresh_calls) == 1, "one refresh per frame, never a retry loop inside it"
-    assert handled == []
-    assert "outside the grant" in caplog.text
-
-    await adapter._on_frame(_envelope("evt_out_2", "cht_out", "msg_out_2"))
-    assert len(refresh_calls) == 2, "each unrevealed frame costs its own refresh -- no cooldown"
-    assert handled == []
-
-
-async def test_chat_created_for_an_unknown_chat_adopts_with_no_message_to_deliver(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """chat_created carries no message -- adoption still runs (ahead of the
-    event_type gate), but there is nothing to hand off."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._http = object()
-    refresh_calls: list[Any] = []
-
-    async def fake_refresh(http: Any) -> None:
-        refresh_calls.append(http)
-        adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
-
-    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    anchored: list[str] = []
-
-    async def fake_anchor(http: Any, chat_uid: str) -> None:
-        anchored.append(chat_uid)
-
-    monkeypatch.setattr(adapter, "_ensure_anchor", fake_anchor)
-    handled = _capture_events(monkeypatch, adapter)
-
-    await adapter._on_frame({
-        "event_id": "evt_created", "event_type": "chat_created",
-        "chat_id": "cht_new", "data": {},
-    })
-    await _settle(adapter)
-
-    assert refresh_calls == [adapter._http]
-    assert anchored == ["cht_new"]
-    assert "cht_new" in adapter.chat_uids
-    assert handled == []
+        await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"), object())
 
 
 class _HTTP:

@@ -277,7 +277,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             }
         }
         self._ws_task = None
-        self._http = None                    # the listen loop's live session, while connected
         self._anchor_lock = asyncio.Lock()
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
@@ -723,7 +722,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         while True:
             try:
                 async with aiohttp.ClientSession() as http:
-                    self._http = http        # live for _on_frame's mid-connection adopt
                     if not first_connection:
                         await self._refresh_reach(http)
                     first_connection = False
@@ -748,7 +746,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                             await self._backfill(http, chat_uid)
                         async for frame in ws:
                             if frame.type == aiohttp.WSMsgType.TEXT:
-                                await self._on_frame(frame.json())
+                                await self._on_frame(frame.json(), http)
             except _PlowAuthError:
                 # Revocation is terminal: every retry presents the same dead
                 # credential. Observed on the str agent 2026-08-27 -- one
@@ -769,43 +767,41 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # that ticket is still live.
                 log.warning("[plow_chat] websocket error: %s", type(exc).__name__)
                 self._mark_disconnected()
-            finally:
-                self._http = None            # the session that live-ness belonged to just closed
             await asyncio.sleep(5)
 
-    async def _adopt_new_chat(self, chat_uid):
-        """A line-granted credential learns about a chat mid-connection --
-        one born after connect, or a `message_received` for one never seen.
-        One refresh re-reads the grant's reach; a chat the server still does
-        not list stays dropped, and the reconnect backfill is the durable
-        recovery, same as ever."""
-        http = self._http
-        if http is None:
-            return
-        try:
-            await self._refresh_reach(http)
-            if chat_uid in self.chat_uids:
-                await self._ensure_anchor(http, chat_uid)
-        except _PlowAuthError:
-            # Terminal by contract: _listen owns the revoked-credential stop
-            # (the 2026-08-27 str incident). Swallowing it here would keep a
-            # dead token looking connected through this new path.
-            raise
-        except Exception as exc:  # noqa: BLE001 - the reconnect backfill recovers a failed adopt
-            log.warning("[plow_chat] reach refresh on new chat failed: %s", type(exc).__name__)
-
-    async def _on_frame(self, frame):
+    async def _on_frame(self, frame, http=None):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
         if chat_uid not in self.chat_uids:
-            # One refresh re-reads the grant's reach. Ahead of the event_type
-            # gate: a chat_created frame has no message to deliver, but still
-            # needs the reach update.
-            await self._adopt_new_chat(chat_uid)
+            # A chat this agent has never seen -- one born after connect, or
+            # a `message_received` for one never seen. One refresh re-reads
+            # the grant's reach, ahead of the event_type gate below: a
+            # chat_created frame has no message to deliver, but still needs
+            # the reach update. A refresh failure propagates to `_listen`'s
+            # existing reconnect seam -- the same recovery already in place
+            # for a dropped socket, not a second one.
+            await self._refresh_reach(http)
             if chat_uid not in self.chat_uids:
                 log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
                 return
+            if not self._anchored_chats.get(chat_uid):
+                # The newest existing message is the very frame already in
+                # hand -- it is stored server-side before Hermes ever sees
+                # it. Anchoring at newest (as `_ensure_anchor` does for a
+                # chat known before connect) would checkpoint that message
+                # before the handoff below accepts it, so a crash in between
+                # drops the chat's first turn. An empty baseline instead lets
+                # `_backfill`'s pages-to-exhaustion branch recover it on
+                # reconnect; the ack-after-handoff checkpoint written in
+                # `_deliver` becomes the first durable one. Writing it now,
+                # before the message below is enqueued, is also what
+                # protects a reconnect landing ahead of that handoff: the
+                # checkpoint file existing on disk is what `_set_reach` reads
+                # back as "already anchored", so the next connect's
+                # `_ensure_anchor` loop will not re-anchor it at newest.
+                if not self._checkpoint("", chat_uid):
+                    raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]
