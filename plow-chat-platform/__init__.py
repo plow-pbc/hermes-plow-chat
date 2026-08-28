@@ -810,9 +810,10 @@ class PlowChatAdapter(BasePlatformAdapter):
                     carry = nxt              # another voice: what came before goes first
                     break
                 burst.append(nxt)
+            media = await self._fetch_media(burst)   # once: a retry must not outlive the signed urls
             while True:
                 try:
-                    await self._deliver(burst, chat_uid)
+                    await self._deliver(burst, media, chat_uid)
                     break
                 except Exception:            # noqa: BLE001 - the retry is the recovery; the chat waits behind it
                     log.exception("[plow_chat] hand-off failed for %s; retrying", chat_uid)
@@ -820,8 +821,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             for _ in burst:
                 queue.task_done()
 
-    async def _deliver(self, burst, chat_uid):
-        sender, role = burst[0].sender, burst[0].sender["role"]
+    async def _fetch_media(self, burst):
         # Fetched here, once the burst has closed: a preview whose fetch
         # outlasts the window must still land in the turn it belongs to.
         # Concurrent, so a stalled part costs one timeout, not one per part.
@@ -843,6 +843,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                     log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
                 notes[m.uid].append(f"[attachment: {kind} {'unavailable' if item['url'] else 'delivery failed'}]")
         lines = ["\n".join(p for p in (m.body.strip(), *notes[m.uid]) if p) for m in burst]
+        return media_urls, media_types, lines
+
+    async def _deliver(self, burst, media, chat_uid):
+        sender, role = burst[0].sender, burst[0].sender["role"]
+        media_urls, media_types, lines = media
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
             text="\n\n".join(line for line in lines if line) or "(attachment)",
