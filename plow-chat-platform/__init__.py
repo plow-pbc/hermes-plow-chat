@@ -662,15 +662,23 @@ class PlowChatAdapter(BasePlatformAdapter):
         # already owns retrying.
         if not self._checkpoint(page[0]["uid"] if page else "", chat_uid):
             raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
-        # The 👋 is a first-meeting disclosure, sent once ever: the checkpoint
-        # file is the durable record of having met this chat, so it rides the
-        # anchor that creates it -- an in-memory latch re-greeted every granted
-        # chat on every gateway restart, a wave of noise into real rooms.
-        if first_meeting:
-            try:
-                await self.send(chat_uid, "👋")
-            except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
-                log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
+        await self._greet_first_meeting(chat_uid, first_meeting)
+
+    async def _greet_first_meeting(self, chat_uid, first_meeting):
+        """The 👋 first-meeting disclosure, sent once ever: the checkpoint
+        file is the durable record of having met this chat, so it rides
+        whichever baseline write creates it -- an in-memory latch re-greeted
+        every granted chat on every gateway restart, a wave of noise into
+        real rooms. Every caller that creates a chat's first checkpoint
+        (`_anchor`'s newest-message baseline, `_on_frame`'s empty baseline
+        for a mid-connection adopt) must route through here, or the chat
+        never gets introduced."""
+        if not first_meeting:
+            return
+        try:
+            await self.send(chat_uid, "👋")
+        except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
+            log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
     async def _backfill(self, http, chat_uid):
         """Process what arrived while the socket was down.
@@ -785,23 +793,31 @@ class PlowChatAdapter(BasePlatformAdapter):
             if chat_uid not in self.chat_uids:
                 log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
                 return
-            if not self._anchored_chats.get(chat_uid):
-                # The newest existing message is the very frame already in
-                # hand -- it is stored server-side before Hermes ever sees
-                # it. Anchoring at newest (as `_ensure_anchor` does for a
-                # chat known before connect) would checkpoint that message
-                # before the handoff below accepts it, so a crash in between
-                # drops the chat's first turn. An empty baseline instead lets
-                # `_backfill`'s pages-to-exhaustion branch recover it on
-                # reconnect; the ack-after-handoff checkpoint written in
-                # `_deliver` becomes the first durable one. Writing it now,
-                # before the message below is enqueued, is also what
-                # protects a reconnect landing ahead of that handoff: the
-                # checkpoint file existing on disk is what `_set_reach` reads
-                # back as "already anchored", so the next connect's
-                # `_ensure_anchor` loop will not re-anchor it at newest.
-                if not self._checkpoint("", chat_uid):
-                    raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
+            # Same lock `_ensure_anchor` uses: this frame's discovery and a
+            # concurrent tool-initiated send to the same brand-new chat_uid
+            # can race to baseline it, and unserialized the loser would
+            # double-write the checkpoint and double-send the greeting.
+            async with self._anchor_lock:
+                if not self._anchored_chats.get(chat_uid):
+                    # The newest existing message is the very frame already
+                    # in hand -- it is stored server-side before Hermes ever
+                    # sees it. Anchoring at newest (as `_anchor` does for a
+                    # chat known before connect) would checkpoint that
+                    # message before the handoff below accepts it, so a
+                    # crash in between drops the chat's first turn. An empty
+                    # baseline instead lets `_backfill`'s pages-to-exhaustion
+                    # branch recover it on reconnect; the ack-after-handoff
+                    # checkpoint written in `_deliver` becomes the first
+                    # durable one. Writing it now, before the message below
+                    # is enqueued, is also what protects a reconnect landing
+                    # ahead of that handoff: the checkpoint file existing on
+                    # disk is what `_set_reach` reads back as "already
+                    # anchored", so the next connect's `_ensure_anchor` loop
+                    # will not re-anchor it at newest.
+                    first_meeting = not self._checkpoint_path(chat_uid).exists()
+                    if not self._checkpoint("", chat_uid):
+                        raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
+                    await self._greet_first_meeting(chat_uid, first_meeting)
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]

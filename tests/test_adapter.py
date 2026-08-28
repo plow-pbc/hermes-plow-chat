@@ -823,7 +823,9 @@ async def test_unknown_chat_frame_adoption_cases(
     that message IS the frame already in hand, stored server-side before
     this process ever saw it. Anchoring it would checkpoint it ahead of the
     handoff below, so a crash in between would drop the chat's first turn;
-    `_ensure_anchor` raising here pins that it is never called."""
+    `_ensure_anchor` raising here pins that it is never called. The
+    first-meeting 👋 still fires -- baselining empty must not silently drop
+    the greeting that baselining at newest would have sent."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = object()  # the listen loop's live session, opaque to a mocked refresh
@@ -838,6 +840,13 @@ async def test_unknown_chat_frame_adoption_cases(
     monkeypatch.setattr(adapter, "_ensure_anchor",
                          mock.AsyncMock(side_effect=AssertionError("adoption must not anchor at newest")))
     handled = _capture_events(monkeypatch, adapter)
+    greetings: list[str] = []
+
+    async def greet(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        greetings.append(chat_id)
+        return _SendResult(success=True)
+
+    monkeypatch.setattr(adapter, "send", greet)
 
     frame = (_envelope("evt_new", "cht_new", "msg_new") if event_type == "message_received"
              else {"event_id": "evt_created", "event_type": "chat_created", "chat_id": "cht_new", "data": {}})
@@ -850,6 +859,7 @@ async def test_unknown_chat_frame_adoption_cases(
     assert ("cht_new" in adapter.chat_uids) == reveals
     assert [event["message_id"] for event in handled] == (["msg_new"] if expect_delivered else [])
     assert ("outside the grant" in caplog.text) == (not reveals)
+    assert greetings == (["cht_new"] if reveals else [])
     if reveals:
         # Recovery semantics, not a newest-message anchor: the baseline is
         # empty until the ack-after-handoff checkpoint (written in
