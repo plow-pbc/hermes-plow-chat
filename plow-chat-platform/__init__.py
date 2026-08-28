@@ -414,22 +414,77 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._cancel_typing(event.source.chat_id)
         self._member_turn_chat.set(None)
 
-    async def send(self, chat_id, content, reply_to=None, metadata=None):
+    def _send_guard(self, chat_id):
+        """The one rule for every outbound call: within the grant, and within
+        the member turn's chat while one is open. None means go."""
         if chat_id not in self.chat_uids:
             return SendResult(success=False, error=f"Plow Chat {chat_id!r} is outside this agent's grant")
         member_turn_chat = self._member_turn_chat.get()
         if member_turn_chat is not None and chat_id != member_turn_chat:
             return SendResult(success=False, error=f"Plow Chat member turn is confined to {member_turn_chat!r}")
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if refused := self._send_guard(chat_id):
+            return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
         self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
-            async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
-                                 json={"body": content.strip()}, headers=self.auth) as resp:
-                data = await resp.json(content_type=None)
+            return await self._post_message(http, chat_id, {"body": content.strip()})
+
+    async def _post_message(self, http, chat_id, payload):
+        async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
+                             json=payload, headers=self.auth) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
+            return SendResult(success=True, message_id=data.get("uid"))
+
+    async def _send_attachment(self, chat_id, path, *, caption=None, filename=None):
+        """Declare, upload, send — the Plow media contract, in that order.
+
+        The declare and the send carry the bearer; the PUT goes to the
+        provider's upload URL with exactly the headers Plow returned and
+        nothing else — that URL is a write capability, not a Plow endpoint.
+        Hermes routes every model-emitted file through the four hooks below,
+        so without this it fell to the base adapter's "native file send
+        unavailable" notice and the file never left the container.
+        """
+        if refused := self._send_guard(chat_id):
+            return refused
+        filename = filename or os.path.basename(path)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        self._cancel_typing(chat_id)
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f"{BASE}/v1/chats/{chat_id}/attachments",
+                                 json={"filename": filename, "content_type": content_type,
+                                       "size_bytes": len(data)},
+                                 headers=self.auth) as resp:
+                declared = await resp.json(content_type=None)
                 if resp.status >= 400:
-                    return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
-                return SendResult(success=True, message_id=data.get("uid"))
+                    return SendResult(success=False, error=f"Plow Chat {resp.status}: {declared}")
+            async with http.put(declared["upload_url"], data=data,
+                                headers=declared["upload_headers"]) as resp:
+                if resp.status >= 400:
+                    return SendResult(success=False, error=f"attachment upload {resp.status}")
+            return await self._post_message(
+                http, chat_id,
+                {"body": (caption or "").strip(), "attachment_uids": [declared["uid"]]})
+
+    async def send_image_file(self, chat_id, image_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, image_path, caption=caption)
+
+    async def send_voice(self, chat_id, audio_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, audio_path, caption=caption)
+
+    async def send_video(self, chat_id, video_path, caption=None, **_kwargs):
+        return await self._send_attachment(chat_id, video_path, caption=caption)
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None, **_kwargs):
+        return await self._send_attachment(chat_id, file_path, caption=caption, filename=file_name)
 
     async def start_group_thread(self, thread_handle, body):
         """POST a new Plow/Linq thread, then refresh reach so we listen to it.

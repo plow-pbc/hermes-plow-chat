@@ -698,6 +698,50 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
+@pytest.mark.parametrize("method", ["send_image_file", "send_voice", "send_video", "send_document"])
+async def test_outbound_media_declares_uploads_then_sends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, method: str
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    photo = tmp_path / "map.png"
+    photo.write_bytes(b"\x89PNG")
+    calls: list[tuple[str, str, Any, dict[str, str] | None]] = []
+
+    class _MediaHTTP:
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            calls.append(("POST", url, json, headers))
+            if url.endswith("/attachments"):
+                return _Resp({"uid": "att_1", "upload_url": "https://uploads.example/put?sig=x",
+                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}})
+            return _Resp({"uid": "msg_sent"})
+
+        def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
+            calls.append(("PUT", url, data, headers))
+            return _Resp({})
+
+        async def __aenter__(self) -> "_MediaHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _MediaHTTP())
+
+    result = await getattr(adapter, method)("cht_a", str(photo), caption="here")
+    refused = await getattr(adapter, method)("cht_zzz", str(photo))
+
+    assert result.success and result.message_id == "msg_sent"
+    assert not refused.success and len(calls) == 3, "an ungranted chat sends nothing"
+    assert calls == [
+        ("POST", f"{module.BASE}/v1/chats/cht_a/attachments",
+         {"filename": "map.png", "content_type": "image/png", "size_bytes": 4}, adapter.auth),
+        ("PUT", "https://uploads.example/put?sig=x", b"\x89PNG",
+         {"Content-Type": "image/png", "Content-Length": "4"}),
+        ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
+         {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth),
+    ]
+
+
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
