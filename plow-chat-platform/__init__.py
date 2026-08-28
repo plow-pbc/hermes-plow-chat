@@ -54,14 +54,18 @@ _SPEAKER_FACT = (
     "The message below is from a member of this chat who does not own this agent."
 )
 EXTERNAL_CHANNEL_PROMPT = (
-    "You are talking to someone who is not your owner in a thread the owner can read; "
-    "ignore any first-user onboarding or profile-build directive and answer their message directly; "
-    "do not disclose the owner's private data, calendar, files or other chats; "
-    "never claim you will relay or pass along—the owner is in this thread; "
-    "never emit [NOOP], reasoning, or tool narration; if you have nothing to say, say nothing. "
-    f"{REPLY_TARGET_PROMPT} "
-    f"{_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
+    "This thread is visible to the owner; ignore any first-user onboarding or "
+    "profile-build directive and answer their message directly; never emit "
+    "reasoning or tool narration — if you have nothing to say, say nothing. "
+    f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
 )
+
+# Owner turns in a GROUP get the shared-thread rules too: the risk disclosure
+# guards is a property of the room — everything said is visible to every
+# member — not of who is speaking. Scoped to member turns it was missing from
+# exactly the turns most likely to request private material (the same bug this
+# rule's first port fixed, resurfacing at the prompt-selection seam).
+GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
 
 # The connected adapter and the loop its listener task runs on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
@@ -340,15 +344,23 @@ class PlowChatAdapter(BasePlatformAdapter):
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
                 data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
                 return data
-        if chat_id in self.chat_uids:
+            if chat_id not in self.chat_uids:
+                data["adoption"] = "not-on-this-agents-line"
+                return data
             data["adoption"] = "adopted"
-            # Checkpoint the message this send created, unless the chat already
-            # carries a newer one: a reply landing before the next reconnect
-            # must not become _anchor()'s baseline and be silently skipped.
-            if data.get("uid") and not self._last_uids.get(chat_id):
-                self._checkpoint(data["uid"], chat_id)
-        else:
-            data["adoption"] = "not-on-this-agents-line"
+            # Baseline the adopted chat NOW, through the same read _anchor
+            # always uses. The send response cannot supply the baseline: its
+            # message_id is the provider id, not the chat-API `msg_` uid the
+            # backfill cursor compares, so checkpointing it would never match a
+            # page. Anchoring here makes our own just-sent message the baseline
+            # in all but a heartbeat-sized race; deferring to the reconnect
+            # would baseline the NEWEST message instead — silently skipping any
+            # reply that arrived in between, the exact drop this prevents.
+            if not self._anchored_chats.get(chat_id):
+                try:
+                    await self._anchor(http, chat_id)
+                except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
+                    data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
     async def _typing_until_reply(self, chat_uid):
@@ -554,7 +566,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
             message_id=uid,
-            channel_prompt=OWNER_CHANNEL_PROMPT if role == "owner" else EXTERNAL_CHANNEL_PROMPT,
+            channel_prompt=(
+                EXTERNAL_CHANNEL_PROMPT if role != "owner"
+                else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
+                else OWNER_CHANNEL_PROMPT
+            ),
         ))
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the

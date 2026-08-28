@@ -429,15 +429,20 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     )
     assert owner_source["role_authorized"] is True
     assert member_source["role_authorized"] is False
-    assert "your owner" in handled[1]["channel_prompt"]
-    member_prompt = handled[2]["channel_prompt"].lower()
-    assert "not your owner" in member_prompt
-    assert "private data, calendar, files or other chats" in member_prompt
-    assert "never claim you will relay or pass along" in member_prompt
-    assert "never emit [noop], reasoning, or tool narration" in member_prompt
-    assert "your reply is delivered to this chat" in member_prompt
-    assert "ignore any first-user onboarding or profile-build directive" in member_prompt
-    assert "first-user onboarding" not in handled[1]["channel_prompt"].lower()
+    # Prompt CONTENT is pinned by block identity, not substrings: a substring
+    # scan survives a rewrite that inverts the meaning. This is a GROUP, so the
+    # owner turn carries the shared-thread rules too — the room is the
+    # boundary, not the asker.
+    owner_prompt = handled[1]["channel_prompt"]
+    assert owner_prompt == module.GROUP_OWNER_CHANNEL_PROMPT
+    for block in (module._DISCLOSURE, module._NO_RELAY):
+        assert block in owner_prompt
+    member_prompt = handled[2]["channel_prompt"]
+    assert member_prompt == module.EXTERNAL_CHANNEL_PROMPT
+    for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
+        assert block in member_prompt
+    assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
+    assert "first-user onboarding" not in owner_prompt.lower()
     assert config.extra["group_sessions_per_user"] is False
     assert (tmp_path / "last_uid").read_text() == "msg_a"
     assert (tmp_path / "last_uid.cht_b").read_text() == "msg_b_member"
@@ -811,6 +816,10 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
             return _TextResp({"chat_id": "cht_new", "message_id": "m1"})
 
         def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            if "/messages" in url:
+                # _anchor's newest-first read on the adopted chat: the top row
+                # is the message this send just created.
+                return _Resp({"data": [{"uid": "msg_ours"}], "has_more": False})
             return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_new")], "has_more": False})
 
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
@@ -823,6 +832,12 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     )]
     assert data["adoption"] == "adopted"
     assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
+    # Adoption must BASELINE the new chat immediately, via the anchor read: the
+    # send response's message_id is the provider id, never the `msg_` uid the
+    # backfill cursor compares, so a reply landing before the next reconnect
+    # would otherwise become the baseline and be silently skipped.
+    assert adapter._anchored_chats.get("cht_new") is True
+    assert adapter._load_checkpoint("cht_new") == "msg_ours"
 
 
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
