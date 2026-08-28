@@ -81,7 +81,7 @@ def _isolated_state_root(monkeypatch, tmp_path):
     """Every adapter gets its own HERMES_HOME.
 
     Autouse because the adapter reads its message cursor at construction: without
-    this a suite run in a directory holding a real `plow-chat-cursor.json` would
+    this a suite run in a directory holding a real `plow-chat-seen.json` would
     adopt it, and tests would pass or fail on the developer's filesystem.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
