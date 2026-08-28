@@ -110,6 +110,26 @@ except ImportError:
     logger.warning("[plow_chat] gateway.response_filters.SILENT_REPLY_TOKEN not "
                    "importable; group silence falls back to %r", SILENT_REPLY_TOKEN)
 
+class _PlowAuthError(Exception):
+    """A 401 from Plow: the credential is gone, not a blip.
+
+    401 only, deliberately. A 403 is routinely about one resource — a chat this
+    agent was removed from — and `_body` is used for per-chat reads during vouch
+    hydration, so treating 403 as revocation would let one forbidden room latch
+    a permanent fatal and end discovery for every other room. Warn-and-retry is
+    the right answer there; the next pass drops the room through `_set_reach`.
+
+    Separate from the RuntimeError `_body` raises for every other status,
+    because the poll has to treat it differently. A 502 in front of Plow
+    recovers; a revoked token fails identically on every later attempt with the
+    same credential, so the retry cadence that serves the first is the thing
+    that hides the second.
+
+    Carries nothing but its message: both consumers discriminate on the type and
+    report with `str(exc)`, so a status attribute would be state no runtime reads.
+    """
+
+
 class _PlowSendError(Exception):
     """An HTTP error from the thread-creation POST, carrying the status."""
 
@@ -310,6 +330,8 @@ async def _body(resp):
     credential. And an error from something in front of Plow (a proxy 502, a WAF
     429) is not JSON at all, so decoding first loses the status to a decode error.
     """
+    if resp.status == 401:
+        raise _PlowAuthError(f"Plow {resp.status}: {(await resp.text())[:200]}")
     if resp.status >= 400:
         raise RuntimeError(f"Plow {resp.status}: {(await resp.text())[:200]}")
     return await resp.json(content_type=None)
@@ -461,6 +483,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # "adopted", so replies are silently missed until the next poll.
         self._reconcile_lock = asyncio.Lock()
         self._welcome_sent = False
+        # Latched so one dead credential produces one report. Every socket and
+        # the poll all discover the same 401, and N notifications for one cause
+        # is the noise that makes the signal unreadable.
+        self._auth_failed = False
         # Half of the shared-group-session setting, and the smaller half: this one
         # is the adapter's in-flight dispatch guard. The key the session is
         # *persisted* under comes from gateway config
@@ -899,6 +925,31 @@ class PlowChatAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("[plow_chat] could not publish channel aliases: %s", exc)
 
+    async def _fail_auth(self, exc: "_PlowAuthError") -> None:
+        """Report a dead credential once, through the channel a human sees.
+
+        `chat_activation_failed` already gets this treatment; a revoked token is
+        the same kind of fact — terminal, and unfixable from inside the process
+        — and got only a warning in a log nobody reads. An agent stayed deaf for
+        sixteen minutes on exactly that (issue #15).
+        """
+        if self._auth_failed:
+            return
+        self._auth_failed = True
+        logger.error("[plow_chat] %s — this agent's credential is revoked or invalid, "
+                     "so nothing it does can succeed until it is re-credentialed", exc)
+        # State first, delivery second. Notifying is the step that talks to the
+        # network, and this is the moment the network is least trustworthy — a
+        # raise there used to leave the latch set, the adapter still reporting
+        # itself connected, and no later call able to correct it, which is the
+        # symptom #15 exists to remove.
+        self._set_fatal_error("token_revoked", str(exc), retryable=False)
+        self._mark_disconnected()
+        try:
+            await self._notify_fatal_error()
+        except Exception:
+            logger.warning("[plow_chat] could not deliver the fatal-error notice", exc_info=True)
+
     async def _reconcile(self) -> None:
         """Adopt the chats nobody configured — polled, because nothing pushes them.
 
@@ -912,6 +963,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                 await self._reconcile_once()
             except asyncio.CancelledError:
                 raise
+            except _PlowAuthError as exc:
+                # Terminal: returning here ends the poll rather than asking the
+                # same dead credential the same question every 60 seconds.
+                await self._fail_auth(exc)
+                return
             except Exception as exc:
                 # Loud but not fatal. A poll that dies takes discovery with it for
                 # the life of the process, and the symptom — one thread silently
@@ -925,11 +981,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             json={"chat_id": chat_uid},
             headers={"Authorization": f"Bearer {self.token}"},
         ) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                err = data.get("error", {}) if isinstance(data, dict) else {}
-                raise RuntimeError(err.get("message") or f"ticket mint failed: {resp.status}")
-            return data["ticket"]
+            # `_body` owns this contract -- status before parse, 401 as
+            # _PlowAuthError, everything else a RuntimeError carrying the status.
+            # The mint used to restate it, and restating it is how the two copies
+            # drifted apart twice: once when only the 401 side was reordered, and
+            # again when the rewrite dropped `_body`'s non-dict guard.
+            return (await _body(resp))["ticket"]
 
     async def _websocket_loop(self, chat_uid: str) -> None:
         import aiohttp
@@ -950,6 +1007,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                             break
             except asyncio.CancelledError:
                 raise
+            except _PlowAuthError as exc:
+                # Same credential, same answer forever — backing off against it
+                # only buries the reason among identical warnings.
+                await self._fail_auth(exc)
+                return
             except Exception as exc:
                 logger.warning(
                     "[plow_chat] websocket loop error (%s): %s",

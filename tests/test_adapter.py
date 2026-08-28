@@ -914,6 +914,9 @@ class _TextResponse(FakeResponse):
     async def text(self):
         return self._text
 
+    async def json(self, content_type=None):
+        return json.loads(self._text)
+
 
 class _PostRecordingSession(PagingSession):
     """PagingSession plus an async post, for the thread-creation call.
@@ -1471,3 +1474,136 @@ def test_a_failed_publish_does_not_disturb_reach(monkeypatch, caplog):
 
     assert "cht_room" in a.chat_uids, "reach survives a naming failure"
     assert "could not publish" in caplog.text, "and the failure is still reported"
+
+
+# ---------------------------------------------------------------------------
+# A revoked token is terminal, not transient
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status,expected", [
+    # 401 is the credential itself — nothing this agent does can succeed until it
+    # is replaced, so the poll must stop rather than ask again every 60s.
+    (401, adapter_mod._PlowAuthError),
+    # 403 is routinely about one *resource* — a chat this agent was removed from —
+    # and _body serves per-chat reads during vouch hydration. Treating it as
+    # revocation would let one forbidden room end discovery for every other room.
+    (403, RuntimeError),
+    (429, RuntimeError),
+    (500, RuntimeError),
+])
+def test_body_treats_only_401_as_a_dead_credential(status, expected):
+    # _PlowAuthError is not a RuntimeError subclass, so `raises(RuntimeError)` is
+    # itself the discrimination: a 403 that came back typed would not match.
+    with pytest.raises(expected) as exc:
+        asyncio.run(adapter_mod._body(_TextResponse("upstream boom", status)))
+    assert str(status) in str(exc.value), "the status survives into the message either way"
+
+
+def test_a_revoked_token_is_reported_once_and_stops_the_poll(monkeypatch, caplog):
+    """The defect this fixes: a revoked credential logged a warning every 60s
+    forever and nothing else, so the agent went deaf silently. It must escalate
+    through the channel a human sees, and stop retrying what cannot succeed."""
+    a = _adapter(monkeypatch, groups=None)
+
+    async def _revoked():
+        raise adapter_mod._PlowAuthError("Plow 401: Invalid or revoked token")
+
+    a._reconcile_once = _revoked
+    slept = []
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep",
+                        lambda d: slept.append(d) or asyncio.sleep(0))
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(a._reconcile())
+
+    assert a.fatal_error[0][0] == "token_revoked", "must be reported as fatal, not warned"
+    assert a.fatal_error[1]["retryable"] is False
+    assert a.fatal_notified is True, "and surfaced, not just recorded"
+    assert a.is_connected is False
+    assert slept == [], "no retry cadence — the same token fails identically forever"
+    assert "revoked" in caplog.text
+
+
+def test_a_transient_failure_still_retries(monkeypatch, caplog):
+    """The guard on over-correcting: a 502 or a dropped connection must keep the
+    warn-and-retry behaviour, because that one does recover."""
+    a = _adapter(monkeypatch, groups=None)
+    calls = []
+
+    async def _flaky():
+        calls.append(1)
+        raise RuntimeError("Plow 502: upstream")
+
+    a._reconcile_once = _flaky
+
+    async def _sleep_once(_delay):
+        a._stop_event.set()
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _sleep_once)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._reconcile())
+
+    assert getattr(a, "fatal_error", None) is None, "a transient error is not fatal"
+    assert calls == [1]
+    assert "chat reconcile failed" in caplog.text
+
+
+def test_the_fatal_report_is_not_repeated_by_a_second_loop(monkeypatch):
+    """Every socket sees the same 401, and N notifications for one dead credential
+    is the noise that makes the real signal unreadable."""
+    a = _adapter(monkeypatch, groups=None)
+    notifications = []
+    a._notify_fatal_error = lambda: notifications.append(1) or asyncio.sleep(0)
+
+    exc = adapter_mod._PlowAuthError("Plow 401: revoked")
+    asyncio.run(a._fail_auth(exc))
+    asyncio.run(a._fail_auth(exc))
+
+    assert notifications == [1], "reported once, however many loops discover it"
+
+
+def test_the_ticket_mint_reports_a_revoked_credential_and_stops_the_socket(monkeypatch, caplog):
+    """The socket is the other place the credential is presented, and it had the
+    same forever-backoff. Driven with a NON-JSON body because that is what a proxy
+    returns, and it is what catches a status check placed after the decode."""
+    a = _adapter(monkeypatch, groups=None)
+    a._http_session = types.SimpleNamespace(
+        post=lambda *a_, **k_: _TextResponse("<html>401 Unauthorized</html>", 401))
+    slept = []
+    real_sleep = asyncio.sleep
+
+    async def _record(delay):
+        slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", _record)
+
+    # WARNING, not ERROR: the generic loop handler logs at WARNING, and capturing
+    # only ERROR would make the "not a generic loop error" assertion vacuous.
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(a._websocket_loop("cht_home"))
+
+    assert a.fatal_error[0][0] == "token_revoked"
+    assert a.is_connected is False
+    assert slept == [], "no backoff against a credential that cannot come back"
+    assert "websocket loop error" not in caplog.text, "reported as revocation, not as a generic loop error"
+
+
+def test_a_failed_notification_still_leaves_the_adapter_marked_disconnected(monkeypatch):
+    """Notifying is the step that touches the network, at the moment the network is
+    least trustworthy. A raise there must not strand the disconnect behind the
+    latch — that is the symptom this change exists to remove."""
+    a = _adapter(monkeypatch, groups=None)
+    a._mark_connected()
+
+    async def _boom():
+        raise RuntimeError("delivery failed")
+
+    a._notify_fatal_error = _boom
+
+    asyncio.run(a._fail_auth(adapter_mod._PlowAuthError("Plow 401: revoked")))
+
+    assert a.fatal_error[0][0] == "token_revoked", "recorded before delivery is attempted"
+    assert a.is_connected is False, "and the disconnect is not stranded behind the failure"
