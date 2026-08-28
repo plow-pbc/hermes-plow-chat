@@ -103,7 +103,12 @@ accepts; a `415` from the declare comes back as the send's error.
 
 Both halves need the attachments API — `plow-pbc/plow#1435`. Against an older
 API the inbound path sees no `attachments` field (a `KeyError`, loud, per
-REVIEW.md) and an outbound declare returns `404`.
+REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
+the frame loop on every inbound message, so the socket is torn down and
+reconnected every 5s and the phone line is mute until the API catches up:
+`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
+until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+to.
 
 ## One implementation, two delivery paths
 

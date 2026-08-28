@@ -74,10 +74,19 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
             return str(path)
         return write
 
+    def _cache_doc():
+        # Distinguishable from the image/audio/video stubs above: the second
+        # arg here is a real filename, not a bare extension suffix.
+        def write(data: bytes, filename: str = "") -> str:
+            path = cache / f"doc_{len(list(cache.iterdir()))}_{filename}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
     base.cache_image_from_bytes = _cache("img")  # type: ignore[attr-defined]
     base.cache_audio_from_bytes = _cache("aud")  # type: ignore[attr-defined]
     base.cache_video_from_bytes = _cache("vid")  # type: ignore[attr-defined]
-    base.cache_document_from_bytes = _cache("doc")  # type: ignore[attr-defined]
+    base.cache_document_from_bytes = _cache_doc()  # type: ignore[attr-defined]
 
     for name, module in {
         "gateway": types.ModuleType("gateway"),
@@ -253,8 +262,11 @@ URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
         ("", "image/png", URL, 404, "[attachment: image/png unavailable]", "text"),
         # null content_type falls to application/octet-stream, becomes document.
         ("", None, URL, 200, "(attachment)", "document"),
+        # a content-type parameter (charset, boundary, ...) must be stripped.
+        ("", "image/jpeg; charset=binary", URL, 200, "(attachment)", "photo"),
     ],
-    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed", "null-type"],
+    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed", "null-type",
+         "parameterized-type"],
 )
 async def test_inbound_media_reaches_hermes_as_local_files(
     monkeypatch: pytest.MonkeyPatch,
@@ -277,7 +289,8 @@ async def test_inbound_media_reaches_hermes_as_local_files(
 
     monkeypatch.setattr(adapter, "handle_message", capture)
 
-    expected_type = content_type or "application/octet-stream"
+    expected_type = (content_type.split(";")[0].strip() if content_type
+                     else "application/octet-stream")
     await adapter._on_frame(_envelope(
         "evt_media", "cht_a", "msg_media", body=body,
         attachments=[{"uid": "att_photo", "filename": "photo.png",
@@ -295,6 +308,70 @@ async def test_inbound_media_reaches_hermes_as_local_files(
     (path,) = event["media_urls"]
     assert pathlib.Path(path).read_bytes() == b"\x89PNG"
     assert event["media_types"] == [expected_type]
+    if expected_kind == "document":
+        assert pathlib.Path(path).name.endswith("photo.png"), "cached document keeps its filename"
+
+
+async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Plow-failed part (status "failed", url null) is named in the text and
+    logged, without dropping the good part that arrived alongside it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope(
+            "evt_multi", "cht_a", "msg_multi", body="",
+            attachments=[
+                {"uid": "att_ok", "filename": "photo.png", "content_type": "image/png",
+                 "url": URL, "size_bytes": 4, "status": "received",
+                 "url_expires_at": "2026-08-28T00:05:00Z"},
+                {"uid": "att_bad", "filename": "doc.pdf", "content_type": "application/pdf",
+                 "url": None, "size_bytes": 4, "status": "failed", "url_expires_at": None},
+            ],
+        ))
+
+    event = handled[0]
+    assert len(event["media_urls"]) == 1
+    assert event["media_types"] == ["image/png"]
+    assert event["message_type"].value == "photo"
+    assert event["text"] == "[attachment: application/pdf delivery failed]"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("att_bad" in r.getMessage() for r in warnings)
+    assert not any("sig=" in r.getMessage() or "http" in r.getMessage() for r in warnings)
+
+
+async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The same message uid arriving twice (socket/backfill overlap, or two
+    distinct wrapping events) must be deduped before the attachment fetch."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    attachments = [{"uid": "att_photo", "filename": "photo.png", "content_type": "image/png",
+                    "url": URL, "size_bytes": 4, "status": "received",
+                    "url_expires_at": "2026-08-28T00:05:00Z"}]
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_dup", attachments=attachments))
+
+    assert len(handled) == 1
+    assert len(http.gets) == 1
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -740,6 +817,48 @@ async def test_outbound_media_declares_uploads_then_sends(
         ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
          {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth),
     ]
+
+
+@pytest.mark.parametrize(("fail_at", "status"), [("declare", 415), ("upload", 403)])
+async def test_outbound_media_stops_on_declare_or_upload_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, fail_at: str, status: int,
+) -> None:
+    """A non-2xx at either the declare or the upload step must not reach the
+    message POST — no orphaned attachment_uid pointing at a half-sent file."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    photo = tmp_path / "map.png"
+    photo.write_bytes(b"\x89PNG")
+    calls: list[tuple[str, str]] = []
+
+    class _MediaHTTP:
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            calls.append(("POST", url))
+            if url.endswith("/attachments"):
+                declare_status = status if fail_at == "declare" else 200
+                return _Resp({"uid": "att_1", "upload_url": "https://uploads.example/put?sig=x",
+                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}},
+                             status=declare_status)
+            return _Resp({"uid": "msg_sent"})
+
+        def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
+            calls.append(("PUT", url))
+            return _Resp({}, status=status if fail_at == "upload" else 200)
+
+        async def __aenter__(self) -> "_MediaHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _MediaHTTP())
+
+    result = await adapter.send_image_file("cht_a", str(photo), caption="here")
+
+    assert result.success is False
+    assert str(status) in result.error
+    assert ("POST", f"{module.BASE}/v1/chats/cht_a/messages") not in calls
+    if fail_at == "declare":
+        assert ("PUT", "https://uploads.example/put?sig=x") not in calls
 
 
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

@@ -102,10 +102,11 @@ async def _fetch_attachment(item, content_type):
     fetched now, without the bearer (the signature IS the authorization), and
     the bytes land where the image's vision path already looks — the same
     cache the bundled iMessage adapter fills. None means unavailable: the
-    caller surfaces that in the turn rather than dropping it.
+    caller surfaces that in the turn rather than dropping it. Bounded to 30s
+    total: a stalled fetch must not mute the frame loop.
     """
     try:
-        async with aiohttp.ClientSession() as http:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
             async with http.get(BASE + item["url"]) as resp:
                 resp.raise_for_status()
                 data = await resp.read()
@@ -123,7 +124,7 @@ async def _fetch_attachment(item, content_type):
 
 
 def _message_type(media_types):
-    prefixes = {(t or "").split("/")[0] for t in media_types}
+    prefixes = {t.split("/")[0] for t in media_types}
     if "image" in prefixes:
         return MessageType.PHOTO
     if "audio" in prefixes:
@@ -425,7 +426,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        if refused := self._send_guard(chat_id):
+        refused = self._send_guard(chat_id)
+        if refused is not None:
             return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
@@ -451,7 +453,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         so without this it fell to the base adapter's "native file send
         unavailable" notice and the file never left the container.
         """
-        if refused := self._send_guard(chat_id):
+        refused = self._send_guard(chat_id)
+        if refused is not None:
             return refused
         filename = filename or os.path.basename(path)
         with open(path, "rb") as fh:
@@ -731,6 +734,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
         role = sender["role"]
+        uid = msg["uid"]
+        message_key = (chat_uid, uid)
+        if message_key in self._seen:
+            return                           # socket/backfill overlap - never re-fetch
         # A failed part is a documented state (status "failed", url null), not
         # schema drift. A part whose bytes cannot be fetched now is the same to
         # the model: named in the turn, never dropped with it.
@@ -742,14 +749,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 media_urls.append(path)
                 media_types.append(content_type)
             else:
+                if not item["url"]:
+                    log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
                 notes.append(f"[attachment: {content_type} "
                              f"{'unavailable' if item['url'] else 'delivery failed'}]")
         text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
         if not text and media_urls:
             text = "(attachment)"
-        uid = msg["uid"]
-        message_key = (chat_uid, uid)
-        if not text or message_key in self._seen:
+        if not text:
             return
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
