@@ -742,9 +742,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         # schema drift. A part whose bytes cannot be fetched now is the same to
         # the model: named in the turn, never dropped with it.
         media_urls, media_types, notes = [], [], []
-        for item in msg["attachments"]:
-            content_type = (item["content_type"] or "application/octet-stream").split(";")[0].strip()
-            path = await _fetch_attachment(item, content_type) if item["url"] else None
+        parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
+                 for item in msg["attachments"]]
+        # Fetched concurrently: this runs inside the frame loop, so a stalled
+        # part must cost the line one timeout, not one per part.
+        paths = await asyncio.gather(*(
+            _fetch_attachment(item, content_type) if item["url"] else asyncio.sleep(0)
+            for item, content_type in parts))
+        for (item, content_type), path in zip(parts, paths):
             if path:
                 media_urls.append(path)
                 media_types.append(content_type)

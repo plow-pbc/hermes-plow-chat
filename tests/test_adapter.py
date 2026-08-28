@@ -775,27 +775,44 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
-@pytest.mark.parametrize("method", ["send_image_file", "send_voice", "send_video", "send_document"])
-async def test_outbound_media_declares_uploads_then_sends(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, method: str
+@pytest.mark.parametrize(
+    ("method", "fail_at", "status"),
+    [
+        ("send_image_file", None, 200),
+        ("send_voice", None, 200),
+        ("send_video", None, 200),
+        ("send_document", None, 200),
+        ("send_image_file", "declare", 415),
+        ("send_image_file", "upload", 403),
+    ],
+    ids=["image", "voice", "video", "document", "declare-415", "upload-403"],
+)
+async def test_outbound_media_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, method: str, fail_at: str | None, status: int,
 ) -> None:
+    """Declare (bearer) -> PUT bytes to the provider URL with exactly the
+    returned headers (no bearer) -> message POST (bearer). A non-2xx at the
+    declare or the upload never reaches the message POST, so no attachment_uid
+    ever points at a half-sent file."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     photo = tmp_path / "map.png"
     photo.write_bytes(b"\x89PNG")
     calls: list[tuple[str, str, Any, dict[str, str] | None]] = []
+    upload_url = "https://uploads.example/put?sig=x"
 
     class _MediaHTTP:
         def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
             calls.append(("POST", url, json, headers))
             if url.endswith("/attachments"):
-                return _Resp({"uid": "att_1", "upload_url": "https://uploads.example/put?sig=x",
-                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}})
+                return _Resp({"uid": "att_1", "upload_url": upload_url,
+                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}},
+                             status=status if fail_at == "declare" else 200)
             return _Resp({"uid": "msg_sent"})
 
         def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
             calls.append(("PUT", url, data, headers))
-            return _Resp({})
+            return _Resp({}, status=status if fail_at == "upload" else 200)
 
         async def __aenter__(self) -> "_MediaHTTP":
             return self
@@ -807,58 +824,18 @@ async def test_outbound_media_declares_uploads_then_sends(
     result = await getattr(adapter, method)("cht_a", str(photo), caption="here")
     refused = await getattr(adapter, method)("cht_zzz", str(photo))
 
-    assert result.success and result.message_id == "msg_sent"
-    assert not refused.success and len(calls) == 3, "an ungranted chat sends nothing"
-    assert calls == [
-        ("POST", f"{module.BASE}/v1/chats/cht_a/attachments",
-         {"filename": "map.png", "content_type": "image/png", "size_bytes": 4}, adapter.auth),
-        ("PUT", "https://uploads.example/put?sig=x", b"\x89PNG",
-         {"Content-Type": "image/png", "Content-Length": "4"}),
-        ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
-         {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth),
-    ]
-
-
-@pytest.mark.parametrize(("fail_at", "status"), [("declare", 415), ("upload", 403)])
-async def test_outbound_media_stops_on_declare_or_upload_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, fail_at: str, status: int,
-) -> None:
-    """A non-2xx at either the declare or the upload step must not reach the
-    message POST — no orphaned attachment_uid pointing at a half-sent file."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    photo = tmp_path / "map.png"
-    photo.write_bytes(b"\x89PNG")
-    calls: list[tuple[str, str]] = []
-
-    class _MediaHTTP:
-        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
-            calls.append(("POST", url))
-            if url.endswith("/attachments"):
-                declare_status = status if fail_at == "declare" else 200
-                return _Resp({"uid": "att_1", "upload_url": "https://uploads.example/put?sig=x",
-                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}},
-                             status=declare_status)
-            return _Resp({"uid": "msg_sent"})
-
-        def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
-            calls.append(("PUT", url))
-            return _Resp({}, status=status if fail_at == "upload" else 200)
-
-        async def __aenter__(self) -> "_MediaHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _MediaHTTP())
-
-    result = await adapter.send_image_file("cht_a", str(photo), caption="here")
-
-    assert result.success is False
-    assert str(status) in result.error
-    assert ("POST", f"{module.BASE}/v1/chats/cht_a/messages") not in calls
-    if fail_at == "declare":
-        assert ("PUT", "https://uploads.example/put?sig=x") not in calls
+    assert not refused.success, "an ungranted chat sends nothing"
+    declare = ("POST", f"{module.BASE}/v1/chats/cht_a/attachments",
+               {"filename": "map.png", "content_type": "image/png", "size_bytes": 4}, adapter.auth)
+    upload = ("PUT", upload_url, b"\x89PNG", {"Content-Type": "image/png", "Content-Length": "4"})
+    send = ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
+            {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth)
+    if fail_at is None:
+        assert result.success and result.message_id == "msg_sent"
+        assert calls == [declare, upload, send]
+    else:
+        assert result.success is False and str(status) in result.error
+        assert calls == [declare] if fail_at == "declare" else [declare, upload]
 
 
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
