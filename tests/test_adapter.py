@@ -58,6 +58,26 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
     base.SendResult = _SendResult  # type: ignore[attr-defined]
+    import enum
+
+    class _MessageType(enum.Enum):
+        TEXT = "text"; PHOTO = "photo"; VIDEO = "video"; VOICE = "voice"; DOCUMENT = "document"
+
+    base.MessageType = _MessageType  # type: ignore[attr-defined]
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    def _cache(kind: str):
+        def write(data: bytes, name: str = "") -> str:
+            path = cache / f"{kind}_{len(list(cache.iterdir()))}{name}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
+    base.cache_image_from_bytes = _cache("img")  # type: ignore[attr-defined]
+    base.cache_audio_from_bytes = _cache("aud")  # type: ignore[attr-defined]
+    base.cache_video_from_bytes = _cache("vid")  # type: ignore[attr-defined]
+    base.cache_document_from_bytes = _cache("doc")  # type: ignore[attr-defined]
 
     for name, module in {
         "gateway": types.ModuleType("gateway"),
@@ -190,34 +210,64 @@ def _envelope(
     }
 
 
+class _BytesResp(_Resp):
+    def __init__(self, data: bytes, status: int = 200) -> None:
+        super().__init__(None, status)
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
+class _ContentHTTP:
+    """GET on a signed content URL; records that no bearer header was sent."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(self, url: str, **kw: Any) -> _BytesResp:
+        self.gets.append((url, kw.get("headers")))
+        return _BytesResp(b"\x89PNG", status=self.status)
+
+    async def __aenter__(self) -> "_ContentHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+
+URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
+
+
 @pytest.mark.parametrize(
-    ("body", "url", "expected_text"),
+    ("body", "content_type", "url", "status", "expected_text", "expected_kind"),
     [
-        (
-            "",
-            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
-            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
-        ),
-        (
-            "Photo attached",
-            "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
-            "Photo attached\n"
-            "[attachment: image/png https://api.plow.co/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
-        ),
-        # status "failed" carries url: null by contract — still surfaced, not dropped.
-        ("", None, "[attachment: image/png delivery failed]"),
+        ("", "image/png", URL, 200, "(attachment)", "photo"),
+        ("Photo attached", "image/png", URL, 200, "Photo attached", "photo"),
+        ("", "audio/x-m4a", URL, 200, "(attachment)", "voice"),
+        ("", "video/mp4", URL, 200, "(attachment)", "video"),
+        ("", "application/pdf", URL, 200, "(attachment)", "document"),
+        # status "failed" carries url: null by contract — surfaced, not dropped.
+        ("", "image/png", None, 200, "[attachment: image/png delivery failed]", "text"),
+        # provider bytes gone (404 from the content route) — surfaced, not dropped.
+        ("", "image/png", URL, 404, "[attachment: image/png unavailable]", "text"),
     ],
-    ids=["media-only", "captioned-media", "failed-part"],
+    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed"],
 )
-async def test_inbound_media_reaches_hermes(
+async def test_inbound_media_reaches_hermes_as_local_files(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     body: str,
+    content_type: str,
     url: str | None,
+    status: int,
     expected_text: str,
+    expected_kind: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=status)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[dict[str, Any]] = []
 
     async def capture(event: dict[str, Any]) -> None:
@@ -225,17 +275,22 @@ async def test_inbound_media_reaches_hermes(
 
     monkeypatch.setattr(adapter, "handle_message", capture)
 
-    await adapter._on_frame(
-        _envelope(
-            "evt_media",
-            "cht_a",
-            "msg_media",
-            body=body,
-            attachments=[{"content_type": "image/png", "url": url}],
-        )
-    )
+    await adapter._on_frame(_envelope(
+        "evt_media", "cht_a", "msg_media", body=body,
+        attachments=[{"uid": "att_photo", "filename": "photo.png",
+                      "content_type": content_type, "url": url}],
+    ))
 
-    assert handled[0]["text"] == expected_text
+    event = handled[0]
+    assert event["text"] == expected_text
+    assert event["message_type"].value == expected_kind
+    if expected_kind == "text":
+        assert event["media_urls"] == []
+        return
+    assert http.gets == [(module.BASE + URL, None)], "signed URL, no bearer header"
+    (path,) = event["media_urls"]
+    assert pathlib.Path(path).read_bytes() == b"\x89PNG"
+    assert event["media_types"] == [content_type]
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

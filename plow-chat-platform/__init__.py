@@ -7,12 +7,17 @@ import asyncio
 import contextvars
 import json
 import logging
+import mimetypes
 import os
 import pathlib
 
 import aiohttp
 from gateway.config import HomeChannel, Platform, persist_home_channel
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter, MessageEvent, MessageType, SendResult,
+    cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
+    cache_video_from_bytes,
+)
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 PLATFORM_NAME = "plow_chat"
@@ -88,6 +93,45 @@ def _write_channel_aliases(names):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
     os.replace(tmp, path)
+
+
+async def _fetch_attachment(item):
+    """Download one inbound part into Hermes' media cache; the local path.
+
+    The content URL is Plow-signed and five minutes old at most, so it is
+    fetched now, without the bearer (the signature IS the authorization), and
+    the bytes land where the image's vision path already looks — the same
+    cache the bundled iMessage adapter fills. None means unavailable: the
+    caller surfaces that in the turn rather than dropping it.
+    """
+    content_type = (item.get("content_type") or "application/octet-stream").split(";")[0].strip()
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(BASE + item["url"]) as resp:
+                resp.raise_for_status()
+                data = await resp.read()
+    except Exception as exc:  # noqa: BLE001 - the turn still reaches hermes, minus the bytes
+        log.warning("[plow_chat] attachment %s fetch failed: %s", item.get("uid"), type(exc).__name__)
+        return None
+    ext = mimetypes.guess_extension(content_type)
+    if content_type.startswith("image/"):
+        return cache_image_from_bytes(data, ext or ".jpg")
+    if content_type.startswith("audio/"):
+        return cache_audio_from_bytes(data, ext or ".m4a")
+    if content_type.startswith("video/"):
+        return cache_video_from_bytes(data, ext or ".mp4")
+    return cache_document_from_bytes(data, item.get("filename") or f"{item.get('uid')}{ext or ''}")
+
+
+def _message_type(media_types):
+    prefixes = {(t or "").split("/")[0] for t in media_types}
+    if "image" in prefixes:
+        return MessageType.PHOTO
+    if "audio" in prefixes:
+        return MessageType.VOICE
+    if "video" in prefixes:
+        return MessageType.VIDEO
+    return MessageType.DOCUMENT if media_types else MessageType.TEXT
 
 
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
@@ -634,12 +678,20 @@ class PlowChatAdapter(BasePlatformAdapter):
             return
         role = sender["role"]
         # A failed part is a documented state (status "failed", url null), not
-        # schema drift; anything else missing should raise, per REVIEW.md.
-        attachment_text = "\n".join(
-            f"[attachment: {item['content_type']} {BASE + item['url'] if item['url'] else 'delivery failed'}]"
-            for item in msg["attachments"]
-        )
-        text = "\n".join(part for part in (msg["body"].strip(), attachment_text) if part)
+        # schema drift. A part whose bytes cannot be fetched now is the same to
+        # the model: named in the turn, never dropped with it.
+        media_urls, media_types, notes = [], [], []
+        for item in msg["attachments"]:
+            path = await _fetch_attachment(item) if item["url"] else None
+            if path:
+                media_urls.append(path)
+                media_types.append(item["content_type"])
+            else:
+                notes.append(f"[attachment: {item['content_type']} "
+                             f"{'unavailable' if item['url'] else 'delivery failed'}]")
+        text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
+        if not text and media_urls:
+            text = "(attachment)"
         uid = msg["uid"]
         message_key = (chat_uid, uid)
         if not text or message_key in self._seen:
@@ -652,6 +704,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
             message_id=uid,
+            media_urls=media_urls,
+            media_types=media_types,
+            message_type=_message_type(media_types),
             channel_prompt=(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
