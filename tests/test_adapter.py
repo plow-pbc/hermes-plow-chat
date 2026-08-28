@@ -248,6 +248,13 @@ class _ContentHTTP:
 URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
 
 
+def _attachment(**overrides: Any) -> dict[str, Any]:
+    """One inbound part with every key the Plow contract always sends."""
+    return {"uid": "att_photo", "filename": "photo.png", "content_type": "image/png",
+            "url": URL, "size_bytes": 4, "status": "received",
+            "url_expires_at": "2026-08-28T00:05:00Z"} | overrides
+
+
 @pytest.mark.parametrize(
     ("body", "content_type", "url", "status", "expected_text", "expected_kind"),
     [
@@ -293,9 +300,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
                      else "application/octet-stream")
     await adapter._on_frame(_envelope(
         "evt_media", "cht_a", "msg_media", body=body,
-        attachments=[{"uid": "att_photo", "filename": "photo.png",
-                      "content_type": content_type, "url": url, "size_bytes": 4,
-                      "status": "received", "url_expires_at": "2026-08-28T00:05:00Z"}],
+        attachments=[_attachment(content_type=content_type, url=url)],
     ))
 
     event = handled[0]
@@ -332,11 +337,9 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
         await adapter._on_frame(_envelope(
             "evt_multi", "cht_a", "msg_multi", body="",
             attachments=[
-                {"uid": "att_ok", "filename": "photo.png", "content_type": "image/png",
-                 "url": URL, "size_bytes": 4, "status": "received",
-                 "url_expires_at": "2026-08-28T00:05:00Z"},
-                {"uid": "att_bad", "filename": "doc.pdf", "content_type": "application/pdf",
-                 "url": None, "size_bytes": 4, "status": "failed", "url_expires_at": None},
+                _attachment(uid="att_ok"),
+                _attachment(uid="att_bad", filename="doc.pdf", content_type="application/pdf",
+                            url=None, status="failed", url_expires_at=None),
             ],
         ))
 
@@ -364,9 +367,7 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(adapter, "handle_message", capture)
 
-    attachments = [{"uid": "att_photo", "filename": "photo.png", "content_type": "image/png",
-                    "url": URL, "size_bytes": 4, "status": "received",
-                    "url_expires_at": "2026-08-28T00:05:00Z"}]
+    attachments = [_attachment()]
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_dup", attachments=attachments))
 
