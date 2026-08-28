@@ -1357,6 +1357,11 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
 
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    # A reply beating this call is already stored server-side but not yet
+    # handed to hermes -- anchoring at newest here would checkpoint it ahead
+    # of that handoff, so this path must never reach `_anchor`.
+    monkeypatch.setattr(adapter, "_anchor",
+                         mock.AsyncMock(side_effect=AssertionError("start_group_thread must not anchor at newest")))
 
     posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
@@ -1370,18 +1375,14 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
             return _TextResp({"chat_id": "cht_new", "message_id": "m1"})
 
         def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            if "/messages" in url:
-                # _anchor's newest-first read on the adopted chat: the top row
-                # is the message this send just created.
-                return _Resp({"data": [{"uid": "msg_ours"}], "has_more": False})
             return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_new")], "has_more": False})
 
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
     data = await adapter.start_group_thread("+15550001111", "hello")
 
-    # The linq send, then the first-meeting 👋 the adoption anchor fires --
-    # the greeting rides the anchor, so a tool-created chat is disclosed even
-    # though the socket is already up.
+    # The linq send, then the first-meeting 👋 the empty-baseline anchor
+    # fires -- the greeting rides it, so a tool-created chat is disclosed
+    # even though the socket is already up.
     assert posts == [(
         f"{module.BASE}/channels/linq/send",
         {"thread_handle": "+15550001111", "text": "hello"},
@@ -1393,12 +1394,14 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     )]
     assert data["adoption"] == "adopted"
     assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
-    # Adoption must BASELINE the new chat immediately, via the anchor read: the
-    # send response's message_id is the provider id, never the `msg_` uid the
-    # backfill cursor compares, so a reply landing before the next reconnect
-    # would otherwise become the baseline and be silently skipped.
+    # Adoption must BASELINE the new chat immediately, empty rather than at
+    # its newest existing message: a reply that beats this call is already
+    # stored server-side but not yet handed to hermes, so anchoring it here
+    # would let a crash before that handoff drop it silently. `_backfill`
+    # recovers it on reconnect instead; the ack-after-handoff checkpoint
+    # written in `_deliver` becomes the first durable one.
     assert adapter._anchored_chats.get("cht_new") is True
-    assert adapter._load_checkpoint("cht_new") == "msg_ours"
+    assert adapter._load_checkpoint("cht_new") is None
 
 
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
