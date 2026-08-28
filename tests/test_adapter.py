@@ -58,6 +58,35 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
     base.SendResult = _SendResult  # type: ignore[attr-defined]
+    import enum
+
+    class _MessageType(enum.Enum):
+        TEXT = "text"; PHOTO = "photo"; VIDEO = "video"; VOICE = "voice"; DOCUMENT = "document"
+
+    base.MessageType = _MessageType  # type: ignore[attr-defined]
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    def _cache(kind: str):
+        def write(data: bytes, name: str = "") -> str:
+            path = cache / f"{kind}_{len(list(cache.iterdir()))}{name}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
+    def _cache_doc():
+        # Distinguishable from the image/audio/video stubs above: the second
+        # arg here is a real filename, not a bare extension suffix.
+        def write(data: bytes, filename: str = "") -> str:
+            path = cache / f"doc_{len(list(cache.iterdir()))}_{filename}"
+            path.write_bytes(data)
+            return str(path)
+        return write
+
+    base.cache_image_from_bytes = _cache("img")  # type: ignore[attr-defined]
+    base.cache_audio_from_bytes = _cache("aud")  # type: ignore[attr-defined]
+    base.cache_video_from_bytes = _cache("vid")  # type: ignore[attr-defined]
+    base.cache_document_from_bytes = _cache_doc()  # type: ignore[attr-defined]
 
     for name, module in {
         "gateway": types.ModuleType("gateway"),
@@ -67,13 +96,20 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
+    # The checkpoint base honors the fleet's HERMES_HOME; pin it here so the
+    # module-scope default never points a test at /var/lib/hermes.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLOW_HOME_CHANNEL", "cht_a")
     monkeypatch.setenv("PLOW_AGENT_TOKEN", "plow_tok")  # pragma: allowlist secret — a fixture string
     spec = importlib.util.spec_from_file_location("plow_chat_under_test", PLUGIN)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "CHECKPOINT", tmp_path / "last_uid")
+    # No CHECKPOINT override: with HERMES_HOME pinned above, the module's own
+    # env-derived resolution already lands in tmp_path -- the assert IS the
+    # regression pin for the fleet's checkpoint home (the old hardcoded
+    # /var/lib/hermes made every fleet anchor raise).
+    assert module.CHECKPOINT == tmp_path / "plow_chat_last_uid"
     return module
 
 
@@ -183,7 +219,15 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str
     return {"uid": uid, "display_name": name, "participants": participants}
 
 
-def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owner") -> dict[str, Any]:
+def _envelope(
+    event_id: str,
+    chat_id: str,
+    message_id: str,
+    *,
+    role: str = "owner",
+    body: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "event_id": event_id,
         "event_type": "message_received",
@@ -192,7 +236,8 @@ def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owne
             "type": "message_received",
             "message": {
                 "uid": message_id,
-                "body": message_id,
+                "body": message_id if body is None else body,
+                "attachments": attachments or [],
                 "direction": "inbound",
                 "sender": {
                     "type": "member",
@@ -203,6 +248,162 @@ def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owne
             },
         },
     }
+
+
+class _BytesResp(_Resp):
+    def __init__(self, data: bytes, status: int = 200) -> None:
+        super().__init__(None, status)
+        self._data = data
+
+    async def read(self) -> bytes:
+        return self._data
+
+
+class _ContentHTTP:
+    """GET on a signed content URL; records that no bearer header was sent."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+        self.gets: list[tuple[str, dict[str, str] | None]] = []
+
+    def get(self, url: str, **kw: Any) -> _BytesResp:
+        self.gets.append((url, kw.get("headers")))
+        return _BytesResp(b"\x89PNG", status=self.status)
+
+    async def __aenter__(self) -> "_ContentHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+
+URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
+
+
+def _attachment(**overrides: Any) -> dict[str, Any]:
+    """One inbound part with every key the Plow contract always sends."""
+    return {"uid": "att_photo", "filename": "photo.png", "content_type": "image/png",
+            "url": URL, "size_bytes": 4, "status": "received",
+            "url_expires_at": "2026-08-28T00:05:00Z"} | overrides
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "url", "status", "expected_text", "expected_kind"),
+    [
+        ("", "image/png", URL, 200, "(attachment)", "photo"),
+        ("Photo attached", "image/png", URL, 200, "Photo attached", "photo"),
+        ("", "audio/x-m4a", URL, 200, "(attachment)", "voice"),
+        ("", "video/mp4", URL, 200, "(attachment)", "video"),
+        ("", "application/pdf", URL, 200, "(attachment)", "document"),
+        # status "failed" carries url: null by contract — surfaced, not dropped.
+        ("", "image/png", None, 200, "[attachment: image/png delivery failed]", "text"),
+        # provider bytes gone (404 from the content route) — surfaced, not dropped.
+        ("", "image/png", URL, 404, "[attachment: image/png unavailable]", "text"),
+        # null content_type falls to application/octet-stream, becomes document.
+        ("", None, URL, 200, "(attachment)", "document"),
+        # a content-type parameter (charset, boundary, ...) must be stripped.
+        ("", "image/jpeg; charset=binary", URL, 200, "(attachment)", "photo"),
+    ],
+    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed", "null-type",
+         "parameterized-type"],
+)
+async def test_inbound_media_reaches_hermes_as_local_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: str,
+    content_type: str,
+    url: str | None,
+    status: int,
+    expected_text: str,
+    expected_kind: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=status)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    expected_type = (content_type.split(";")[0].strip() if content_type
+                     else "application/octet-stream")
+    await adapter._on_frame(_envelope(
+        "evt_media", "cht_a", "msg_media", body=body,
+        attachments=[_attachment(content_type=content_type, url=url)],
+    ))
+
+    event = handled[0]
+    assert event["text"] == expected_text
+    assert event["message_type"].value == expected_kind
+    if expected_kind == "text":
+        assert event["media_urls"] == []
+        return
+    assert http.gets == [(module.BASE + URL, None)], "signed URL, no bearer header"
+    (path,) = event["media_urls"]
+    assert pathlib.Path(path).read_bytes() == b"\x89PNG"
+    assert event["media_types"] == [expected_type]
+    if expected_kind == "document":
+        assert pathlib.Path(path).name.endswith("photo.png"), "cached document keeps its filename"
+
+
+async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Plow-failed part (status "failed", url null) is named in the text and
+    logged, without dropping the good part that arrived alongside it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope(
+            "evt_multi", "cht_a", "msg_multi", body="",
+            attachments=[
+                _attachment(uid="att_ok"),
+                _attachment(uid="att_bad", filename="doc.pdf", content_type="application/pdf",
+                            url=None, status="failed", url_expires_at=None),
+            ],
+        ))
+
+    event = handled[0]
+    assert len(event["media_urls"]) == 1
+    assert event["media_types"] == ["image/png"]
+    assert event["message_type"].value == "photo"
+    assert event["text"] == "[attachment: application/pdf delivery failed]"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("att_bad" in r.getMessage() for r in warnings)
+    assert not any("sig=" in r.getMessage() or "http" in r.getMessage() for r in warnings)
+
+
+async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The same message uid arriving twice (socket/backfill overlap, or two
+    distinct wrapping events) must be deduped before the attachment fetch."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ContentHTTP(status=200)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    attachments = [_attachment()]
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_dup", attachments=attachments))
+
+    assert len(handled) == 1
+    assert len(http.gets) == 1
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -359,7 +560,7 @@ async def test_startup_baseline_cases(
         assert "backfill" in calls, calls
 
     assert adapter._last_uids[adapter.home_chat_uid] == baseline
-    checkpoint = tmp_path / "last_uid"
+    checkpoint = tmp_path / "plow_chat_last_uid"
     if connects:
         # The file's existence is what records "this agent has anchored" — its
         # contents are the cursor, empty when the chat was empty. A restart has
@@ -380,7 +581,7 @@ async def test_a_restart_does_not_re_anchor_over_messages_it_never_handled(monke
     to hermes. The checkpoint file is the one durable owner of that state.
     """
     module = _load(monkeypatch, tmp_path)
-    checkpoint = tmp_path / "last_uid"
+    checkpoint = tmp_path / "plow_chat_last_uid"
     checkpoint.write_text("")  # anchored earlier, on an empty chat
 
     calls: list[str] = []
@@ -454,7 +655,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
         ("cht_b", "msg_b_member"),
     ]
     owner_source, member_source = handled[1]["source"], handled[2]["source"]
-    assert (owner_source["chat_name"], owner_source["chat_type"]) == ("Project room", "group")
+    assert (owner_source["chat_name"], owner_source["chat_type"]) == ("Project room (cht_b)", "group")
     assert (owner_source["chat_id"], owner_source["chat_type"]) == (
         member_source["chat_id"],
         member_source["chat_type"],
@@ -476,8 +677,8 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
     assert "first-user onboarding" not in owner_prompt.lower()
     assert config.extra["group_sessions_per_user"] is False
-    assert (tmp_path / "last_uid").read_text() == "msg_a"
-    assert (tmp_path / "last_uid.cht_b").read_text() == "msg_b_member"
+    assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_a"
+    assert (tmp_path / "plow_chat_last_uid.cht_b").read_text() == "msg_b_member"
     assert "outside the grant" in caplog.text
 
 
@@ -566,6 +767,57 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     assert sorted(greetings) == ["cht_a", "cht_b"], "each chat is latched before its one greeting attempt"
     assert {url.split("/v1/chats/")[1].split("/")[0] for url in http.gets} == {"cht_a", "cht_b"}
 
+    # A NEW process over the same checkpoints must not greet again: the wave is
+    # a first-meeting disclosure, and an in-memory latch alone re-sent it to
+    # every granted chat on every gateway restart.
+    restarted = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    restarted._set_reach([_chat("cht_a"), _chat("cht_b")])
+    monkeypatch.setattr(restarted, "send", greet)
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await restarted._listen()
+    assert sorted(greetings) == ["cht_a", "cht_b"], "a restart re-greeted an already-met chat"
+
+
+async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The startup loop and a tool adoption can find the same brand-new chat at
+    once; _ensure_anchor's lock, re-checked inside, is what keeps the
+    disclosure wave to one send (and one checkpoint write)."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+
+    class _YieldingResp(_Resp):
+        async def __aenter__(self) -> "_Resp":
+            # A reach rebuild lands mid-anchor, then control passes to the
+            # racing discoverer -- the two interleavings the lock must absorb.
+            adapter._set_reach([_chat("cht_a")])
+            await asyncio.sleep(0)
+            return self
+
+    class _HTTPStub:
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            return _YieldingResp({"data": [{"uid": "msg_1"}], "has_more": False})
+
+    sends: list[str] = []
+
+    async def send(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        sends.append(chat_id)
+        return _SendResult(success=True)
+
+    monkeypatch.setattr(adapter, "send", send)
+    http = _HTTPStub()
+
+    async def discover() -> None:
+        await adapter._ensure_anchor(http, "cht_a")
+
+    await asyncio.gather(discover(), discover())
+    assert sends == ["cht_a"], "concurrent discovery double-sent the disclosure wave"
+    assert adapter._load_checkpoint("cht_a") == "msg_1"
+
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(
     monkeypatch: pytest.MonkeyPatch,
@@ -606,6 +858,69 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
+@pytest.mark.parametrize(
+    ("method", "fail_at", "status"),
+    [
+        ("send_image_file", None, 200),
+        ("send_voice", None, 200),
+        ("send_video", None, 200),
+        ("send_document", None, 200),
+        ("send_image_file", "declare", 415),
+        ("send_image_file", "upload", 403),
+    ],
+    ids=["image", "voice", "video", "document", "declare-415", "upload-403"],
+)
+async def test_outbound_media_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, method: str, fail_at: str | None, status: int,
+) -> None:
+    """Declare (bearer) -> PUT bytes to the provider URL with exactly the
+    returned headers (no bearer) -> message POST (bearer). A non-2xx at the
+    declare or the upload never reaches the message POST, so no attachment_uid
+    ever points at a half-sent file."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    photo = tmp_path / "map.png"
+    photo.write_bytes(b"\x89PNG")
+    calls: list[tuple[str, str, Any, dict[str, str] | None]] = []
+    upload_url = "https://uploads.example/put?sig=x"
+
+    class _MediaHTTP:
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            calls.append(("POST", url, json, headers))
+            if url.endswith("/attachments"):
+                return _Resp({"uid": "att_1", "upload_url": upload_url,
+                              "upload_headers": {"Content-Type": "image/png", "Content-Length": "4"}},
+                             status=status if fail_at == "declare" else 200)
+            return _Resp({"uid": "msg_sent"})
+
+        def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
+            calls.append(("PUT", url, data, headers))
+            return _Resp({}, status=status if fail_at == "upload" else 200)
+
+        async def __aenter__(self) -> "_MediaHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _MediaHTTP())
+
+    result = await getattr(adapter, method)("cht_a", str(photo), caption="here")
+    refused = await getattr(adapter, method)("cht_zzz", str(photo))
+
+    assert not refused.success, "an ungranted chat sends nothing"
+    declare = ("POST", f"{module.BASE}/v1/chats/cht_a/attachments",
+               {"filename": "map.png", "content_type": "image/png", "size_bytes": 4}, adapter.auth)
+    upload = ("PUT", upload_url, b"\x89PNG", {"Content-Type": "image/png", "Content-Length": "4"})
+    send = ("POST", f"{module.BASE}/v1/chats/cht_a/messages",
+            {"body": "here", "attachment_uids": ["att_1"]}, adapter.auth)
+    if fail_at is None:
+        assert result.success and result.message_id == "msg_sent"
+        assert calls == [declare, upload, send]
+    else:
+        assert result.success is False and str(status) in result.error
+        assert calls == ([declare] if fail_at == "declare" else [declare, upload])
+
+
 async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -619,7 +934,7 @@ async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.Monk
     with pytest.raises(OSError) as error:
         await adapter._anchor(_AnchorHTTP(), "cht_b")
 
-    assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'last_uid.cht_b'}"
+    assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'plow_chat_last_uid.cht_b'}"
 
 
 # --- prompt rules and the group-send tool (ported from the operator-model adapter) ---
@@ -845,9 +1160,16 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
     data = await adapter.start_group_thread("+15550001111", "hello")
 
+    # The linq send, then the first-meeting 👋 the adoption anchor fires --
+    # the greeting rides the anchor, so a tool-created chat is disclosed even
+    # though the socket is already up.
     assert posts == [(
         f"{module.BASE}/channels/linq/send",
         {"thread_handle": "+15550001111", "text": "hello"},
+        adapter.auth,
+    ), (
+        f"{module.BASE}/v1/chats/cht_new/messages",
+        {"body": "👋"},
         adapter.auth,
     )]
     assert data["adoption"] == "adopted"
@@ -911,3 +1233,101 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"
     assert "ws_connect" not in calls, calls
+
+
+# ---------------------------------------------------------------------------
+# Naming: publish granted-thread titles into the image's alias registry
+# (re-port of #14's naming slice onto the credential-scope adapter)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chat,expected", [
+    # Plow's own answer -- the iMessage thread title -- always uid-suffixed.
+    (_chat("cht_x", name="Snoqualmie Cabin Cleaning Thread"),
+     "Snoqualmie Cabin Cleaning Thread (cht_x)"),
+    # Sparse: absent, empty, and whitespace all mean "nobody titled it".
+    (_chat("cht_x"), "cht_x"),
+    (_chat("cht_x", name=""), "cht_x"),
+    (_chat("cht_x", name="   "), "cht_x"),
+])
+def test_a_chat_is_named_from_its_own_title_or_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    chat: dict[str, Any],
+    expected: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._resolve_chat_names([chat], "cht_home")[chat["uid"]] == expected
+
+
+def test_the_home_chat_keeps_its_name_and_no_title_can_take_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The home is the one fixed, unsuffixed name. A title is chosen by whoever
+    is in the thread, so the uid suffix is what makes a title incapable of
+    equalling another room's name -- including the home's."""
+    module = _load(monkeypatch, tmp_path)
+    chats = [_chat("cht_home", name="Renamed By Someone"),
+             _chat("cht_impostor", name="Plow Chat")]
+    names = module._resolve_chat_names(chats, "cht_home")
+    assert names["cht_home"] == "Plow Chat"
+    assert names["cht_impostor"] == "Plow Chat (cht_impostor)"
+
+
+def test_publishing_names_owns_one_key_and_leaves_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The file is shared with every other platform on the gateway: replace our
+    key wholesale (stale entries are how names rot) and touch nothing else."""
+    module = _load(monkeypatch, tmp_path)
+    path = tmp_path / "channel_aliases.json"
+    path.write_text(json.dumps({"telegram": {"1": "Ops"},
+                                "plow_chat": {"cht_stale": "Old Name"}}))
+    module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
+    assert json.loads(path.read_text()) == {
+        "telegram": {"1": "Ops"},
+        "plow_chat": {"cht_a": "Cleaning (cht_a)"},
+    }
+
+
+def test_a_corrupt_alias_file_is_not_clobbered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    path = tmp_path / "channel_aliases.json"
+    path.write_text("[]")
+    with pytest.raises(ValueError):
+        module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
+    assert path.read_text() == "[]"
+
+
+def test_reach_publishes_the_names_it_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Writing the registry is the whole feature: the image re-applies the
+    overlay on every directory build and load, which is what makes a granted
+    thread addressable as plow_chat:#<name> before it has ever spoken."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Cleaning", group=True)])
+    data = json.loads((tmp_path / "channel_aliases.json").read_text())
+    assert data["plow_chat"] == {"cht_a": "Plow Chat", "cht_b": "Cleaning (cht_b)"}
+
+
+def test_an_unwritable_registry_does_not_cost_the_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Naming is cosmetic where reach is the credential grant. A registry that
+    cannot be written must not fail _set_reach, or one read-only file tears
+    down the line it decorates."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    monkeypatch.setattr(module, "_write_channel_aliases",
+                        mock.Mock(side_effect=OSError("read-only volume")))
+    adapter._set_reach([_chat("cht_a")])
+    assert adapter.chat_uids == frozenset({"cht_a"})

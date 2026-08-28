@@ -66,11 +66,49 @@ drops nothing.
 
 ### What a group thread is called
 
-The retired adapter named threads from `PLOW_CHAT_GROUP_UIDS` and the chats'
-own titles, publishing a channel-alias overlay. The credential-scope adapter
-does not do this yet — re-porting the naming layer is
-[#20](https://github.com/plow-pbc/hermes-plow-chat/issues/20). Until then a
-thread is addressed by its `cht_` id.
+The home chat is always `Plow Chat`. Every other granted thread is named from
+its own iMessage title — `<title> (<cht_ id>)`, the uid suffix making a title
+structurally unable to take another room's name — or by its bare `cht_` id
+when nobody has titled it. Titling the thread in iMessage is how it gets a
+name; there is no name configuration here.
+
+The result is published into the image's `channel_aliases.json` overlay on
+every (re)connect, which is re-applied on every channel-directory build and
+load, so a granted thread is addressable — and visible to `send_message
+action="list"` — before it has ever spoken. The suffix does not get in the way
+of addressing: the image's resolver falls back to an unambiguous prefix match,
+so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
+`Snoqualmie Cabin Cleaning (cht_...)`. A name grants nothing — reach and
+authority stay with the credential's grant. A retitle mid-connection shows up
+on the next reconnect.
+
+## Media
+
+Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`
+as files in the image's own media cache — the same place the bundled iMessage
+adapter puts them, so the vision path and the skills that say "a texted photo
+arrives as a file path" need nothing new. Each part is fetched once, at
+delivery, through the five-minute Plow-signed content URL and without the
+bearer: the signature is the authorization. A part Plow reports as `failed`, or
+one whose bytes cannot be fetched, is named in the turn as
+`[attachment: <type> delivery failed | unavailable]` and logged — never dropped
+with the message.
+
+Outbound files the model emits go through Hermes' `send_image_file` /
+`send_voice` / `send_video` / `send_document` hooks, which this adapter
+implements as the Plow contract — declare the attachment, PUT the bytes to the
+provider's upload URL with exactly the headers Plow returned, then send the
+message with `attachment_uids`. Content types are limited to what the provider
+accepts; a `415` from the declare comes back as the send's error.
+
+Both halves need the attachments API — `plow-pbc/plow#1435`. Against an older
+API the inbound path sees no `attachments` field (a `KeyError`, loud, per
+REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
+the frame loop on every inbound message, so the socket is torn down and
+reconnected every 5s and the phone line is mute until the API catches up:
+`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
+until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+to.
 
 ## One implementation, two delivery paths
 
