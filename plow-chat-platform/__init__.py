@@ -254,8 +254,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self):
+        # Only retire our own entry: a lagging disconnect on a replaced
+        # instance must not clobber the adapter that connected after it.
         global _live
-        _live = None
+        if _live is not None and _live[0] is self:
+            _live = None
         if self._ws_task:
             self._ws_task.cancel()
         for chat_uid in tuple(self._typing):
@@ -612,7 +615,9 @@ def _plow_start_group_message(args, **_kwargs):
             "success": True,
             "dry_run": True,
             "would_send": {
-                "recipient_count": len([r for r in recipients if str(r).strip()]),
+                # From the validated handle, so the reported count can never
+                # desync from the recipient set a confirmed send would use.
+                "recipient_count": len(thread_handle.split(",")),
                 "body": body,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "

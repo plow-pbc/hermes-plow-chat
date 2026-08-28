@@ -861,3 +861,22 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     )]
     assert data["adoption"] == "adopted"
     assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
+
+
+async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A stale adapter's disconnect must not clobber its successor's `_live`
+    entry — that would leave the send tool reporting a disconnected gateway
+    while a healthy adapter is live."""
+    module = _load(monkeypatch, tmp_path)
+    stale = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    live = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(module, "_live", (live, loop))
+
+    await stale.disconnect()
+    assert module._live == (live, loop)
+
+    await live.disconnect()
+    assert module._live is None
