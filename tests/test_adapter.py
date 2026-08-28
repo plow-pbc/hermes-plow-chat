@@ -1072,6 +1072,13 @@ def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "owner" in module.OWNER_CHANNEL_PROMPT.lower()
 
 
+def test_platform_declares_cron_delivery_home_channel(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    ctx = mock.Mock()
+    module.register(ctx)
+    assert ctx.register_platform.call_args.kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
+
+
 class _ToolContext:
     def __init__(self) -> None:
         self.tools: list[dict[str, Any]] = []
