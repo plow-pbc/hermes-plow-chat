@@ -664,19 +664,6 @@ def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tm
     assert out["would_send"]["recipient_count"] == 1
 
 
-def test_group_message_requires_confirm_to_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    """A caller that asked to send and forgot confirm must not read back as a
-    dry run it did not request."""
-    import json
-
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, raises=AssertionError("must not send without confirm"))
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False}))
-    assert out["success"] is False
-    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
-
-
 @pytest.mark.parametrize("recipients,message", [
     ([], "at least one recipient"),
     (["+1", "+1"], "duplicates"),
@@ -708,7 +695,7 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
     assert out["success"] is False
-    assert "confirm" in out["error"]
+    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
 
 
 @pytest.mark.parametrize("dry_run", ["false", "no", "0", 0, "off"])
