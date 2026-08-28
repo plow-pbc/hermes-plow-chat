@@ -277,6 +277,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             }
         }
         self._ws_task = None
+        self._http = None                    # the listen loop's live session, while connected
         self._anchor_lock = asyncio.Lock()
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
@@ -722,6 +723,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         while True:
             try:
                 async with aiohttp.ClientSession() as http:
+                    self._http = http        # live for _on_frame's mid-connection adopt
                     if not first_connection:
                         await self._refresh_reach(http)
                     first_connection = False
@@ -767,15 +769,38 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # that ticket is still live.
                 log.warning("[plow_chat] websocket error: %s", type(exc).__name__)
                 self._mark_disconnected()
+            finally:
+                self._http = None            # the session that live-ness belonged to just closed
             await asyncio.sleep(5)
+
+    async def _adopt_new_chat(self, chat_uid):
+        """A line-granted credential learns about a chat mid-connection --
+        one born after connect, or a `message_received` for one never seen.
+        One refresh re-reads the grant's reach; a chat the server still does
+        not list stays dropped, and the reconnect backfill is the durable
+        recovery, same as ever."""
+        http = self._http
+        if http is None:
+            return
+        try:
+            await self._refresh_reach(http)
+            if chat_uid in self.chat_uids:
+                await self._ensure_anchor(http, chat_uid)
+        except Exception as exc:  # noqa: BLE001 - the reconnect backfill recovers a failed adopt
+            log.warning("[plow_chat] reach refresh on new chat failed: %s", type(exc).__name__)
 
     async def _on_frame(self, frame):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
         if chat_uid not in self.chat_uids:
-            log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
-            return
+            # One refresh re-reads the grant's reach. Ahead of the event_type
+            # gate: a chat_created frame has no message to deliver, but still
+            # needs the reach update.
+            await self._adopt_new_chat(chat_uid)
+            if chat_uid not in self.chat_uids:
+                log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
+                return
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]

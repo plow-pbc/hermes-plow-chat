@@ -795,6 +795,106 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     assert "outside the grant" in caplog.text
 
 
+async def test_unknown_chat_frame_adopts_via_one_refresh_then_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A line-granted socket can carry a chat this agent has never seen --
+    one created after connect, or a sibling's room on the shared line. One
+    reach refresh either reveals it (adopted, this very frame delivered) or
+    it stays outside the grant."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._http = object()  # the listen loop's live session, stood in for
+    refresh_calls: list[Any] = []
+
+    async def fake_refresh(http: Any) -> None:
+        refresh_calls.append(http)
+        adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
+
+    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
+    anchored: list[str] = []
+
+    async def fake_anchor(http: Any, chat_uid: str) -> None:
+        anchored.append(chat_uid)
+
+    monkeypatch.setattr(adapter, "_ensure_anchor", fake_anchor)
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame(_envelope("evt_new", "cht_new", "msg_new"))
+    await _settle(adapter)
+
+    assert refresh_calls == [adapter._http]
+    assert anchored == ["cht_new"], "the frame in hand is the first message; anchoring baselines it"
+    assert [event["message_id"] for event in handled] == ["msg_new"]
+
+
+async def test_a_still_unrevealed_chat_is_dropped_after_one_refresh_per_frame(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A chat the refresh does not reveal (a sibling agent's room on the same
+    line) stays dropped -- costing exactly one refresh, not a retry loop
+    within the frame, and not zero on the next frame (no cooldown memo)."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._http = object()
+    refresh_calls: list[Any] = []
+
+    async def fake_refresh(http: Any) -> None:
+        refresh_calls.append(http)  # reach unchanged -- cht_out is never revealed
+
+    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
+    handled = _capture_events(monkeypatch, adapter)
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope("evt_out", "cht_out", "msg_out"))
+    assert len(refresh_calls) == 1, "one refresh per frame, never a retry loop inside it"
+    assert handled == []
+    assert "outside the grant" in caplog.text
+
+    await adapter._on_frame(_envelope("evt_out_2", "cht_out", "msg_out_2"))
+    assert len(refresh_calls) == 2, "each unrevealed frame costs its own refresh -- no cooldown"
+    assert handled == []
+
+
+async def test_chat_created_for_an_unknown_chat_adopts_with_no_message_to_deliver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """chat_created carries no message -- adoption still runs (ahead of the
+    event_type gate), but there is nothing to hand off."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._http = object()
+    refresh_calls: list[Any] = []
+
+    async def fake_refresh(http: Any) -> None:
+        refresh_calls.append(http)
+        adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
+
+    monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
+    anchored: list[str] = []
+
+    async def fake_anchor(http: Any, chat_uid: str) -> None:
+        anchored.append(chat_uid)
+
+    monkeypatch.setattr(adapter, "_ensure_anchor", fake_anchor)
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame({
+        "event_id": "evt_created", "event_type": "chat_created",
+        "chat_id": "cht_new", "data": {},
+    })
+    await _settle(adapter)
+
+    assert refresh_calls == [adapter._http]
+    assert anchored == ["cht_new"]
+    assert "cht_new" in adapter.chat_uids
+    assert handled == []
+
+
 class _HTTP:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
