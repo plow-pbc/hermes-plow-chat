@@ -251,8 +251,10 @@ URL = "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2"
         ("", "image/png", None, 200, "[attachment: image/png delivery failed]", "text"),
         # provider bytes gone (404 from the content route) — surfaced, not dropped.
         ("", "image/png", URL, 404, "[attachment: image/png unavailable]", "text"),
+        # null content_type falls to application/octet-stream, becomes document.
+        ("", None, URL, 200, "(attachment)", "document"),
     ],
-    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed"],
+    ids=["media-only", "captioned", "audio", "video", "document", "failed-part", "fetch-failed", "null-type"],
 )
 async def test_inbound_media_reaches_hermes_as_local_files(
     monkeypatch: pytest.MonkeyPatch,
@@ -275,10 +277,12 @@ async def test_inbound_media_reaches_hermes_as_local_files(
 
     monkeypatch.setattr(adapter, "handle_message", capture)
 
+    expected_type = content_type or "application/octet-stream"
     await adapter._on_frame(_envelope(
         "evt_media", "cht_a", "msg_media", body=body,
         attachments=[{"uid": "att_photo", "filename": "photo.png",
-                      "content_type": content_type, "url": url}],
+                      "content_type": content_type, "url": url, "size_bytes": 4,
+                      "status": "received", "url_expires_at": "2026-08-28T00:05:00Z"}],
     ))
 
     event = handled[0]
@@ -290,7 +294,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
     assert http.gets == [(module.BASE + URL, None)], "signed URL, no bearer header"
     (path,) = event["media_urls"]
     assert pathlib.Path(path).read_bytes() == b"\x89PNG"
-    assert event["media_types"] == [content_type]
+    assert event["media_types"] == [expected_type]
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

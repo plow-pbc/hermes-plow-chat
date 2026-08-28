@@ -95,7 +95,7 @@ def _write_channel_aliases(names):
     os.replace(tmp, path)
 
 
-async def _fetch_attachment(item):
+async def _fetch_attachment(item, content_type):
     """Download one inbound part into Hermes' media cache; the local path.
 
     The content URL is Plow-signed and five minutes old at most, so it is
@@ -104,14 +104,13 @@ async def _fetch_attachment(item):
     cache the bundled iMessage adapter fills. None means unavailable: the
     caller surfaces that in the turn rather than dropping it.
     """
-    content_type = (item.get("content_type") or "application/octet-stream").split(";")[0].strip()
     try:
         async with aiohttp.ClientSession() as http:
             async with http.get(BASE + item["url"]) as resp:
                 resp.raise_for_status()
                 data = await resp.read()
     except Exception as exc:  # noqa: BLE001 - the turn still reaches hermes, minus the bytes
-        log.warning("[plow_chat] attachment %s fetch failed: %s", item.get("uid"), type(exc).__name__)
+        log.warning("[plow_chat] attachment %s fetch failed: %s", item["uid"], type(exc).__name__)
         return None
     ext = mimetypes.guess_extension(content_type)
     if content_type.startswith("image/"):
@@ -120,7 +119,7 @@ async def _fetch_attachment(item):
         return cache_audio_from_bytes(data, ext or ".m4a")
     if content_type.startswith("video/"):
         return cache_video_from_bytes(data, ext or ".mp4")
-    return cache_document_from_bytes(data, item.get("filename") or f"{item.get('uid')}{ext or ''}")
+    return cache_document_from_bytes(data, item["filename"] or f"{item['uid']}{ext or ''}")
 
 
 def _message_type(media_types):
@@ -682,12 +681,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         # the model: named in the turn, never dropped with it.
         media_urls, media_types, notes = [], [], []
         for item in msg["attachments"]:
-            path = await _fetch_attachment(item) if item["url"] else None
+            content_type = (item["content_type"] or "application/octet-stream").split(";")[0].strip()
+            path = await _fetch_attachment(item, content_type) if item["url"] else None
             if path:
                 media_urls.append(path)
-                media_types.append(item["content_type"])
+                media_types.append(content_type)
             else:
-                notes.append(f"[attachment: {item['content_type']} "
+                notes.append(f"[attachment: {content_type} "
                              f"{'unavailable' if item['url'] else 'delivery failed'}]")
         text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
         if not text and media_urls:
