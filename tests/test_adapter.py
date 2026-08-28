@@ -117,6 +117,17 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     return module
 
 
+def _capture_events(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> list[Any]:
+    """Stand in for hermes: every hand-off lands here."""
+    events: list[Any] = []
+
+    async def capture(event: Any) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+    return events
+
+
 async def _settle(adapter: Any) -> None:
     """Let every chat's server hand off what it holds."""
     await asyncio.gather(*(queue.join() for queue, _server in adapter._inbound.values()))
@@ -298,12 +309,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=status)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     expected_type = (content_type.split(";")[0].strip() if content_type
                      else "application/octet-stream")
@@ -336,12 +342,7 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     with caplog.at_level(logging.WARNING):
         await adapter._on_frame(_envelope(
@@ -371,12 +372,7 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
 
     attachments = [_attachment()]
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_dup", attachments=attachments))
@@ -394,12 +390,7 @@ async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatc
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05   # the fetch yields; a zero window would close on it
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="look at these"))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="",
@@ -409,10 +400,34 @@ async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatc
     await _settle(adapter)
 
     [event] = handled
-    assert event["text"] == "look at these\n\n(attachment)\n\n(attachment)"
+    assert event["text"] == "look at these"
     assert len(event["media_urls"]) == 2 and event["media_types"] == ["image/png", "image/png"]
     assert event["message_type"].value == "photo"
     assert event["message_id"] == "msg_3"
+
+
+async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The preview bubble's bytes can take longer to fetch than the window
+    lasts. It joined the burst the moment it arrived; the fetch is the
+    hand-off's to wait for, not the window's."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    release = asyncio.Event()
+
+    async def slow_fetch(item: Any, kind: str) -> str:
+        await release.wait()
+        return "/cache/preview.png"
+
+    monkeypatch.setattr(module, "_fetch_attachment", slow_fetch)
+    handled = _capture_events(monkeypatch, adapter)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="see this"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body="", attachments=[_attachment()]))
+    release.set()
+    await _settle(adapter)
+
+    [event] = handled
+    assert (event["text"], event["media_urls"], event["message_id"]) == ("see this", ["/cache/preview.png"], "msg_2")
 
 
 @pytest.mark.parametrize(
@@ -436,12 +451,7 @@ async def test_a_burst_from_one_sender_is_one_turn(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
     await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role=second_role))
@@ -775,12 +785,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
 
-    handled: list[dict[str, Any]] = []
-
-    async def capture(event: dict[str, Any]) -> None:
-        handled.append(event)
-
-    monkeypatch.setattr(adapter, "handle_message", capture)
+    handled = _capture_events(monkeypatch, adapter)
     with caplog.at_level(logging.WARNING):
         await adapter._on_frame(_envelope("evt_a", "cht_a", "msg_a"))
         await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b_owner"))

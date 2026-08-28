@@ -207,9 +207,8 @@ def _server_died(task):
 class _Inbound:
     uid: str
     sender: dict
-    text: str
-    media_urls: list
-    media_types: list
+    body: str
+    attachments: list
 
 
 class _PlowAuthError(Exception):
@@ -779,37 +778,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         uid = msg["uid"]
         if (chat_uid, uid) in self._seen:
             return                           # socket/backfill overlap - never re-fetch
-        # A failed part is a documented state (status "failed", url null), not
-        # schema drift. A part whose bytes cannot be fetched now is the same to
-        # the model: named in the turn, never dropped with it.
-        media_urls, media_types, notes = [], [], []
-        parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
-                 for item in msg["attachments"]]
-        # Fetched concurrently: this runs inside the frame loop, so a stalled
-        # part must cost the line one timeout, not one per part.
-        paths = await asyncio.gather(*(
-            _fetch_attachment(item, content_type) if item["url"] else asyncio.sleep(0)
-            for item, content_type in parts))
-        for (item, content_type), path in zip(parts, paths):
-            if path:
-                media_urls.append(path)
-                media_types.append(content_type)
-            else:
-                if not item["url"]:
-                    log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
-                notes.append(f"[attachment: {content_type} "
-                             f"{'unavailable' if item['url'] else 'delivery failed'}]")
-        text = "\n".join(part for part in (msg["body"].strip(), *notes) if part)
-        if not text and media_urls:
-            text = "(attachment)"
-        if not text:
+        if not msg["body"].strip() and not msg["attachments"]:
             return
         if chat_uid not in self._inbound:
             queue = asyncio.Queue()
             server = asyncio.create_task(self._serve_chat(chat_uid, queue))
             server.add_done_callback(_server_died)
             self._inbound[chat_uid] = (queue, server)
-        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, text, media_urls, media_types))
+        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, msg["body"], msg["attachments"]))
         # Seen at enqueue: queued, in flight or delivered, a second copy is the
         # same overlap. The durable ack is the checkpoint, written after the
         # hand-off; a replacement adapter starts with an empty `_seen` and its
@@ -846,11 +822,30 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def _deliver(self, burst, chat_uid):
         sender, role = burst[0].sender, burst[0].sender["role"]
-        media_urls = [url for m in burst for url in m.media_urls]
-        media_types = [kind for m in burst for kind in m.media_types]
+        # Fetched here, once the burst has closed: a preview whose fetch
+        # outlasts the window must still land in the turn it belongs to.
+        # Concurrent, so a stalled part costs one timeout, not one per part.
+        # A failed part (status "failed", url null) is a documented state, not
+        # schema drift; a part whose bytes cannot be fetched now is the same
+        # to the model: named in the turn, never dropped with it.
+        parts = [(m, item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
+                 for m in burst for item in m.attachments]
+        paths = await asyncio.gather(*(
+            _fetch_attachment(item, kind) if item["url"] else asyncio.sleep(0)
+            for _m, item, kind in parts))
+        media_urls, media_types, notes = [], [], {m.uid: [] for m in burst}
+        for (m, item, kind), path in zip(parts, paths):
+            if path:
+                media_urls.append(path)
+                media_types.append(kind)
+            else:
+                if not item["url"]:
+                    log.warning("[plow_chat] attachment %s: provider delivery failed", item["uid"])
+                notes[m.uid].append(f"[attachment: {kind} {'unavailable' if item['url'] else 'delivery failed'}]")
+        lines = ["\n".join(p for p in (m.body.strip(), *notes[m.uid]) if p) for m in burst]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
-            text="\n\n".join(m.text for m in burst),
+            text="\n\n".join(line for line in lines if line) or "(attachment)",
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id=sender["uid"],
                                      user_name=sender.get("display_name") or sender["uid"],
