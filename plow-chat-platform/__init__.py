@@ -554,7 +554,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
         role = sender["role"]
-        text, uid = msg["body"].strip(), msg["uid"]
+        attachments = msg.get("attachments") or []
+        attachment_text = "\n".join(
+            f"[attachment: {item.get('content_type') or 'unknown'} {item.get('url') or 'unavailable'}]"
+            for item in attachments
+        )
+        text = "\n".join(part for part in (msg["body"].strip(), attachment_text) if part)
+        uid = msg["uid"]
         message_key = (chat_uid, uid)
         if not text or message_key in self._seen:
             return

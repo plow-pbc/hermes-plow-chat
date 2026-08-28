@@ -151,7 +151,15 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str
     return {"uid": uid, "display_name": name, "participants": participants}
 
 
-def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owner") -> dict[str, Any]:
+def _envelope(
+    event_id: str,
+    chat_id: str,
+    message_id: str,
+    *,
+    role: str = "owner",
+    body: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "event_id": event_id,
         "event_type": "message_received",
@@ -160,7 +168,8 @@ def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owne
             "type": "message_received",
             "message": {
                 "uid": message_id,
-                "body": message_id,
+                "body": message_id if body is None else body,
+                "attachments": attachments or [],
                 "direction": "inbound",
                 "sender": {
                     "type": "member",
@@ -171,6 +180,50 @@ def _envelope(event_id: str, chat_id: str, message_id: str, *, role: str = "owne
             },
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_text"),
+    [
+        ("", "[attachment: image/png /v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]"),
+        (
+            "Photo attached",
+            "Photo attached\n[attachment: image/png /v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2]",
+        ),
+    ],
+    ids=["media-only", "captioned-media"],
+)
+async def test_inbound_media_reaches_hermes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: str,
+    expected_text: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    handled: list[dict[str, Any]] = []
+
+    async def capture(event: dict[str, Any]) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", capture)
+
+    await adapter._on_frame(
+        _envelope(
+            "evt_media",
+            "cht_a",
+            "msg_media",
+            body=body,
+            attachments=[
+                {
+                    "content_type": "image/png",
+                    "url": "/v1/chats/cht_a/attachments/att_photo/content?exp=1&sig=2",
+                }
+            ],
+        )
+    )
+
+    assert handled[0]["text"] == expected_text
 
 
 def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
