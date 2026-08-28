@@ -594,7 +594,10 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
-def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+def test_guest_turn_does_not_register_a_tool_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
     module = _load(monkeypatch, tmp_path)
     hooks: dict[str, Any] = {}
 
@@ -606,89 +609,12 @@ def test_member_turn_hook_is_registered_and_blocks_tools(monkeypatch: pytest.Mon
         def register_tool(self, **kwargs: Any) -> None: ...
 
     module.register(_Context())
-    hook = hooks["pre_tool_call"]
-
-    assert hook() is None
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     turn = adapter._member_turn_chat.set("cht_b")
     try:
-        assert hook(
-            tool_name="terminal",
-            args={},
-            task_id="task",
-            session_id="session",
-            tool_call_id="call",
-            turn_id="turn",
-            api_request_id="request",
-            middleware_trace=[],
-        ) == {"action": "block", "message": "tools are unavailable on this turn"}
+        assert "pre_tool_call" not in hooks
     finally:
         adapter._member_turn_chat.reset(turn)
-
-
-async def test_busy_queued_member_turn_uses_its_own_tool_gate_state(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a", group=True)])
-
-    owner_started = asyncio.Event()
-    release_owner = asyncio.Event()
-    turns_done = asyncio.Event()
-    observed: list[tuple[str, Any]] = []
-    typing_tasks: dict[str, Any] = {}
-    pending: Any = None
-    active = False
-
-    async def run_turn(event: Any) -> None:
-        nonlocal active, pending
-        on_start = getattr(adapter, "on_processing_start", None)
-        if on_start:
-            await on_start(event)
-        typing_tasks[event.message_id] = adapter._typing[event.source.chat_id]
-        try:
-            observed.append((event.message_id, module._block_member_tools()))
-            if event.message_id == "msg_owner":
-                owner_started.set()
-                await release_owner.wait()
-        finally:
-            on_complete = getattr(adapter, "on_processing_complete", None)
-            if on_complete:
-                await on_complete(event, None)
-
-        if pending is not None:
-            next_event, pending = pending, None
-            asyncio.create_task(run_turn(next_event))
-        else:
-            active = False
-            turns_done.set()
-
-    async def enqueue(event: Any) -> None:
-        nonlocal active, pending
-        if active:
-            pending = event
-            return
-        active = True
-        asyncio.create_task(run_turn(event))
-
-    monkeypatch.setattr(adapter, "handle_message", enqueue)
-    await adapter._on_frame(_envelope("evt_owner", "cht_a", "msg_owner"))
-    await asyncio.wait_for(owner_started.wait(), timeout=1)
-    await adapter._on_frame(_envelope("evt_member", "cht_a", "msg_member", role="member"))
-    await _settle(adapter)
-    queued_kept_owner_typing = adapter._typing["cht_a"] is typing_tasks["msg_owner"]
-    release_owner.set()
-    await asyncio.wait_for(turns_done.wait(), timeout=1)
-
-    assert observed == [
-        ("msg_owner", None),
-        ("msg_member", {"action": "block", "message": "tools are unavailable on this turn"}),
-    ]
-    assert queued_kept_owner_typing
-    assert typing_tasks["msg_owner"] is not typing_tasks["msg_member"]
-    assert not adapter._typing
 
 
 @pytest.mark.parametrize(
@@ -1137,6 +1063,8 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
     assert "do not reveal" in p           # disclosure
     assert "already" in p                 # no-relay: they already received it
     assert "does not own" in p            # speaker-ownership fact
+    for private_kind in ("email contents", "files", "slack", "messages", "contacts", "credentials"):
+        assert private_kind in module._DISCLOSURE.lower()
 
 
 def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
