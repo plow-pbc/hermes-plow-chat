@@ -196,6 +196,13 @@ INBOUND_DEBOUNCE_SECONDS = 2.0
 HAND_OFF_RETRY_SECONDS = 5.0
 
 
+def _server_died(task):
+    # A chat's server is held for the adapter's life, so a bug that kills it
+    # would otherwise stall that chat with no signal at all.
+    if not task.cancelled() and task.exception():
+        log.error("[plow_chat] chat server died", exc_info=task.exception())
+
+
 @dataclasses.dataclass
 class _Inbound:
     uid: str
@@ -799,7 +806,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             return
         if chat_uid not in self._inbound:
             queue = asyncio.Queue()
-            self._inbound[chat_uid] = (queue, asyncio.create_task(self._serve_chat(chat_uid, queue)))
+            server = asyncio.create_task(self._serve_chat(chat_uid, queue))
+            server.add_done_callback(_server_died)
+            self._inbound[chat_uid] = (queue, server)
         self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, text, media_urls, media_types))
         # Seen at enqueue: queued, in flight or delivered, a second copy is the
         # same overlap. The durable ack is the checkpoint, written after the
