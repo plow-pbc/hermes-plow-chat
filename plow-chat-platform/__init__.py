@@ -4,7 +4,6 @@ Receives granted-scope WSS events and sends replies through the chat REST API.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
-import collections
 import contextvars
 import dataclasses
 import json
@@ -194,16 +193,16 @@ _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 # the first. 2s is what plow#442 measured for the bubble/preview split. A
 # change of speaker closes the burst, so a group's order is never reshuffled.
 INBOUND_DEBOUNCE_SECONDS = 2.0
+HAND_OFF_RETRY_SECONDS = 5.0
 
 
 @dataclasses.dataclass
-class _Burst:
+class _Inbound:
+    uid: str
     sender: dict
-    parts: list = dataclasses.field(default_factory=list)
-    uids: list = dataclasses.field(default_factory=list)
-    media_urls: list = dataclasses.field(default_factory=list)
-    media_types: list = dataclasses.field(default_factory=list)
-    task: asyncio.Task | None = None
+    text: str
+    media_urls: list
+    media_types: list
 
 
 class _PlowAuthError(Exception):
@@ -254,13 +253,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchor_lock = asyncio.Lock()
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
-        self._bursts = {}                    # chat uid -> the open _Burst
-        self._stalled = set()                # chats whose hand-off failed, until backfilled
-        self._ws = None
-        # Hand-offs and the backfill take turns per chat: acks then land in
-        # window-close order, which is uid order, and a reconnect's backfill
-        # cannot page a uid whose hand-off is still in flight and unacked.
-        self._chat_locks = collections.defaultdict(asyncio.Lock)
+        self._inbound = {}                   # chat uid -> (queue, the task serving it)
         # One durable owner of recovery state. The file existing means "this
         # agent has taken its baseline"; its CONTENTS mean "and it was this uid",
         # empty meaning the chat was empty at the time. A process-local flag
@@ -425,9 +418,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             _live = None
         if self._ws_task:
             self._ws_task.cancel()
-        for burst in self._bursts.values():
-            burst.task.cancel()
-        self._bursts.clear()
+        for _queue, server in self._inbound.values():
+            server.cancel()                  # what it held unacked, the next backfill replays
+        self._inbound.clear()
         for chat_uid in tuple(self._typing):
             self._cancel_typing(chat_uid)
         self._mark_disconnected()
@@ -669,11 +662,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # chat, if the socket dropped before hermes accepted it. With no
         # checkpoint to stop at the loop simply pages to exhaustion, which for a
         # chat that started empty is the handful of messages actually missed.
-        async with self._chat_locks[chat_uid]:
-            self._stalled.discard(chat_uid)  # everything unacked is replayed from here
-            await self._page_missed(http, chat_uid)
-
-    async def _page_missed(self, http, chat_uid):
         missed, cursor = [], None
         while True:
             url = f"{BASE}/v1/chats/{chat_uid}/messages?limit=50"
@@ -725,7 +713,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                         await self._ensure_anchor(http, chat_uid)
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
-                        self._ws = ws
                         self._mark_connected()
                         log.info("[plow_chat] websocket connected")
                         for chat_uid in self.chat_uids:
@@ -772,8 +759,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         del self._seen_events[:-512]
 
     async def _on_message(self, msg, chat_uid):
-        """One inbound message, from the socket or from the backfill. Buffered
-        per chat; the burst hands off when the window closes or the speaker changes."""
+        """One inbound message, from the socket or from the backfill, queued
+        for the chat's server."""
         if msg["direction"] != "inbound":
             return                           # the echo of our own send
         sender = msg["sender"]
@@ -783,8 +770,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
         uid = msg["uid"]
-        burst = self._bursts.get(chat_uid)
-        if (chat_uid, uid) in self._seen or (burst is not None and uid in burst.uids):
+        if (chat_uid, uid) in self._seen:
             return                           # socket/backfill overlap - never re-fetch
         # A failed part is a documented state (status "failed", url null), not
         # schema drift. A part whose bytes cannot be fetched now is the same to
@@ -811,58 +797,59 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = "(attachment)"
         if not text:
             return
-        burst = self._bursts.get(chat_uid)   # the fetch yielded: re-read the open burst
-        if burst is not None and burst.sender["uid"] != sender["uid"]:
-            self._close_burst(chat_uid)      # another voice: what came before goes first
-            burst = None
-        elif burst is not None:
-            burst.task.cancel()              # still sleeping: the task pops the key first
-        if burst is None:
-            burst = self._bursts[chat_uid] = _Burst(sender=sender)
-        burst.parts.append(text)
-        burst.uids.append(uid)
-        burst.media_urls.extend(media_urls)
-        burst.media_types.extend(media_types)
-        burst.task = asyncio.create_task(self._dispatch_burst(chat_uid))
+        if chat_uid not in self._inbound:
+            queue = asyncio.Queue()
+            self._inbound[chat_uid] = (queue, asyncio.create_task(self._serve_chat(chat_uid, queue)))
+        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, text, media_urls, media_types))
+        # Seen at enqueue: queued, in flight or delivered, a second copy is the
+        # same overlap. The durable ack is the checkpoint, written after the
+        # hand-off; a replacement adapter starts with an empty `_seen` and its
+        # backfill replays whatever this one still held.
+        self._seen.append((chat_uid, uid))
+        del self._seen[:-512]
 
-    def _close_burst(self, chat_uid):
-        burst = self._bursts.pop(chat_uid)
-        burst.task.cancel()
-        burst.task = asyncio.create_task(self._hand_off(burst, chat_uid))
-
-    async def _dispatch_burst(self, chat_uid):
-        await asyncio.sleep(INBOUND_DEBOUNCE_SECONDS)
-        await self._hand_off(self._bursts.pop(chat_uid), chat_uid)
-
-    async def _hand_off(self, burst, chat_uid):
-        async with self._chat_locks[chat_uid]:
-            if chat_uid in self._stalled:
-                return                       # unacked: the backfill replays it, in order
-            try:
-                await self._deliver(burst, chat_uid)
-            except Exception:                # noqa: BLE001 - the reconnect is the retry
-                # The hand-off ran on its own task, so nothing else carries this
-                # failure to the listener. Stall the chat so no later burst acks
-                # past the failed uid, and drop the socket: the listener
-                # reconnects and its backfill replays from the checkpoint.
-                log.exception("[plow_chat] hand-off failed for %s; reconnecting", chat_uid)
-                self._stalled.add(chat_uid)
-                if self._ws is not None:
-                    await self._ws.close()
+    async def _serve_chat(self, chat_uid, queue):
+        """The one owner of a chat's inbound, for the life of the adapter:
+        groups one speaker's burst, hands it off, retries at the head so
+        nothing later acks past a failure, and acks. Order is the queue's."""
+        carry = None
+        while True:
+            burst = [carry or await queue.get()]
+            carry = None
+            while True:
+                try:
+                    nxt = await asyncio.wait_for(queue.get(), INBOUND_DEBOUNCE_SECONDS)
+                except asyncio.TimeoutError:
+                    break
+                if nxt.sender["uid"] != burst[0].sender["uid"]:
+                    carry = nxt              # another voice: what came before goes first
+                    break
+                burst.append(nxt)
+            while True:
+                try:
+                    await self._deliver(burst, chat_uid)
+                    break
+                except Exception:            # noqa: BLE001 - the retry is the recovery; the chat waits behind it
+                    log.exception("[plow_chat] hand-off failed for %s; retrying", chat_uid)
+                    await asyncio.sleep(HAND_OFF_RETRY_SECONDS)
+            for _ in burst:
+                queue.task_done()
 
     async def _deliver(self, burst, chat_uid):
-        sender, role = burst.sender, burst.sender["role"]
+        sender, role = burst[0].sender, burst[0].sender["role"]
+        media_urls = [url for m in burst for url in m.media_urls]
+        media_types = [kind for m in burst for kind in m.media_types]
         chat = await self.get_chat_info(chat_uid)
         await self.handle_message(MessageEvent(
-            text="\n\n".join(burst.parts),
+            text="\n\n".join(m.text for m in burst),
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id=sender["uid"],
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=role == "owner"),
-            message_id=burst.uids[-1],
-            media_urls=burst.media_urls,
-            media_types=burst.media_types,
-            message_type=_message_type(burst.media_types),
+            message_id=burst[-1].uid,
+            media_urls=media_urls,
+            media_types=media_types,
+            message_type=_message_type(media_types),
             channel_prompt=(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
@@ -872,9 +859,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.
-        self._seen.extend((chat_uid, uid) for uid in burst.uids)
-        del self._seen[:-512]
-        self._checkpoint(burst.uids[-1], chat_uid)
+        self._checkpoint(burst[-1].uid, chat_uid)
 
 
 class _PlowSendError(Exception):

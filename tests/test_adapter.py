@@ -110,23 +110,16 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     # regression pin for the fleet's checkpoint home (the old hardcoded
     # /var/lib/hermes made every fleet anchor raise).
     assert module.CHECKPOINT == tmp_path / "plow_chat_last_uid"
-    # Zero window under test: a burst still hands off on its own task, so a
-    # test awaits `_settle` where it needs the turn to have landed.
+    # Zero window and no retry pause under test: a burst still hands off on the
+    # chat's own task, so a test awaits `_settle` where it needs the turn landed.
     module.INBOUND_DEBOUNCE_SECONDS = 0
+    module.HAND_OFF_RETRY_SECONDS = 0
     return module
 
 
 async def _settle(adapter: Any) -> None:
-    """Let every buffered or in-flight burst hand off to hermes."""
-    while True:
-        dispatching = [
-            task for task in asyncio.all_tasks()
-            if task.get_coro().__qualname__.split(".")[-1] in {"_dispatch_burst", "_hand_off"}
-            and not task.done()
-        ]
-        if not dispatching:
-            return
-        await asyncio.gather(*dispatching, return_exceptions=True)  # a reset timer is a cancelled task
+    """Let every chat's server hand off what it holds."""
+    await asyncio.gather(*(queue.join() for queue, _server in adapter._inbound.values()))
 
 
 class _WS:
@@ -495,13 +488,14 @@ async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_3"
 
 
-async def test_a_backfill_waits_for_the_hand_off_in_flight(
+async def test_a_backfilled_duplicate_of_an_in_flight_uid_is_dropped(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
     """A socket drop mid-hand-off: the uid is unacked, so the reconnect's
-    backfill pages it again. It must wait for the ack, then drop it — not
-    hand hermes the same message twice."""
+    backfill pages it again while the first hand-off is still in flight. The
+    chat's server delivers in order, so the duplicate reaches it after the
+    ack and is dropped — hermes never sees the message twice."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     entered, release = asyncio.Event(), asyncio.Event()
@@ -515,35 +509,24 @@ async def test_a_backfill_waits_for_the_hand_off_in_flight(
     monkeypatch.setattr(adapter, "handle_message", slow_turn)
     frame = _envelope("evt_1", "cht_a", "msg_1")
     await adapter._on_frame(frame)
-    await entered.wait()                     # the hand-off holds the chat
-    backfill = asyncio.create_task(adapter._backfill(_Session(backfill=[frame["data"]["message"]]), "cht_a"))
-    await asyncio.sleep(0)
-    assert not backfill.done(), "the backfill waits behind the hand-off"
+    await entered.wait()                     # the hand-off is in flight, unacked
+    await adapter._backfill(_Session(backfill=[frame["data"]["message"]]), "cht_a")
     release.set()
-    await backfill
     await _settle(adapter)
 
     assert handled == ["msg_1"]
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_1"
 
 
-async def test_a_failed_hand_off_is_replayed_by_the_reconnect(
+async def test_a_failed_hand_off_is_retried_at_the_head(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """A hand-off runs on its own task, so a failure there has no listener to
-    fall into. It must drop the socket — the reconnect's backfill is the retry
-    — and until that backfill, nothing in the chat may ack past the failed
-    uid: a later burst is dropped unacked, and the backfill replays both."""
+    """A hand-off that fails is retried where it sits; everything behind it
+    in the chat waits, so nothing ever acks past a message hermes never
+    accepted, and order holds through the retry."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    ws = SimpleNamespace(closed=False)
-
-    async def close() -> None:
-        ws.closed = True
-
-    ws.close = close
-    adapter._ws = ws
     handled: list[str] = []
 
     async def flaky(event: Any) -> None:
@@ -553,20 +536,11 @@ async def test_a_failed_hand_off_is_replayed_by_the_reconnect(
         handled.append(event.text)
 
     monkeypatch.setattr(adapter, "handle_message", flaky)
-    first, second = _envelope("evt_1", "cht_a", "msg_1"), _envelope("evt_2", "cht_a", "msg_2")
-    await adapter._on_frame(first)
-    await _settle(adapter)
-    assert ws.closed and handled == ["boom"]
-    await adapter._on_frame(second)
-    await _settle(adapter)
-    assert handled == ["boom"], "nothing acks past the failed uid before the backfill"
-    assert not (tmp_path / "plow_chat_last_uid").exists()
-
-    page = [second["data"]["message"], first["data"]["message"]]   # newest-first
-    await adapter._backfill(_Session(backfill=page), "cht_a")
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role="member"))
     await _settle(adapter)
 
-    assert handled == ["boom", "msg_1\n\nmsg_2"]
+    assert handled == ["boom", "msg_1", "msg_2"]
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
@@ -1294,8 +1268,15 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     await adapter.connect(is_reconnect=True)
     assert module._live is not None and module._live[0] is adapter
     await adapter._ws_task
+    # A retired adapter must not keep serving a chat: its replacement's
+    # backfill replays what this one still held, and two servers on one
+    # chat would hand off twice and race the checkpoint.
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
+    _queue, server = adapter._inbound["cht_a"]
     await adapter.disconnect()
     assert module._live is None
+    assert server.cancelled() or server.cancelling()
+    assert not adapter._inbound
 
 
 async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoption(
