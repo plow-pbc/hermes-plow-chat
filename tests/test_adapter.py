@@ -1433,14 +1433,48 @@ def test_only_a_dispatched_turn_is_recorded_as_seen(monkeypatch):
 def test_a_first_sight_chat_anchors_without_replaying_its_history(
     monkeypatch, history, expected
 ):
-    """Adopting a chat must not fire its whole back catalogue at the agent."""
+    """On a fresh install (no record at load), adopting a chat must not fire
+    its back catalogue at the agent — every standing thread anchors once."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     a._http_session = PagingSession({"/v1/chats/cht_a/messages": history})
 
-    asyncio.run(a._anchor("cht_a"))
+    asyncio.run(a._first_contact("cht_a"))
 
     assert list(a._seen.get("cht_a", {})) == expected
     assert a.handled == []
+
+
+def test_a_chat_born_during_a_gap_replays_its_short_catalogue(monkeypatch, tmp_path):
+    """The operator created a group while the container was down. The record
+    has been live (it knows another chat), this one is absent from it, and the
+    catalogue fits one page — so the catalogue IS the gap, and it arrives
+    oldest-first instead of being anchored away."""
+    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_other": ["msg_0"]}))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    # Newest-first, as the API answers.
+    a._http_session = PagingSession({"/v1/chats/cht_a/messages": [
+        _msg("msg_2", "second"), _msg("msg_1", "first"),
+    ]})
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert [e.text for e in a.handled] == ["first", "second"]
+    assert set(a._seen["cht_a"]) == {"msg_1", "msg_2"}
+
+
+def test_a_deep_first_sight_catalogue_is_history_not_a_gap(monkeypatch, tmp_path):
+    """Even with a live record, a first-sight chat whose catalogue overflows
+    one page is an adopted thread. It anchors: no gap this feature recovers
+    from accumulates a full page in a single thread."""
+    (tmp_path / "plow-chat-seen.json").write_text(json.dumps({"cht_other": ["msg_0"]}))
+    a = _adapter(monkeypatch, cls=CapturingAdapter)
+    a._http_session = PagingSession(
+        {"/v1/chats/cht_a/messages": [_msg("old_1", "old")]}, has_more=True)
+
+    asyncio.run(a._backfill("cht_a"))
+
+    assert a.handled == []
+    assert "old_1" in a._seen["cht_a"]
 
 
 def test_backfill_replays_the_gap_oldest_first(monkeypatch):
@@ -1564,9 +1598,9 @@ def test_the_walk_stops_at_the_first_message_it_recognises(monkeypatch):
 
 
 def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypatch):
-    """_anchor records one page. A page-shaped floor made the first backfill
+    """Anchoring records one page. A page-shaped floor made the first backfill
     after adoption page straight past it into pre-adoption history and dispatch
-    all of it — the flood _anchor exists to prevent, fired by the first new
+    all of it — the flood anchoring exists to prevent, fired by the first new
     message instead of by adoption."""
     a = _adapter(monkeypatch, cls=CapturingAdapter)
     history = [_msg(f"old_{n}", f"old body {n}") for n in range(50)]
@@ -1584,7 +1618,7 @@ def test_an_adopted_chat_replays_only_what_arrived_after_it_was_adopted(monkeypa
 
     newest = history[:]
     a._http_session = Deep()
-    asyncio.run(a._anchor("cht_a"))
+    asyncio.run(a._first_contact("cht_a"))
     assert a.handled == [], "adoption dispatches nothing"
 
     # One new message arrives on top of the page that was anchored.

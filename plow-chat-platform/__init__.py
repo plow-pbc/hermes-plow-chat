@@ -1048,13 +1048,33 @@ class PlowChatAdapter(BasePlatformAdapter):
         ) as resp:
             return await _body(resp)
 
-    async def _anchor(self, chat_uid: str) -> None:
-        """Mark a first-seen chat's current history as seen, dispatching nothing.
+    async def _first_contact(self, chat_uid: str) -> None:
+        """Replay a chat this record has never seen, or anchor it.
 
-        Without this an adopted chat has an empty seen-set, so its entire back
-        catalogue reads as unseen and gets fired at the agent one turn at a time.
+        A chat can be absent from the record for two reasons, and they pull in
+        opposite directions. Created while this agent had no socket — and its
+        short catalogue IS the gap: dropping it is exactly the loss this file
+        exists to close, and it is the first thing an operator's brand-new
+        group thread does. Or it predates the record — a fresh install, a
+        thread this line was added to — and replaying that history re-answers
+        conversations that were already had.
+
+        Two signals separate them, and replay needs both. A record that
+        existed at load means this agent has been live before, so a chat it
+        never recorded is new, not inherited — and a fresh install anchors
+        everything exactly once, instead of firing each standing thread's
+        catalogue at the agent on deploy day. And a catalogue that overflows
+        one page is history, not a gap — no outage this feature can recover
+        from accumulates PAGE_SIZE turns in a single thread. Everything else
+        anchors: a duplicated answer in a room of real people costs more than
+        a late one.
         """
-        page = (await self._messages_page(chat_uid, None)).get("data") or []
+        body = await self._messages_page(chat_uid, None)
+        page = body.get("data") or []
+        if self._had_record and not body.get("has_more"):
+            for message in reversed([m for m in page if _is_replayable(m)]):
+                await self._handle_ws_frame(
+                    chat_uid, {"type": "message_received", "message": message})
         self._mark_seen(chat_uid, [m["uid"] for m in page])
 
     async def _backfill(self, chat_uid: str) -> None:
@@ -1086,7 +1106,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Dropping it would make a chat that flaps out of a paged listing and
         # back re-answer everything it had already handled.
         if chat_uid not in self._seen:
-            await self._anchor(chat_uid)
+            await self._first_contact(chat_uid)
             return
         missed: list[dict] = []
         cursor: Optional[str] = None
@@ -1161,6 +1181,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         Only the file's own contents are forgiven. A missing HERMES_HOME is
         raised at construction instead — see __init__.
         """
+        # Whether any record was readable at load — the "has this agent been
+        # live before" half of _first_contact's replay decision. A corrupt file
+        # deliberately reads as no record: its chats must anchor, not replay,
+        # because their uids were seen once and replaying re-answers them.
+        self._had_record = False
         try:
             path = self._seen_path()
             if not path.exists():
@@ -1168,6 +1193,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             loaded = json.loads(path.read_text())
             if not isinstance(loaded, dict):
                 raise ValueError(f"expected a map of chat uid to message uids, got {type(loaded).__name__}")
+            self._had_record = True
             # Per entry, keeping what parses. All-or-nothing meant one malformed
             # chat discarded every chat's record, and each of those then anchors
             # on its next walk and silently skips whatever was pending in it —
