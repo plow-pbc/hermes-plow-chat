@@ -809,6 +809,39 @@ async def test_a_chat_discovered_after_first_connect_never_newest_anchors(
     assert handled == ["msg_reply"], "the reply survives via backfill instead of being skipped past"
 
 
+async def test_a_restart_with_an_already_granted_unanchored_chat_never_newest_anchors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The seam's completion: `first_connection` alone is process-local --
+    always true on a fresh process, whether this is the agent's genuine
+    first life or its fiftieth restart. `connect` unconditionally refreshes
+    reach before `_listen` ever starts, so process 2 here begins its own
+    "first connect" with cht_new already back in `chat_uids`: granted in a
+    PRIOR life, its own empty-anchor write never landed then. Without
+    `first_install` gating alongside `first_connection`, this restart would
+    newest-anchor cht_new anyway -- checkpointing a reply hermes never
+    handled and silently dropping it, exactly the class of loss this whole
+    PR has been closing, just reopened by the process boundary."""
+    module = _load(monkeypatch, tmp_path)
+    (tmp_path / "plow_chat_last_uid").write_text("msg_old")  # this agent has anchored before, in a prior life
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    assert adapter._anchored_chats[adapter.home_chat_uid], "an existing checkpoint means this agent already anchored"
+    adapter._set_reach([_chat("cht_a"), _chat("cht_new")])  # connect's own refresh already re-granted both
+    http = _DiscoveredAfterFirstConnectHTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    handled: list[str] = []
+    monkeypatch.setattr(adapter, "_on_message", lambda m, _chat_uid: handled.append(m["uid"]))
+
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await adapter._listen()
+
+    assert "cht_new" not in http.history_reads, "a chat re-granted on a restart must never be newest-anchored"
+    assert adapter._load_checkpoint("cht_new") is None, "its baseline must be empty, not a newest-message uid"
+    assert handled == ["msg_reply"], "the reply survives via backfill instead of being skipped past"
+
+
 async def test_an_initial_marker_that_will_not_persist_does_not_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """In-memory anchor state follows the disk; it never leads it.
 

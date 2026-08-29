@@ -769,6 +769,18 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def _listen(self):
         first_connection = True
+        # Durable across restarts, unlike `first_connection`: `connect`
+        # unconditionally refreshes reach before ever starting this loop
+        # (`__init__`'s own checkpoint read stands in for a raw `_listen`
+        # call with no `connect`), so `_anchored_chats` already reflects,
+        # by the time this runs, every chat currently granted -- including
+        # one this agent discovered in a PRIOR life and never finished
+        # anchoring. `first_connection` alone cannot tell that case apart
+        # from a genuine first-ever install: it is always true for a fresh
+        # process regardless of which life this is. The home checkpoint
+        # already existing on disk is what actually means "not the first
+        # life" -- read once, here, before anything below can change it.
+        first_install = not self._anchored_chats.get(self.home_chat_uid)
         while True:
             try:
                 async with aiohttp.ClientSession() as http:
@@ -783,23 +795,25 @@ class PlowChatAdapter(BasePlatformAdapter):
                         _auth_raise_for_status(resp)
                         ticket = (await resp.json(content_type=None))["ticket"]
                     # ONE gate decides newest vs empty for every chat this
-                    # agent ever anchors: `first_connection`, read here and
-                    # flipped permanently right after. This process's true
-                    # first-ever connect newest-anchors every chat already
-                    # known at that moment -- a deliberate, one-time skip of
-                    # pre-existing history, taken while nothing is arriving
-                    # yet. Every chat learned about any later -- this
-                    # reconnect's own reach refresh above, a frame-side adopt
-                    # mid-connection, a tool-side `start_group_thread` -- gets
-                    # `_ensure_empty_anchor` instead: its newest existing
-                    # message can be a turn hermes has not yet accepted, and
-                    # newest-anchoring it would risk checkpointing that turn
-                    # ahead of the handoff that accepts it. A chat stranded
-                    # unanchored by a failed empty-anchor write is retried
-                    # empty again on every later pass through here -- never
-                    # newest, no matter how many attempts it takes.
+                    # agent ever anchors: `first_connection and first_install`
+                    # -- this process's first connect, AND this agent's
+                    # genuine first-ever life, never anchored before under
+                    # any prior incarnation. Only then is skipping
+                    # pre-existing history for every chat already known at
+                    # that moment the deliberate, one-time choice it claims
+                    # to be, taken while nothing is arriving yet. Every other
+                    # case -- a later connection of this process, OR any
+                    # process (first or fiftieth) whose home checkpoint
+                    # already exists -- gets `_ensure_empty_anchor` instead:
+                    # a chat's newest existing message can be a turn hermes
+                    # has not yet accepted, and newest-anchoring it would
+                    # risk checkpointing that turn ahead of the handoff that
+                    # accepts it. A chat stranded unanchored by a failed
+                    # empty-anchor write is retried empty again on every
+                    # later pass through here -- never newest, no matter how
+                    # many attempts, or restarts, it takes.
                     for chat_uid in self.chat_uids:
-                        if first_connection:
+                        if first_connection and first_install:
                             await self._ensure_anchor(http, chat_uid)
                         else:
                             await self._ensure_empty_anchor(chat_uid)
