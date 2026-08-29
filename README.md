@@ -73,6 +73,26 @@ burst, so a group's order holds. The ack is the burst's last uid, so a restart
 mid-burst backfills the whole burst; a hand-off that fails is retried where it
 sits, with the rest of the chat waiting behind it.
 
+### Trusted group conversations
+
+Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
+Before handing off each inbound burst, the adapter refreshes that chat so a
+dashboard change applies to the next message. An untrusted group keeps owner
+data private. In a trusted group, every participant may ask the assistant to
+use its normal tools and connected accounts, and requested results such as
+calendar details may be answered in the thread; credential, authentication,
+token, and payment-card secrets remain excluded.
+
+The `plow_set_conversation_trusted` tool writes the same API preference as the
+dashboard. It only succeeds during an owner-authored Plow Chat turn and after
+the model passes `confirm=true` for an explicit owner request. Member turns and
+calls outside an active chat turn cannot change it.
+
+This plugin version requires a Plow API that publishes the required `trusted`
+chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
+older API the per-message refresh fails loudly and the chat waits for retry
+rather than guessing a trust state.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from

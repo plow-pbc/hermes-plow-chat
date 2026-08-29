@@ -105,6 +105,16 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Most adapter tests isolate a different seam and drive an already-cached
+    # chat directly, without a REST server. Keep that canonical resource as
+    # the response for those tests. The dedicated refresh tests below restore
+    # the production method and exercise its HTTP/status/validation behavior.
+    module._real_refresh_current_chat = module.PlowChatAdapter._refresh_current_chat
+
+    async def keep_current_chat(adapter: Any, chat_uid: str) -> None:
+        assert chat_uid in adapter._chats
+
+    monkeypatch.setattr(module.PlowChatAdapter, "_refresh_current_chat", keep_current_chat)
     # No CHECKPOINT override: with HERMES_HOME pinned above, the module's own
     # env-derived resolution already lands in tmp_path -- the assert IS the
     # regression pin for the fleet's checkpoint home (the old hardcoded
@@ -198,6 +208,25 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
+class _ChatResourceHTTP:
+    def __init__(self, response: _Resp) -> None:
+        self.response = response
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def __aenter__(self) -> "_ChatResourceHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+    def get(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("get", url, kwargs))
+        return self.response
+
+    def put(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("put", url, kwargs))
+        return self.response
+
+
 def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
     """Simulate these chats having already been anchored -- by `_listen`'s
     pre-connect loop, the real precondition before any frame reaches
@@ -211,7 +240,7 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
 
 
 def _chat(uid: str, *, name: str | None = None, group: bool = False,
-          agent_name: str | None = None) -> dict[str, Any]:
+          agent_name: str | None = None, trusted: bool = False) -> dict[str, Any]:
     participants = [
         {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
         if agent_name else {"type": "agent"},
@@ -219,7 +248,8 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
     ]
     if group:
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member"})
-    return {"uid": uid, "display_name": name, "participants": participants}
+    return {"uid": uid, "display_name": name, "participants": participants,
+            "trusted": trusted}
 
 
 def _envelope(
@@ -634,11 +664,11 @@ def test_guest_turn_does_not_register_a_tool_block(
 
     module.register(_Context())
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    turn = adapter._member_turn_chat.set("cht_b")
+    turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
         assert "pre_tool_call" not in hooks
     finally:
-        adapter._member_turn_chat.reset(turn)
+        adapter._active_turn.reset(turn)
 
 
 @pytest.mark.parametrize(
@@ -1068,6 +1098,95 @@ async def test_named_line_identity_prefixes_every_turn_prompt(
     assert event["channel_prompt"] == expected
 
 
+@pytest.mark.parametrize(
+    ("group", "role", "trusted", "prompt_name"),
+    [
+        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
+        pytest.param(True, "owner", False, "GROUP_OWNER_CHANNEL_PROMPT", id="untrusted-group-owner"),
+        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", id="untrusted-group-member"),
+        pytest.param(True, "owner", True, "TRUSTED_GROUP_OWNER_CHANNEL_PROMPT", id="trusted-group-owner"),
+        pytest.param(True, "member", True, "TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT", id="trusted-group-member"),
+    ],
+)
+async def test_trust_selects_the_explicit_prompt_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    group: bool,
+    role: str,
+    trusted: bool,
+    prompt_name: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=group, trusted=trusted)])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame(_envelope("evt_matrix", "cht_a", "msg_matrix", role=role), object())
+    await _settle(adapter)
+
+    assert handled[0]["channel_prompt"] == getattr(module, prompt_name)
+
+    if trusted:
+        prompt = handled[0]["channel_prompt"].lower()
+        assert "calendar" in prompt
+        assert "normal tools" in prompt
+        assert "everyone" in prompt
+        for secret in ("credentials", "authentication secrets", "raw tokens", "payment-card"):
+            assert secret in prompt
+
+
+async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+    _mark_anchored(adapter, "cht_a")
+    refreshed = _chat("cht_a", group=True, trusted=True)
+    http = _ChatResourceHTTP(_Resp(refreshed))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._deliver(
+        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"})],
+        [([], [], "what is on the calendar?")],
+        "cht_a",
+    )
+
+    assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
+    assert adapter._chats["cht_a"]["trusted"] is True
+    assert handled[0]["channel_prompt"] == module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT
+
+
+async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=True)])
+    _mark_anchored(adapter, "cht_a")
+
+    http = _ChatResourceHTTP(_Resp({}, status=503))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
+    handled = _capture_events(monkeypatch, adapter)
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        await adapter._deliver(
+            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"})],
+            [([], [], "calendar")],
+            "cht_a",
+        )
+
+    assert handled == []
+    assert adapter._chats["cht_a"]["trusted"] is True
+    assert adapter._last_uids["cht_a"] is None
+
+
 class _HTTP:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
@@ -1229,12 +1348,17 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     async def reply_from_member_turn(event: Any) -> None:
         await adapter.on_processing_start(event)
         try:
+            assert adapter._active_turn.get() == {
+                "chat_uid": event.source.chat_id,
+                "owner": False,
+            }
             if event.message_id == "msg_no_reply":
                 return
             results["reply"] = await adapter.send(event.source.chat_id, "reply in B")
             results["cross_chat"] = await adapter.send("cht_a", "must not leave B")
         finally:
             await adapter.on_processing_complete(event, None)
+            assert adapter._active_turn.get() is None
 
     monkeypatch.setattr(adapter, "handle_message", reply_from_member_turn)
     await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b", role="member"))
@@ -1372,11 +1496,18 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     module = _load(monkeypatch, tmp_path)
     ctx = _ToolContext()
     module.register(ctx)
-    assert [t["name"] for t in ctx.tools] == ["plow_start_group_message"]
+    assert [t["name"] for t in ctx.tools] == [
+        "plow_start_group_message",
+        "plow_set_conversation_trusted",
+    ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
+
+    trust_tool = ctx.tools[1]
+    assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
+    assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
 
 def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, raises=None, record=None):
@@ -1401,6 +1532,134 @@ def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, rai
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
     return adapter
+
+
+def _live_trust_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, raises=None, record=None):
+    import threading
+
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def stub(chat_uid: str, trusted: bool) -> dict[str, Any]:
+        if record is not None:
+            record.append((chat_uid, trusted))
+        if raises is not None:
+            raise raises
+        return {"trusted": trusted}
+
+    adapter.set_conversation_trusted = stub
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr(module, "_live", (adapter, loop))
+    return adapter
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_owner_can_set_current_conversation_trust(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    trusted: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, bool]] = []
+    _live_trust_tool(module, monkeypatch, record=calls)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": trusted, "confirm": True}))
+
+    assert out == {"success": True, "chat_id": "cht_a", "trusted": trusted}
+    assert calls == [("cht_a", trusted)]
+
+
+@pytest.mark.parametrize(
+    ("turn", "confirm", "error"),
+    [
+        pytest.param(None, True, "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": False}, True, "owner", id="member-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, False, "confirm", id="unconfirmed"),
+    ],
+)
+def test_trust_tool_refuses_without_explicit_owner_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None,
+    confirm: bool,
+    error: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_trust_tool(module, monkeypatch, raises=AssertionError("must not write"))
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": confirm}))
+
+    assert out["success"] is False
+    assert error.lower() in out["error"].lower()
+
+
+def test_trust_tool_surfaces_api_error_without_claiming_a_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_trust_tool(module, monkeypatch, raises=RuntimeError("HTTP 503"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": True}))
+
+    assert out["success"] is False
+    assert "not confirm" in out["error"]
+
+
+async def test_trust_write_updates_cache_only_after_canonical_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+    http = _ChatResourceHTTP(_Resp({"trusted": True}))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    result = await adapter.set_conversation_trusted("cht_a", True)
+
+    assert result == {"trusted": True}
+    assert http.calls == [("put", f"{module.BASE}/v1/chats/cht_a/trusted", {
+        "json": {"trusted": True}, "headers": adapter.auth,
+    })]
+    assert adapter._chats["cht_a"]["trusted"] is True
+
+
+async def test_failed_trust_write_preserves_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+
+    http = _ChatResourceHTTP(_Resp({}, status=503))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        await adapter.set_conversation_trusted("cht_a", True)
+    assert adapter._chats["cht_a"]["trusted"] is False
+
+
+async def test_direct_chat_trust_write_is_refused_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=False, trusted=False)])
+    monkeypatch.setattr(
+        module.aiohttp,
+        "ClientSession",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not issue PUT")),
+    )
+
+    with pytest.raises(RuntimeError, match="group conversation"):
+        await adapter.set_conversation_trusted("cht_a", True)
+    assert adapter._chats["cht_a"]["trusted"] is False
 
 
 def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
