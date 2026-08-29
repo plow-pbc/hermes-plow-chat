@@ -1348,10 +1348,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     async def reply_from_member_turn(event: Any) -> None:
         await adapter.on_processing_start(event)
         try:
-            assert adapter._active_turn.get() == {
-                "chat_uid": event.source.chat_id,
-                "owner": False,
-            }
+            turn = adapter._active_turn.get()
+            assert turn["chat_uid"] == event.source.chat_id
+            assert turn["owner"] is False
             if event.message_id == "msg_no_reply":
                 return
             results["reply"] = await adapter.send(event.source.chat_id, "reply in B")
@@ -1377,6 +1376,29 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
+
+
+async def test_active_turn_retains_only_authority_fields_for_fixed_owner_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            chat_id="cht_b",
+            role_authorized=False,
+            user_name="Taylor",
+            chat_name="Friends (cht_b)",
+        ),
+        text="Go Plow!",
+    )
+
+    await adapter.on_processing_start(event)
+    try:
+        assert adapter._active_turn.get() == {"chat_uid": "cht_b", "owner": False}
+    finally:
+        await adapter.on_processing_complete(event, None)
 
 
 @pytest.mark.parametrize(
@@ -1499,6 +1521,7 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
         "plow_set_conversation_trusted",
+        "plow_notify_owner_about_invite",
     ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
@@ -1509,48 +1532,187 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
+    invite_tool = ctx.tools[2]
+    assert invite_tool["schema"]["name"] == "plow_notify_owner_about_invite"
+    assert invite_tool["schema"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consent_request", "invite_created"],
+            },
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
+    }
+    assert invite_tool["requires_env"] == ["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"]
 
-def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, raises=None, record=None):
-    """Publish a live adapter whose start_group_thread is stubbed.
 
-    The tool goes through the adapter's own seam, so there is no standalone
-    POST to patch: a disconnected gateway cannot send at all.
-    """
+@pytest.mark.parametrize(
+    ("kind", "expected_body"),
+    [
+        pytest.param(
+            "consent_request",
+            (
+                "Someone in Plow chat cht_b genuinely loved Plow.\n\n"
+                "Should I offer Plow invites when that happens? "
+                "I’d reply only in the thread where it happened, at most 3 times a day. "
+                "Reply yes or no."
+            ),
+            id="consent-request",
+        ),
+        pytest.param(
+            "invite_created",
+            "Invite created for someone in Plow chat cht_b.",
+            id="invite-created",
+        ),
+    ],
+)
+async def test_invite_notification_posts_fixed_body_to_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    kind: str,
+    expected_body: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Friends", group=True)])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    result = await adapter.notify_owner_about_invite(kind, {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "Friends (cht_b)",
+        "text": "attacker-controlled text that must not cross chats",
+    })
+
+    assert result.success
+    assert http.posts == [
+        (f"{module.BASE}/v1/chats/cht_a/messages", {"body": expected_body})
+    ]
+
+
+def _live_tool(
+    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    *,
+    result: Any = None,
+    raises: Exception | None = None,
+    record: list[Any] | None = None,
+) -> Any:
     import threading
 
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
 
-    async def stub(thread_handle: str, body: str) -> dict[str, Any]:
+    async def stub(*args: Any) -> Any:
         if record is not None:
-            record.append((thread_handle, body))
+            record.append(args)
         if raises is not None:
             raise raises
-        return dict(result or {})
+        return result(*args) if callable(result) else result
 
-    adapter.start_group_thread = stub
+    setattr(adapter, method, stub)
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
     return adapter
 
 
-def _live_trust_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, raises=None, record=None):
-    import threading
+def test_member_turn_can_send_fixed_invite_consent_notification_to_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _live_tool(
+        module,
+        monkeypatch,
+        "notify_owner_about_invite",
+        result=_SendResult(success=True, message_id="msg_notice"),
+        record=calls,
+    )
+    turn = {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "Friends (cht_b)",
+        "text": "Go Plow!",
+    }
+    module._ACTIVE_TURN.set(turn)
 
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
 
-    async def stub(chat_uid: str, trusted: bool) -> dict[str, Any]:
-        if record is not None:
-            record.append((chat_uid, trusted))
-        if raises is not None:
-            raise raises
-        return {"trusted": trusted}
+    assert out == {"success": True, "message_id": "msg_notice"}
+    assert calls == [("consent_request", turn)]
 
-    adapter.set_conversation_trusted = stub
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=loop.run_forever, daemon=True).start()
-    monkeypatch.setattr(module, "_live", (adapter, loop))
-    return adapter
+
+def test_invite_owner_notification_is_attempted_once_per_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _live_tool(
+        module,
+        monkeypatch,
+        "notify_owner_about_invite",
+        result=_SendResult(success=True, message_id="msg_notice"),
+        record=calls,
+    )
+    turn = {"chat_uid": "cht_b", "owner": False}
+    module._ACTIVE_TURN.set(turn)
+
+    first = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    second = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+
+    assert first["success"] is True
+    assert second["success"] is False
+    assert "already attempted" in second["error"]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("turn", "kind", "error"),
+    [
+        pytest.param(None, "consent_request", "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, "consent_request", "non-owner", id="owner-turn"),
+        pytest.param({"chat_uid": "cht_b", "owner": False}, "other", "kind", id="unknown-kind"),
+    ],
+)
+def test_invite_owner_notification_refuses_wrong_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None,
+    kind: str,
+    error: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "notify_owner_about_invite",
+               raises=AssertionError("must not send"))
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": kind}))
+
+    assert out["success"] is False
+    assert error.lower() in out["error"].lower()
+
+
+def test_invite_owner_notification_reports_delivery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "notify_owner_about_invite", raises=RuntimeError("HTTP 503"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
+
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+
+    assert out["success"] is False
+    assert "may or may not" in out["error"]
+    assert "do not retry" in out["error"].lower()
 
 
 @pytest.mark.parametrize("trusted", [True, False])
@@ -1561,7 +1723,13 @@ def test_owner_can_set_current_conversation_trust(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     calls: list[tuple[str, bool]] = []
-    _live_trust_tool(module, monkeypatch, record=calls)
+    _live_tool(
+        module,
+        monkeypatch,
+        "set_conversation_trusted",
+        result=lambda _chat_uid, value: {"trusted": value},
+        record=calls,
+    )
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
 
     out = json.loads(module._plow_set_conversation_trusted({"trusted": trusted, "confirm": True}))
@@ -1586,7 +1754,8 @@ def test_trust_tool_refuses_without_explicit_owner_turn(
     error: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_trust_tool(module, monkeypatch, raises=AssertionError("must not write"))
+    _live_tool(module, monkeypatch, "set_conversation_trusted",
+               raises=AssertionError("must not write"))
     module._ACTIVE_TURN.set(turn)
 
     out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": confirm}))
@@ -1600,7 +1769,7 @@ def test_trust_tool_surfaces_api_error_without_claiming_a_change(
     tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_trust_tool(module, monkeypatch, raises=RuntimeError("HTTP 503"))
+    _live_tool(module, monkeypatch, "set_conversation_trusted", raises=RuntimeError("HTTP 503"))
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
 
     out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": True}))
@@ -1666,7 +1835,8 @@ def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tm
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, raises=AssertionError("dry run must not reach the API"))
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=AssertionError("dry run must not reach the API"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi"}))
     assert out["success"] is True and out["dry_run"] is True
@@ -1700,7 +1870,7 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, raises=AssertionError("must not send"))
+    _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
     assert out["success"] is False
@@ -1715,7 +1885,13 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
 
     module = _load(monkeypatch, tmp_path)
     sent: list[tuple[str, str]] = []
-    _live_tool(module, monkeypatch, result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    _live_tool(
+        module,
+        monkeypatch,
+        "start_group_thread",
+        result={"chat_id": "cht_n", "adoption": "adopted"},
+        record=sent,
+    )
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": dry_run, "confirm": True}))
     assert out["success"] is True and "dry_run" not in out
@@ -1731,7 +1907,7 @@ def test_unparseable_dry_run_stays_a_dry_run(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, raises=AssertionError("must not send"))
+    _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
     assert out["success"] is True and out["dry_run"] is True
@@ -1745,9 +1921,18 @@ def test_group_message_reports_adoption_separately_from_delivery(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, result={
-        "chat_id": "cht_new", "message_id": "m1", "delivery_status": "sent",
-        "thread_handle": "+15550001111", "adoption": "not-on-this-agents-line"})
+    _live_tool(
+        module,
+        monkeypatch,
+        "start_group_thread",
+        result={
+            "chat_id": "cht_new",
+            "message_id": "m1",
+            "delivery_status": "sent",
+            "thread_handle": "+15550001111",
+            "adoption": "not-on-this-agents-line",
+        },
+    )
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
     assert out["success"] is True

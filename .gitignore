@@ -7,3 +7,5 @@ install-report.json
 
 # knightwatch materializes declared review siblings here during a review.
 .siblings/
+docs/superpowers/plans/
+docs/superpowers/specs/
