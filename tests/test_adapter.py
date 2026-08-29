@@ -198,16 +198,6 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
-def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
-    """Simulate `_listen`'s pre-connect loop having already anchored these
-    chats -- the real precondition before any frame reaches `_on_frame` in
-    production. A test that drives `_on_frame` directly, skipping `_listen`,
-    needs this so a frame for a chat the test doesn't care about anchoring
-    doesn't trip `_ensure_empty_anchor`'s per-frame baseline check."""
-    for chat_uid in chat_uids:
-        adapter._anchored_chats[chat_uid] = True
-
-
 def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str, Any]:
     participants = [
         {"type": "agent"},
@@ -317,7 +307,6 @@ async def test_inbound_media_reaches_hermes_as_local_files(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=status)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -351,7 +340,6 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
     logged, without dropping the good part that arrived alongside it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -382,7 +370,6 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     distinct wrapping events) must be deduped before the attachment fetch."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -401,7 +388,6 @@ async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatc
     photo. One turn, both files, in arrival order, typed from the whole burst."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -426,7 +412,6 @@ async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.
     hand-off's to wait for, not the window's."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     release = asyncio.Event()
 
     async def slow_fetch(item: Any, kind: str) -> str:
@@ -453,7 +438,6 @@ async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
     burst's, begun when the chat gets around to it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     entered, release, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -503,7 +487,6 @@ async def test_a_burst_from_one_sender_is_one_turn(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
-    _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
@@ -529,7 +512,6 @@ async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
-    _mark_anchored(adapter, "cht_a")
     a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
     order: list[str] = []
 
@@ -562,7 +544,6 @@ async def test_a_backfilled_duplicate_of_an_in_flight_uid_is_dropped(
     ack and is dropped — hermes never sees the message twice."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     entered, release = asyncio.Event(), asyncio.Event()
     handled: list[str] = []
 
@@ -593,7 +574,6 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
     a retry must not go back to a signed url that may have expired."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[str] = []
@@ -736,6 +716,77 @@ async def test_a_restart_does_not_re_anchor_over_messages_it_never_handled(monke
     assert handled == ["msg_during_restart"], "it must be backfilled instead"
 
 
+class _DiscoveredAfterFirstConnectHTTP:
+    """The first connect knows only cht_a, empty. Before the second connect's
+    own reach refresh reveals cht_new for the first time, a reply for it is
+    already the newest message server-side -- the state a chat is left in
+    when an earlier empty-anchor attempt for it (a live adopt, a
+    `start_group_thread` call) never landed. `history_reads` is read-once:
+    it must never name cht_new."""
+
+    def __init__(self) -> None:
+        self.history_reads: list[str] = []
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+        if url.endswith("/v1/chats"):
+            return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_new")], "has_more": False})
+        chat_uid = url.split("/v1/chats/")[1].split("/")[0]
+        if "limit=1" in url:
+            self.history_reads.append(chat_uid)
+            return _Resp({"data": [], "has_more": False})
+        if chat_uid == "cht_new":
+            return _Resp({"data": [{"uid": "msg_reply"}], "has_more": False})
+        return _Resp({"data": [], "has_more": False})
+
+    def post(self, url: str, **kw: Any) -> _Resp:
+        return _Resp({"ticket": "tkt"})
+
+    def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
+        return _WS()
+
+    async def __aenter__(self) -> "_DiscoveredAfterFirstConnectHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+
+async def test_a_chat_discovered_after_first_connect_never_newest_anchors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The bug this round closes: baselining a chat discovered after this
+    process's true first-ever connect used to go through whichever of three
+    call sites discovered it first, and if a live adopt's or a
+    `start_group_thread`'s empty-anchor write failed even once, the chat was
+    left known-but-unanchored -- and the OLD per-connect loop then
+    newest-anchored it on the very next reconnect regardless, checkpointing
+    a reply hermes never handled and silently dropping it.
+
+    `first_connection` is now the one gate, read once per process life:
+    cht_a, known at the true first connect, gets `_ensure_anchor` (newest,
+    the deliberate one-time history skip). cht_new, revealed only by the
+    SECOND connect's own reach refresh -- exactly like a chat a failed
+    empty-anchor write left stranded until the next reconnect -- must get
+    `_ensure_empty_anchor` instead, no matter that a reply for it is already
+    the newest message server-side, so `_backfill` recovers it rather than
+    skipping past it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _DiscoveredAfterFirstConnectHTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    handled: list[str] = []
+    monkeypatch.setattr(adapter, "_on_message", lambda m, _chat_uid: handled.append(m["uid"]))
+
+    with mock.patch.object(module.asyncio, "sleep", side_effect=[None, StopAsyncIteration]):
+        with pytest.raises(StopAsyncIteration):
+            await adapter._listen()
+
+    assert "cht_new" not in http.history_reads, "a chat discovered after first connect must never be newest-anchored"
+    assert adapter._load_checkpoint("cht_new") is None, "its baseline must be empty, not a newest-message uid"
+    assert adapter._anchored_chats["cht_new"], "empty-anchored still means anchored, not skipped"
+    assert handled == ["msg_reply"], "the reply survives via backfill instead of being skipped past"
+
+
 async def test_an_initial_marker_that_will_not_persist_does_not_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """In-memory anchor state follows the disk; it never leads it.
 
@@ -770,7 +821,6 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     config = SimpleNamespace(extra={})
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
-    _mark_anchored(adapter, "cht_a", "cht_b")
     # cht_c is never granted; a refresh that leaves reach unchanged is what
     # a real ungranted chat looks like -- nothing here exercises adoption.
     monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
@@ -840,13 +890,11 @@ async def test_unknown_chat_frame_adoption_cases(
     reach refresh either reveals it (adopted; a carried message is delivered)
     or it stays outside the grant (dropped, logged, costing one refresh).
 
-    A revealed chat must NOT be anchored at its newest existing message --
-    that message IS the frame already in hand, stored server-side before
-    this process ever saw it. Anchoring it would checkpoint it ahead of the
-    handoff below, so a crash in between would drop the chat's first turn;
-    `_ensure_anchor` raising here pins that it is never called. The
-    first-meeting 👋 still fires -- baselining empty must not silently drop
-    the greeting that baselining at newest would have sent."""
+    `_on_frame` does not baseline a revealed chat itself any more -- that is
+    `_listen`'s per-connect loop's job (see `test_a_chat_discovered_after_
+    first_connect_never_newest_anchors`), so neither anchor helper is called
+    here, no baseline is written, and no greeting fires yet; delivery below
+    does not need one either way."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = object()  # the listen loop's live session, opaque to a mocked refresh
@@ -858,8 +906,9 @@ async def test_unknown_chat_frame_adoption_cases(
             adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
 
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    monkeypatch.setattr(adapter, "_ensure_anchor",
-                         mock.AsyncMock(side_effect=AssertionError("adoption must not anchor at newest")))
+    no_anchor = mock.AsyncMock(side_effect=AssertionError("_on_frame must not baseline a chat itself"))
+    monkeypatch.setattr(adapter, "_ensure_anchor", no_anchor)
+    monkeypatch.setattr(adapter, "_ensure_empty_anchor", no_anchor)
     handled = _capture_events(monkeypatch, adapter)
     greetings: list[str] = []
 
@@ -880,14 +929,12 @@ async def test_unknown_chat_frame_adoption_cases(
     assert ("cht_new" in adapter.chat_uids) == reveals
     assert [event["message_id"] for event in handled] == (["msg_new"] if expect_delivered else [])
     assert ("outside the grant" in caplog.text) == (not reveals)
-    assert greetings == (["cht_new"] if reveals else [])
-    if reveals:
-        # Recovery semantics, not a newest-message anchor: the baseline is
-        # empty until the ack-after-handoff checkpoint (written in
-        # `_deliver`) advances it, so a crash before that handoff leaves
-        # `_backfill` paging to exhaustion instead of stopping at a message
-        # hermes never accepted.
-        assert adapter._load_checkpoint("cht_new") == ("msg_new" if expect_delivered else None)
+    assert greetings == [], "the first-meeting greeting rides the next connect's anchor pass, not this frame"
+    if expect_delivered:
+        # The delivered message's own ack-after-handoff checkpoint (written
+        # in `_deliver`) is the only baseline this chat gets from this call --
+        # never a `_on_frame`-side anchor of any kind.
+        assert adapter._load_checkpoint("cht_new") == "msg_new"
     else:
         assert not adapter._checkpoint_path("cht_new").exists()
 
@@ -1055,7 +1102,6 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
-    _mark_anchored(adapter, "cht_a", "cht_b")
     http = _HTTP()
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
@@ -1346,7 +1392,6 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     reporting a disconnected gateway."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    _mark_anchored(adapter, "cht_a")
     http = _HTTP()
     http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}
