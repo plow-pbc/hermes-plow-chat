@@ -105,6 +105,16 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Most adapter tests isolate a different seam and drive an already-cached
+    # chat directly, without a REST server. Keep that canonical resource as
+    # the response for those tests. The dedicated refresh tests below restore
+    # the production method and exercise its HTTP/status/validation behavior.
+    module._real_refresh_current_chat = module.PlowChatAdapter._refresh_current_chat
+
+    async def keep_current_chat(adapter: Any, chat_uid: str) -> None:
+        assert chat_uid in adapter._chats
+
+    monkeypatch.setattr(module.PlowChatAdapter, "_refresh_current_chat", keep_current_chat)
     # No CHECKPOINT override: with HERMES_HOME pinned above, the module's own
     # env-derived resolution already lands in tmp_path -- the assert IS the
     # regression pin for the fleet's checkpoint home (the old hardcoded
@@ -211,7 +221,7 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
 
 
 def _chat(uid: str, *, name: str | None = None, group: bool = False,
-          agent_name: str | None = None) -> dict[str, Any]:
+          agent_name: str | None = None, trusted: bool = False) -> dict[str, Any]:
     participants = [
         {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
         if agent_name else {"type": "agent"},
@@ -219,7 +229,8 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
     ]
     if group:
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member"})
-    return {"uid": uid, "display_name": name, "participants": participants}
+    return {"uid": uid, "display_name": name, "participants": participants,
+            "trusted": trusted}
 
 
 def _envelope(
@@ -1066,6 +1077,114 @@ async def test_named_line_identity_prefixes_every_turn_prompt(
     if agent_name:
         expected = f"You are {agent_name}, a Plow assistant; people here address you by that name. {expected}"
     assert event["channel_prompt"] == expected
+
+
+@pytest.mark.parametrize(
+    ("group", "role", "trusted", "prompt_name"),
+    [
+        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
+        pytest.param(True, "owner", False, "GROUP_OWNER_CHANNEL_PROMPT", id="untrusted-group-owner"),
+        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", id="untrusted-group-member"),
+        pytest.param(True, "owner", True, "TRUSTED_GROUP_OWNER_CHANNEL_PROMPT", id="trusted-group-owner"),
+        pytest.param(True, "member", True, "TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT", id="trusted-group-member"),
+    ],
+)
+async def test_trust_selects_the_explicit_prompt_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    group: bool,
+    role: str,
+    trusted: bool,
+    prompt_name: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=group, trusted=trusted)])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame(_envelope("evt_matrix", "cht_a", "msg_matrix", role=role), object())
+    await _settle(adapter)
+
+    assert handled[0]["channel_prompt"] == getattr(module, prompt_name)
+
+    if trusted:
+        prompt = handled[0]["channel_prompt"].lower()
+        assert "calendar" in prompt
+        assert "normal tools" in prompt
+        assert "everyone" in prompt
+        for secret in ("credentials", "authentication secrets", "raw tokens", "payment-card"):
+            assert secret in prompt
+
+
+async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+    _mark_anchored(adapter, "cht_a")
+    refreshed = _chat("cht_a", group=True, trusted=True)
+    gets: list[str] = []
+
+    class _CurrentChatHTTP:
+        async def __aenter__(self) -> "_CurrentChatHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            gets.append(url)
+            return _Resp(refreshed)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _CurrentChatHTTP())
+    adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._deliver(
+        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"})],
+        [([], [], "what is on the calendar?")],
+        "cht_a",
+    )
+
+    assert gets == [f"{module.BASE}/v1/chats/cht_a"]
+    assert adapter._chats["cht_a"]["trusted"] is True
+    assert handled[0]["channel_prompt"] == module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT
+
+
+async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=True)])
+    _mark_anchored(adapter, "cht_a")
+
+    class _FailedHTTP:
+        async def __aenter__(self) -> "_FailedHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            return _Resp({}, status=503)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _FailedHTTP())
+    adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
+    handled = _capture_events(monkeypatch, adapter)
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        await adapter._deliver(
+            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"})],
+            [([], [], "calendar")],
+            "cht_a",
+        )
+
+    assert handled == []
+    assert adapter._chats["cht_a"]["trusted"] is True
+    assert adapter._last_uids["cht_a"] is None
 
 
 class _HTTP:

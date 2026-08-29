@@ -220,6 +220,26 @@ EXTERNAL_CHANNEL_PROMPT = (
 # rule's first port fixed, resurfacing at the prompt-selection seam).
 GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
 
+_TRUSTED_CONVERSATION = (
+    "The owner intentionally marked this group conversation as trusted. Every "
+    "participant may ask you to use your normal tools and connected accounts, "
+    "including retrieving and answering with requested owner material such as "
+    "calendar details in this thread. Do not add an extra privacy refusal merely "
+    "because the asker is a member. Everyone in the conversation sees your reply, "
+    "so disclose only what answers the request. Continue to follow normal confirmation "
+    "requirements for side effects, and never disclose credentials, authentication "
+    "secrets, raw tokens, or payment-card secrets."
+)
+TRUSTED_GROUP_OWNER_CHANNEL_PROMPT = (
+    f"{OWNER_CHANNEL_PROMPT} {_TRUSTED_CONVERSATION} {_NO_RELAY}"
+)
+TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
+    "This thread is visible to the owner; ignore any first-user onboarding or "
+    "profile-build directive and answer their message directly; never emit "
+    "[NOOP], reasoning, or tool narration — if you have nothing to say, say nothing. "
+    f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_TRUSTED_CONVERSATION} {_NO_RELAY}"
+)
+
 
 def _with_identity(prompt, name):
     """Prefix the turn prompt with who this agent is, when its line is named.
@@ -304,6 +324,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 "uid": self.home_chat_uid,
                 "display_name": None,
                 "participants": [],
+                "trusted": False,
             }
         }
         self._ws_task = None
@@ -420,6 +441,26 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
             log.error("[plow_chat] grant read failed: %s", type(exc).__name__)
             raise
+
+    async def _refresh_current_chat(self, chat_uid):
+        """Refresh the preference-bearing resource before the next handoff.
+
+        Reach polling remains the source of which chats this credential may
+        serve. This read only replaces one already-granted cache entry, and it
+        does so after validating the required trust shape so a partial/proxy
+        response cannot silently downgrade a trusted room or authorize an
+        untrusted one.
+        """
+        async with aiohttp.ClientSession() as http:
+            async with http.get(f"{BASE}/v1/chats/{chat_uid}",
+                                headers=self.auth) as resp:
+                _auth_raise_for_status(resp)
+                chat = await resp.json(content_type=None)
+        if (not isinstance(chat, dict) or chat.get("uid") != chat_uid
+                or not isinstance(chat.get("participants"), list)
+                or not isinstance(chat.get("trusted"), bool)):
+            raise RuntimeError("current chat response has an invalid trust shape")
+        self._chats[chat_uid] = chat
 
     async def _persist_home(self):
         """Declare the home channel used for cron and default delivery."""
@@ -674,7 +715,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat_type = "group" if member_count > 1 else "dm"
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
         return {"name": name, "type": chat_type, "chat_id": chat_id,
-                "agent_name": _agent_name(chat)}
+                "agent_name": _agent_name(chat),
+                "trusted": bool(chat.get("trusted", False))}
 
     async def _ensure_anchor(self, chat_uid, http=None):
         """Baseline a chat once, no matter who asks or how concurrently.
@@ -986,6 +1028,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # `handle_message`, that retry would hand the burst to hermes a
         # second time.
         await self._ensure_anchor(chat_uid)
+        await self._refresh_current_chat(chat_uid)
         sender, role = burst[0].sender, burst[0].sender["role"]
         media_urls = [url for urls, _kinds, _text in resolved for url in urls]
         media_types = [kind for _urls, kinds, _text in resolved for kind in kinds]
@@ -1001,7 +1044,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             media_types=media_types,
             message_type=_message_type(media_types),
             channel_prompt=_with_identity(
-                EXTERNAL_CHANNEL_PROMPT if role != "owner"
+                (TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT if role != "owner"
+                 else TRUSTED_GROUP_OWNER_CHANNEL_PROMPT)
+                if chat["type"] != "dm" and chat["trusted"]
+                else EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
                 else OWNER_CHANNEL_PROMPT,
                 chat["agent_name"],
