@@ -641,9 +641,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             # too, empty, on whatever reconnect comes next, but this call
             # needs to know NOW, synchronously, whether the baseline
             # actually landed -- `data["adoption"]` is this tool's honest
-            # answer to the caller. `uid` defaults to "" -- see
-            # `_ensure_anchor` for why empty, never the newest existing
-            # message, is always the right call here.
+            # answer to the caller. No `http` passed -- see `_ensure_anchor`
+            # for why empty, never the newest existing message, is always
+            # the right call here.
             try:
                 await self._ensure_anchor(chat_id)
             except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
@@ -678,43 +678,57 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "agent_name": _agent_name(chat)}
 
-    async def _ensure_anchor(self, chat_uid, uid=""):
+    async def _ensure_anchor(self, chat_uid, http=None):
         """Baseline a chat once, no matter who asks or how concurrently.
 
-        `uid` is the baseline. It is the chat's newest existing message only
-        for this process's true first-ever connect -- `_listen`'s
-        first-install branch reads that, before the socket, while nothing
-        is arriving yet, and passes it in; that is the one deliberate,
-        one-time skip of pre-existing history this whole mechanism exists
-        to gate. Every other caller -- `_listen` on any later connect,
-        `start_group_thread` right after its own send, `_deliver` for a
-        chat it discovers is still unanchored -- passes nothing, empty:
-        that chat's newest existing message can be a turn hermes has not
-        yet accepted (a reply that beat the call, or one still sitting in
-        an in-memory delivery queue), and checkpointing it would risk
-        marking it handled ahead of the handoff that actually accepts it.
-        `_backfill`'s pages-to-exhaustion branch recovers an empty baseline
-        instead; the ack-after-handoff checkpoint `_deliver` writes becomes
-        the first durable one.
+        `http` is given only by `_listen`'s first-install branch, for a
+        chat known at this process's true first-ever connect -- the one
+        deliberate, one-time skip of pre-existing history this mechanism
+        exists to gate. The newest-message read happens HERE, under the
+        lock and after the already-anchored check, never before taking it:
+        reading it first and passing the uid in left a window where a
+        concurrent empty anchor for the same chat_uid (a `start_group_thread`
+        call, or `_deliver` for a message that lands mid-read) could win the
+        lock first, leaving this call's own read to resolve into a
+        skipped, already-anchored no-op -- stranding the chat empty-anchored
+        instead of at newest, and `_backfill` would then replay its entire
+        pre-existing history to hermes as new turns. Every other caller --
+        `_listen` on any later connect, `start_group_thread` right after
+        its own send, `_deliver` for a chat it discovers is still
+        unanchored -- passes no `http`, empty: that chat's newest existing
+        message can be a turn hermes has not yet accepted (a reply that
+        beat the call, or one still sitting in an in-memory delivery
+        queue), and checkpointing it would risk marking it handled ahead of
+        the handoff that actually accepts it. `_backfill`'s
+        pages-to-exhaustion branch recovers an empty baseline instead; the
+        ack-after-handoff checkpoint `_deliver` writes becomes the first
+        durable one.
 
         A write failure raises: `_listen` and `_deliver` both retry (the
-        reconnect loop, `_serve_chat`'s hand-off retry) and always pass ""
-        on the next attempt regardless of what this one tried, so a chat
-        stranded unanchored is retried empty, never newest, no matter how
-        many attempts it takes; `start_group_thread` reports it honestly in
-        `adoption` instead of retrying.
+        reconnect loop, `_serve_chat`'s hand-off retry) and always pass no
+        `http` on the next attempt regardless of what this one tried, so a
+        chat stranded unanchored is retried empty, never newest, no matter
+        how many attempts it takes; `start_group_thread` reports it
+        honestly in `adoption` instead of retrying.
 
-        One lock, re-checked inside, is the whole concurrency story:
-        `_listen`'s first-connect sweep and a `start_group_thread` call can
-        race to discover the same brand-new chat_uid, and unserialized the
-        loser would see a half-done anchor as done and start a cursorless
-        backfill (replaying history as new turns), or double-send the
-        disclosure wave -- anchoring is rare, so contention is nil.
+        One lock, held for the whole check-read-write-greet sequence, is
+        the whole concurrency story: `_listen`'s first-connect sweep and a
+        `start_group_thread` call can race to discover the same brand-new
+        chat_uid, and whichever wins the lock completes atomically before
+        the other so much as reads `_anchored_chats` -- anchoring is rare,
+        so contention is nil.
         """
         async with self._anchor_lock:
             if self._anchored_chats.get(chat_uid):
                 return
             first_meeting = not self._checkpoint_path(chat_uid).exists()
+            uid = ""
+            if http is not None:
+                async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
+                                    headers=self.auth) as resp:
+                    _auth_raise_for_status(resp)
+                    page = (await resp.json(content_type=None)).get("data") or []
+                uid = page[0]["uid"] if page else ""
             if not self._checkpoint(uid, chat_uid):
                 raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
             await self._greet_first_meeting(chat_uid, first_meeting)
@@ -820,19 +834,16 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # for why empty is always the safe default).
                     newest_anchor = first_connection and first_install
                     first_connection = False
+                    # `http` only when newest_anchor: `_ensure_anchor` reads
+                    # the newest uid itself, under its own lock, so a
+                    # concurrent empty anchor for the same chat_uid (a
+                    # `start_group_thread` call racing this very first
+                    # connect) can never land between a read taken here and
+                    # a write made there. Before the socket either way,
+                    # never inside it -- reading after `ws_connect` races
+                    # the frames that connection is already buffering.
                     for chat_uid in self.chat_uids:
-                        uid = ""
-                        if newest_anchor:
-                            # Before the socket, never inside it: reading the
-                            # newest uid after `ws_connect` races the frames
-                            # that connection is already buffering, which can
-                            # silently drop the customer's first turn.
-                            async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
-                                                headers=self.auth) as resp:
-                                _auth_raise_for_status(resp)
-                                page = (await resp.json(content_type=None)).get("data") or []
-                            uid = page[0]["uid"] if page else ""
-                        await self._ensure_anchor(chat_uid, uid)
+                        await self._ensure_anchor(chat_uid, http if newest_anchor else None)
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()

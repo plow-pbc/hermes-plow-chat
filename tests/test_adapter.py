@@ -977,9 +977,9 @@ async def test_unknown_chat_frame_adoption_cases(
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
     real_ensure_anchor = adapter._ensure_anchor
 
-    async def spying_ensure_anchor(chat_uid: str, uid: str = "") -> None:
-        assert uid == "", "must not anchor at newest from this path"
-        await real_ensure_anchor(chat_uid, uid)
+    async def spying_ensure_anchor(chat_uid: str, http: Any = None) -> None:
+        assert http is None, "must not anchor at newest from this path"
+        await real_ensure_anchor(chat_uid, http)
 
     monkeypatch.setattr(adapter, "_ensure_anchor", spying_ensure_anchor)
     handled = _capture_events(monkeypatch, adapter)
@@ -1169,20 +1169,25 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """The startup loop and a tool adoption can find the same brand-new chat at
-    once; `_ensure_anchor`'s lock, re-checked inside, is what keeps the
-    disclosure wave to one send (and one checkpoint write) -- one discoverer
-    reads the newest uid (as `_listen`'s first-install branch would) while
-    the other races straight to `_ensure_anchor` empty (as a concurrent
-    `start_group_thread` call would)."""
+    """The startup loop and a tool adoption can find the same brand-new chat
+    at once; `_ensure_anchor`'s lock -- held across its own newest-message
+    read, not released and re-taken around it -- is what keeps a concurrent
+    empty anchor (a `start_group_thread` call) from landing while the
+    first-install read is in flight. If it could, the read would resolve
+    into a skipped, already-anchored no-op, stranding the chat empty
+    instead of at newest, and `_backfill` would replay its entire
+    pre-existing history to hermes as new turns. The reader must win: its
+    lock-held read blocks the empty racer out entirely, so the checkpoint
+    lands at the newest uid, not empty, and only one greeting ever fires."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a")])
 
     class _YieldingResp(_Resp):
         async def __aenter__(self) -> "_Resp":
-            # A reach rebuild lands mid-read, then control passes to the
-            # racing discoverer -- the two interleavings the lock must absorb.
+            # A reach rebuild lands mid-read, still under the anchor lock,
+            # then control passes to the racing discoverer -- the two
+            # interleavings the lock must absorb.
             adapter._set_reach([_chat("cht_a")])
             await asyncio.sleep(0)
             return self
@@ -1200,14 +1205,12 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     monkeypatch.setattr(adapter, "send", send)
     http = _HTTPStub()
 
-    async def discover_via_read() -> None:
-        async with http.get(f"{module.BASE}/v1/chats/cht_a/messages?limit=1", headers=adapter.auth) as resp:
-            page = (await resp.json(content_type=None)).get("data") or []
-        await adapter._ensure_anchor("cht_a", page[0]["uid"] if page else "")
-
-    await asyncio.gather(discover_via_read(), adapter._ensure_anchor("cht_a"))
+    # As `_listen`'s first-install branch would call it (with `http`,
+    # racing a concurrent `start_group_thread`-style call with none).
+    await asyncio.gather(adapter._ensure_anchor("cht_a", http), adapter._ensure_anchor("cht_a"))
     assert sends == ["cht_a"], "concurrent discovery double-sent the disclosure wave"
-    assert adapter._anchored_chats["cht_a"]
+    assert adapter._load_checkpoint("cht_a") == "msg_1", \
+        "the lock-held read must win over a racing empty anchor, not lose the newest baseline to it"
 
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(
