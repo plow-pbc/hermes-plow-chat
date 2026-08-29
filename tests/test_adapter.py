@@ -1348,10 +1348,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     async def reply_from_member_turn(event: Any) -> None:
         await adapter.on_processing_start(event)
         try:
-            assert adapter._active_turn.get() == {
-                "chat_uid": event.source.chat_id,
-                "owner": False,
-            }
+            turn = adapter._active_turn.get()
+            assert turn["chat_uid"] == event.source.chat_id
+            assert turn["owner"] is False
             if event.message_id == "msg_no_reply":
                 return
             results["reply"] = await adapter.send(event.source.chat_id, "reply in B")
@@ -1377,6 +1376,35 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
+
+
+async def test_active_turn_retains_event_fields_for_fixed_owner_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            chat_id="cht_b",
+            role_authorized=False,
+            user_name="Taylor",
+            chat_name="Friends (cht_b)",
+        ),
+        text="Go Plow!",
+    )
+
+    await adapter.on_processing_start(event)
+    try:
+        assert adapter._active_turn.get() == {
+            "chat_uid": "cht_b",
+            "owner": False,
+            "user_name": "Taylor",
+            "chat_name": "Friends (cht_b)",
+            "text": "Go Plow!",
+        }
+    finally:
+        await adapter.on_processing_complete(event, None)
 
 
 @pytest.mark.parametrize(
@@ -1499,6 +1527,7 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
         "plow_set_conversation_trusted",
+        "plow_notify_owner_about_invite",
     ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
@@ -1508,6 +1537,199 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     trust_tool = ctx.tools[1]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+
+    invite_tool = ctx.tools[2]
+    assert invite_tool["schema"]["name"] == "plow_notify_owner_about_invite"
+    assert invite_tool["schema"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consent_request", "invite_created"],
+            },
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
+    }
+    assert invite_tool["requires_env"] == ["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"]
+
+
+async def test_invite_notification_posts_fixed_event_derived_consent_request_to_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Friends", group=True)])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    result = await adapter.notify_owner_about_invite("consent_request", {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "Friends (cht_b)",
+        "text": "  I’m   loving\nPlow!  ",
+    })
+
+    assert result.success
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {
+        "body": (
+            "Taylor in Friends (cht_b) said “I’m loving Plow!”\n\n"
+            "Should I offer Plow invites when someone genuinely loves it? "
+            "I’d reply only in the thread where it happened, at most 3 times a day. "
+            "Reply yes or no."
+        ),
+    })]
+
+
+async def test_invite_notification_caps_external_praise_and_names_created_invite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    result = await adapter.notify_owner_about_invite("invite_created", {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "cht_b",
+        "text": "x" * 300,
+    })
+
+    assert result.success
+    body = http.posts[0][1]["body"]
+    assert body == f"Invite created for Taylor in cht_b after they said “{'x' * 239}…”"
+    assert len(body) < 350
+
+
+async def test_invite_notification_refuses_home_outside_current_grant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter.chat_uids = frozenset({"cht_b"})
+    monkeypatch.setattr(
+        module.aiohttp,
+        "ClientSession",
+        lambda: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+
+    result = await adapter.notify_owner_about_invite("consent_request", {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "cht_b",
+        "text": "Go Plow!",
+    })
+
+    assert result.success is False
+    assert "outside" in result.error
+
+
+def _live_invite_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, raises=None, record=None):
+    import threading
+
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def stub(kind: str, turn: dict[str, Any]) -> _SendResult:
+        if record is not None:
+            record.append((kind, turn))
+        if raises is not None:
+            raise raises
+        return _SendResult(success=True, message_id="msg_notice")
+
+    adapter.notify_owner_about_invite = stub
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr(module, "_live", (adapter, loop))
+    return adapter
+
+
+def test_member_turn_can_send_fixed_invite_consent_notification_to_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _live_invite_tool(module, monkeypatch, record=calls)
+    turn = {
+        "chat_uid": "cht_b",
+        "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "Friends (cht_b)",
+        "text": "Go Plow!",
+    }
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+
+    assert out == {"success": True, "message_id": "msg_notice"}
+    assert calls == [("consent_request", turn)]
+
+
+def test_invite_owner_notification_is_attempted_once_per_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    _live_invite_tool(module, monkeypatch, record=calls)
+    turn = {"chat_uid": "cht_b", "owner": False}
+    module._ACTIVE_TURN.set(turn)
+
+    first = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    second = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+
+    assert first["success"] is True
+    assert second["success"] is False
+    assert "already attempted" in second["error"]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("turn", "kind", "error"),
+    [
+        pytest.param(None, "consent_request", "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, "consent_request", "non-owner", id="owner-turn"),
+        pytest.param({"chat_uid": "cht_b", "owner": False}, "other", "kind", id="unknown-kind"),
+    ],
+)
+def test_invite_owner_notification_refuses_wrong_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None,
+    kind: str,
+    error: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_invite_tool(module, monkeypatch, raises=AssertionError("must not send"))
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": kind}))
+
+    assert out["success"] is False
+    assert error.lower() in out["error"].lower()
+
+
+def test_invite_owner_notification_reports_delivery_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_invite_tool(module, monkeypatch, raises=RuntimeError("HTTP 503"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
+
+    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+
+    assert out["success"] is False
+    assert "may or may not" in out["error"]
+    assert "do not retry" in out["error"].lower()
 
 
 def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, raises=None, record=None):

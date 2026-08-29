@@ -528,6 +528,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._active_turn.set({
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
+            "user_name": event.source.user_name,
+            "chat_name": event.source.chat_name,
+            "text": event.text,
         })
 
     async def on_processing_complete(self, event, outcome):
@@ -553,6 +556,33 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, chat_id, {"body": content.strip()})
+
+    async def notify_owner_about_invite(self, kind, turn):
+        """Send one fixed invite-workflow notice to the configured home.
+
+        This is deliberately not a generic send exception. The caller chooses
+        only the notice kind; its destination and content come from the active
+        inbound event, so a member turn cannot address another chat or supply
+        an arbitrary owner message.
+        """
+        if self.home_chat_uid not in self.chat_uids:
+            return SendResult(success=False, error="the configured home is outside this agent's grant")
+        praise = " ".join(str(turn["text"]).split())
+        if len(praise) > 240:
+            praise = praise[:239] + "…"
+        who = " ".join(str(turn["user_name"]).split()) or "A chat member"
+        where = " ".join(str(turn["chat_name"]).split()) or turn["chat_uid"]
+        if kind == "consent_request":
+            body = (
+                f"{who} in {where} said “{praise}”\n\n"
+                "Should I offer Plow invites when someone genuinely loves it? "
+                "I’d reply only in the thread where it happened, at most 3 times a day. "
+                "Reply yes or no."
+            )
+        else:
+            body = f"Invite created for {who} in {where} after they said “{praise}”"
+        async with aiohttp.ClientSession() as http:
+            return await self._post_message(http, self.home_chat_uid, {"body": body})
 
     async def set_conversation_trusted(self, chat_uid, trusted):
         """Write trust through Plow and update cache only from its response."""
@@ -1318,6 +1348,68 @@ PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
 }
 
 
+_INVITE_OWNER_NOTIFICATION_KINDS = {"consent_request", "invite_created"}
+
+
+def _plow_notify_owner_about_invite(args, **_kwargs):
+    """Bridge the fixed invite-workflow notice to the live adapter's loop."""
+    kind = args.get("kind")
+    if kind not in _INVITE_OWNER_NOTIFICATION_KINDS:
+        return json.dumps({"success": False, "error": "kind must be consent_request or invite_created"})
+    turn = _ACTIVE_TURN.get()
+    if turn is None:
+        return json.dumps({"success": False,
+                           "error": "this tool requires an active Plow Chat turn; nothing was sent"})
+    if turn["owner"]:
+        return json.dumps({"success": False,
+                           "error": "this notification is only for a non-owner delight turn; nothing was sent"})
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    attempted = turn.setdefault("_invite_owner_notifications_attempted", set())
+    if kind in attempted:
+        return json.dumps({"success": False,
+                           "error": f"the {kind} owner notification was already attempted this turn"})
+    attempted.add(kind)
+    adapter, loop = _live
+    try:
+        result = asyncio.run_coroutine_threadsafe(
+            adapter.notify_owner_about_invite(kind, turn), loop
+        ).result(timeout=20)
+    except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"could not confirm the owner notification ({type(exc).__name__}); it may or may not "
+                     "have been sent. Do not retry this turn",
+        })
+    if not result.success:
+        return json.dumps({"success": False, "error": result.error})
+    return json.dumps({"success": True, "message_id": result.message_id})
+
+
+PLOW_NOTIFY_OWNER_ABOUT_INVITE_SCHEMA = {
+    "name": "plow_notify_owner_about_invite",
+    "description": (
+        "Send the agent owner one fixed Plow-invite workflow notification from the "
+        "current non-owner turn. The destination, participant, chat, and praise are "
+        "taken from that turn; callers choose only whether this is the first consent "
+        "request or the FYI after an invite was created."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consent_request", "invite_created"],
+            },
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
+    },
+}
+
+
 def check_requirements():
     return bool(os.environ.get("PLOW_HOME_CHANNEL")
                 and os.environ.get("PLOW_AGENT_TOKEN"))
@@ -1352,4 +1444,12 @@ def register(ctx):
         handler=_plow_set_conversation_trusted,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_notify_owner_about_invite",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_NOTIFY_OWNER_ABOUT_INVITE_SCHEMA,
+        handler=_plow_notify_owner_about_invite,
+        check_fn=check_requirements,
+        requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
     )
