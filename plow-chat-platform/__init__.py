@@ -1046,8 +1046,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         if msg["direction"] != "inbound":
             return                           # the echo of our own send
         sender = msg["sender"]
-        if sender["type"] == "agent" and sender.get("relationship") == "self":
-            return
         if sender["type"] not in ("member", "agent") or (
                 sender["type"] == "agent" and sender.get("relationship") != "peer"):
             # This sender-type gate must run before anything reads uid:
