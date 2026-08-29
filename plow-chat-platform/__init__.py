@@ -66,6 +66,23 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _agent_name(chat):
+    """The line's persona name ("Elm"), or None for an unnamed line.
+
+    Read from the chat's own agent participant, so the DB stays the single
+    identity source and a rename needs no reprovision — it lands at the next
+    reach refresh (reconnect or group-send adoption), which is deliberate: a
+    rename is a rare coordinated ops event (it ships a new vCard too), not
+    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
+    of the listing readers: a pre-persona server omits `line`, and an unnamed
+    line omits `display_name`.
+    """
+    for participant in chat.get("participants") or []:
+        if participant.get("type") == "agent":
+            return (participant.get("line") or {}).get("display_name") or None
+    return None
+
+
 def _write_channel_aliases(names):
     """Publish our names into the image's own friendly-name registry.
 
@@ -202,6 +219,19 @@ EXTERNAL_CHANNEL_PROMPT = (
 # exactly the turns most likely to request private material (the same bug this
 # rule's first port fixed, resurfacing at the prompt-selection seam).
 GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
+
+
+def _with_identity(prompt, name):
+    """Prefix the turn prompt with who this agent is, when its line is named.
+
+    "hey Elm" in a group only reads as addressed if the model knows it IS Elm.
+    The name is ops-seeded on the line (not provider- or member-supplied text),
+    so carrying it in the prompt is not the injection seam a sender name would
+    be. Unnamed lines keep the exact prompts they have today.
+    """
+    if name is None:
+        return prompt
+    return f"You are {name}, a Plow assistant; people here address you by that name. {prompt}"
 
 # The connected adapter and the loop its listener task runs on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
@@ -484,6 +514,35 @@ class PlowChatAdapter(BasePlatformAdapter):
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, chat_id, {"body": content.strip()})
 
+    async def send_or_update_status(self, chat_id, status_key, content, metadata=None):
+        """Absorb the gateway's agent status frames instead of texting them.
+
+        Hermes routes every status callback (compaction notices, retry
+        chatter, working heartbeats) here when the adapter provides this hook;
+        without it they fall back to plain send() and land in the owner's
+        thread as real iMessages (#30). Dropped by default -- the typing
+        indicator already runs for the whole turn, so "working" is covered --
+        and reported as success so the gateway treats the frame as handled.
+        PLOW_STATUS_MESSAGES=deliver opts a deployment (one agent, one owner)
+        into receiving them as messages. The 💾 background-review summary
+        takes the gateway's plain send() path, not this hook; silence that
+        with display.memory_notifications in the hermes config.
+        """
+        if os.environ.get("PLOW_STATUS_MESSAGES", "").strip().lower() == "deliver":
+            refused = self._send_guard(chat_id)
+            if refused is not None:
+                return refused
+            # Not send(): that cancels the typing indicator, and a mid-turn
+            # status must not eat the "working" signal it rides alongside —
+            # a deployment that opts in gets both, not one or the other.
+            async with aiohttp.ClientSession() as http:
+                return await self._post_message(http, chat_id, {"body": content.strip()})
+        # Key and chat only, never the content: status payloads carry upstream
+        # provider detail with no non-secret guarantee, and this frame exists
+        # to be dropped, not persisted into the journal.
+        log.info("[plow_chat] dropped status frame %r for %s", status_key, chat_id)
+        return SendResult(success=True)
+
     async def _post_message(self, http, chat_id, payload):
         async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
                              json=payload, headers=self.auth) as resp:
@@ -620,7 +679,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         member_count = sum(participant.get("type") == "member" for participant in chat["participants"])
         chat_type = "group" if member_count > 1 else "dm"
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
-        return {"name": name, "type": chat_type, "chat_id": chat_id}
+        return {"name": name, "type": chat_type, "chat_id": chat_id,
+                "agent_name": _agent_name(chat)}
 
     async def _ensure_anchor(self, http, chat_uid):
         """Anchor once, no matter who asks or how concurrently.
@@ -982,10 +1042,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             message_type=_message_type(media_types),
-            channel_prompt=(
+            channel_prompt=_with_identity(
                 EXTERNAL_CHANNEL_PROMPT if role != "owner"
                 else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
-                else OWNER_CHANNEL_PROMPT
+                else OWNER_CHANNEL_PROMPT,
+                chat["agent_name"],
             ),
         ))
         # Ack AFTER the handoff, never before: a checkpoint advanced first
@@ -1183,6 +1244,7 @@ def register(ctx):
         label="Plow Chat",
         adapter_factory=lambda cfg: PlowChatAdapter(cfg),
         check_fn=check_requirements,
+        cron_deliver_env_var="PLOW_HOME_CHANNEL",
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables.",

@@ -210,9 +210,11 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
         adapter._anchored_chats[chat_uid] = True
 
 
-def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str, Any]:
+def _chat(uid: str, *, name: str | None = None, group: bool = False,
+          agent_name: str | None = None) -> dict[str, Any]:
     participants = [
-        {"type": "agent"},
+        {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
+        if agent_name else {"type": "agent"},
         {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner"},
     ]
     if group:
@@ -1025,6 +1027,42 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
         await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"), object())
 
 
+@pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
+@pytest.mark.parametrize(
+    ("group", "role", "base"),
+    [
+        pytest.param(False, "owner", "OWNER_CHANNEL_PROMPT", id="dm_owner"),
+        pytest.param(True, "owner", "GROUP_OWNER_CHANNEL_PROMPT", id="group_owner"),
+        pytest.param(True, "member", "EXTERNAL_CHANNEL_PROMPT", id="group_member"),
+    ],
+)
+async def test_named_line_identity_prefixes_every_turn_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    agent_name: str | None,
+    group: bool,
+    role: str,
+    base: str,
+) -> None:
+    """A named line tells the model who it is on every turn — "hey Elm" in a
+    group only reads as addressed if the agent knows it IS Elm. An unnamed
+    line keeps today's prompts exactly."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=group, agent_name=agent_name)])
+    _mark_anchored(adapter, "cht_a")
+
+    handled = _capture_events(monkeypatch, adapter)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", role=role), object())
+    await _settle(adapter)
+
+    (event,) = handled
+    expected = getattr(module, base)
+    if agent_name:
+        expected = f"You are {agent_name}, a Plow assistant; people here address you by that name. {expected}"
+    assert event["channel_prompt"] == expected
+
+
 class _HTTP:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
@@ -1301,6 +1339,13 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
 def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     assert "owner" in module.OWNER_CHANNEL_PROMPT.lower()
+
+
+def test_platform_declares_cron_delivery_home_channel(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    module = _load(monkeypatch, tmp_path)
+    ctx = mock.Mock()
+    module.register(ctx)
+    assert ctx.register_platform.call_args.kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
 
 
 class _ToolContext:
@@ -1685,3 +1730,35 @@ def test_an_unwritable_registry_does_not_cost_the_subscription(
                         mock.Mock(side_effect=OSError("read-only volume")))
     adapter._set_reach([_chat("cht_a")])
     assert adapter.chat_uids == frozenset({"cht_a"})
+
+
+async def test_status_frames_are_dropped_unless_the_deployment_opts_into_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes routes agent status callbacks (compaction notices, retry
+    chatter) through send_or_update_status when an adapter provides it;
+    without the hook they fall back to plain send() and land in the owner's
+    iMessage thread as real messages (#30). The contract: dropped by default
+    -- the typing indicator already covers "working" -- reported as success
+    so the gateway never retries, and delivered only when the deployment
+    sets PLOW_STATUS_MESSAGES=deliver."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    status = "✓ Context compaction complete — continuing turn..."
+
+    dropped = await adapter.send_or_update_status("cht_a", "compacted", status)
+    assert dropped.success and http.posts == []
+
+    # Delivery must not eat the typing indicator: a status arrives mid-turn,
+    # and the opted-in deployment gets both signals, not one or the other.
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
+    monkeypatch.setenv("PLOW_STATUS_MESSAGES", "deliver")
+    delivered = await adapter.send_or_update_status("cht_a", "compacted", status)
+    assert delivered.success
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
+    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
