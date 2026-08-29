@@ -1546,43 +1546,27 @@ async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_conn
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """The production ordering this round's fix protects: `connect` no
-    longer publishes `_live` itself, and a genuine first install's newest-
-    message read (inside `_ensure_anchor`, under its lock) can take real
-    network time. A tool call that fires in that window must find the
-    gateway not connected -- `_plow_start_group_message`'s existing
-    contract -- rather than being able to reach `_ensure_anchor` at all and
-    race the still-in-progress newest-vs-empty decision."""
+    longer publishes `_live` itself, and a genuine first install's anchor
+    pass -- still inside `_ensure_anchor`'s lock through its first-meeting
+    greeting -- can take real network time. A tool call that fires in that
+    window must find the gateway not connected -- `_plow_start_group_
+    message`'s existing contract -- rather than being able to reach
+    `_ensure_anchor` at all and race the still-in-progress newest-vs-empty
+    decision."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     entered, resumed = asyncio.Event(), asyncio.Event()
 
-    class _SlowResp(_Resp):
-        async def __aenter__(self) -> "_Resp":
-            entered.set()
-            await resumed.wait()
-            return self
+    async def slow_greet(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        entered.set()
+        await resumed.wait()
+        return _SendResult(success=True)
 
-    class _SlowFirstAnchorHTTP:
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            if url.endswith("/v1/chats"):
-                return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
-            return _SlowResp({"data": [], "has_more": False})  # the newest-message read, held open
-
-        def post(self, url: str, **kw: Any) -> _Resp:
-            return _Resp({"ticket": "tkt"})
-
-        def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
-            return _WS()
-
-        async def __aenter__(self) -> "_SlowFirstAnchorHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SlowFirstAnchorHTTP())
+    monkeypatch.setattr(adapter, "send", slow_greet)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _AnchorLifecycleHTTP([_chat("cht_a")]))
 
     await adapter.connect(is_reconnect=True)
-    await entered.wait()  # `_listen` is mid first-install anchor read, still pre-publish
+    await entered.wait()  # `_listen` is mid first-install anchor pass (greeting cht_a), still pre-publish
     assert module._live is None, "the tool must not see a live adapter before the first anchor pass finishes"
 
     out = json.loads(module._plow_start_group_message(
