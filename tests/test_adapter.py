@@ -202,7 +202,7 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
     """Simulate these chats having already been anchored -- by `_listen`'s
     pre-connect loop, the real precondition before any frame reaches
     `_on_frame` in production, or by an earlier delivery, since `_deliver`
-    now also routes a chat's first checkpoint through `_ensure_empty_anchor`.
+    now also routes a chat's first checkpoint through `_ensure_anchor`.
     A test that drives `_on_frame`/delivery directly, skipping `_listen`,
     needs this so a chat it doesn't care about anchoring doesn't trip that
     check on delivery."""
@@ -956,14 +956,14 @@ async def test_unknown_chat_frame_adoption_cases(
     reach refresh either reveals it (adopted; a carried message is delivered)
     or it stays outside the grant (dropped, logged, costing one refresh).
 
-    `_on_frame` itself never baselines a revealed chat -- `_ensure_anchor`
-    (newest) must never fire from this path at all, pinned below, and
-    `_listen`'s per-connect loop is what would empty-anchor it on the next
-    connect (see `test_a_chat_discovered_after_first_connect_never_newest_
-    anchors`). But a delivered message does not wait for that: `_deliver`
-    routes a chat's first-ever checkpoint through `_ensure_empty_anchor`
-    too, so the greeting still rides the delivery itself rather than being
-    silently dropped until some future reconnect."""
+    `_on_frame` itself never baselines a revealed chat -- `_listen`'s
+    per-connect loop is what would empty-anchor it on the next connect (see
+    `test_a_chat_discovered_after_first_connect_never_newest_anchors`). But
+    a delivered message does not wait for that: `_deliver` routes a chat's
+    first-ever checkpoint through `_ensure_anchor` too, so the greeting
+    still rides the delivery itself rather than being silently dropped
+    until some future reconnect -- always with an empty `uid`, pinned
+    below, never the newest existing message."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = object()  # the listen loop's live session, opaque to a mocked refresh
@@ -975,8 +975,13 @@ async def test_unknown_chat_frame_adoption_cases(
             adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
 
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    monkeypatch.setattr(adapter, "_ensure_anchor",
-                         mock.AsyncMock(side_effect=AssertionError("must not anchor at newest")))
+    real_ensure_anchor = adapter._ensure_anchor
+
+    async def spying_ensure_anchor(chat_uid: str, uid: str = "") -> None:
+        assert uid == "", "must not anchor at newest from this path"
+        await real_ensure_anchor(chat_uid, uid)
+
+    monkeypatch.setattr(adapter, "_ensure_anchor", spying_ensure_anchor)
     handled = _capture_events(monkeypatch, adapter)
     greetings: list[str] = []
 
@@ -1165,15 +1170,18 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     tmp_path: pathlib.Path,
 ) -> None:
     """The startup loop and a tool adoption can find the same brand-new chat at
-    once; _ensure_anchor's lock, re-checked inside, is what keeps the
-    disclosure wave to one send (and one checkpoint write)."""
+    once; `_ensure_anchor`'s lock, re-checked inside, is what keeps the
+    disclosure wave to one send (and one checkpoint write) -- one discoverer
+    reads the newest uid (as `_listen`'s first-install branch would) while
+    the other races straight to `_ensure_anchor` empty (as a concurrent
+    `start_group_thread` call would)."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a")])
 
     class _YieldingResp(_Resp):
         async def __aenter__(self) -> "_Resp":
-            # A reach rebuild lands mid-anchor, then control passes to the
+            # A reach rebuild lands mid-read, then control passes to the
             # racing discoverer -- the two interleavings the lock must absorb.
             adapter._set_reach([_chat("cht_a")])
             await asyncio.sleep(0)
@@ -1192,12 +1200,14 @@ async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     monkeypatch.setattr(adapter, "send", send)
     http = _HTTPStub()
 
-    async def discover() -> None:
-        await adapter._ensure_anchor(http, "cht_a")
+    async def discover_via_read() -> None:
+        async with http.get(f"{module.BASE}/v1/chats/cht_a/messages?limit=1", headers=adapter.auth) as resp:
+            page = (await resp.json(content_type=None)).get("data") or []
+        await adapter._ensure_anchor("cht_a", page[0]["uid"] if page else "")
 
-    await asyncio.gather(discover(), discover())
+    await asyncio.gather(discover_via_read(), adapter._ensure_anchor("cht_a"))
     assert sends == ["cht_a"], "concurrent discovery double-sent the disclosure wave"
-    assert adapter._load_checkpoint("cht_a") == "msg_1"
+    assert adapter._anchored_chats["cht_a"]
 
 
 async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targets(
@@ -1310,13 +1320,9 @@ async def test_anchor_failure_names_the_chat_checkpoint(monkeypatch: pytest.Monk
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
 
-    class _AnchorHTTP:
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            return _Resp({"data": []})
-
     monkeypatch.setattr(adapter, "_checkpoint", lambda uid, chat_uid: False)
     with pytest.raises(OSError) as error:
-        await adapter._anchor(_AnchorHTTP(), "cht_b")
+        await adapter._ensure_anchor("cht_b")
 
     assert str(error.value) == f"could not persist the initial baseline at {tmp_path / 'plow_chat_last_uid.cht_b'}"
 
