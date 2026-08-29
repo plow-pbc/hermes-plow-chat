@@ -459,11 +459,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # first-connect write; a failure fails the connect, loudly.
         if not is_reconnect:
             await self._persist_home()
-        # Published for the synchronous tool handler, which bridges its send
-        # onto this loop; cleared in disconnect so a tool call can never adopt
-        # a thread onto listeners that are being torn down.
-        global _live
-        _live = (self, asyncio.get_running_loop())
+        # _live is published inside `_listen`, not here -- see its comment
+        # for why publishing before that task has even run its first anchor
+        # pass let a tool call race it.
         self._ws_task = asyncio.create_task(self._listen())
         return True
 
@@ -792,6 +790,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] backfilled %d missed message(s)", len(missed))
 
     async def _listen(self):
+        global _live
         first_connection = True
         # Durable across restarts, unlike `first_connection`: `connect`
         # unconditionally refreshes reach before ever starting this loop
@@ -844,6 +843,18 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # the frames that connection is already buffering.
                     for chat_uid in self.chat_uids:
                         await self._ensure_anchor(chat_uid, http if newest_anchor else None)
+                    # Published only now, after every chat known at this
+                    # connect has been through the anchor decision above --
+                    # never in `connect`, where publishing let the
+                    # synchronous tool handler's bridged call reach
+                    # `_ensure_anchor` before this task had even run,
+                    # racing (and potentially winning) the newest-vs-empty
+                    # decision for a chat this pass was about to
+                    # newest-anchor. Republishing the same tuple on every
+                    # reconnect is harmless -- this task's own loop, same
+                    # adapter, same event loop for its whole life. Cleared
+                    # in `disconnect` and in the auth-terminal branch below.
+                    _live = (self, asyncio.get_running_loop())
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()
@@ -863,7 +874,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                 log.error("[plow_chat] credential refused (401) -- stopping the "
                           "listen loop; re-credential this agent")
                 self._mark_disconnected()
-                global _live
                 if _live is not None and _live[0] is self:
                     _live = None
                 return

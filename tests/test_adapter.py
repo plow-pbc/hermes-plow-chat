@@ -1510,8 +1510,10 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """The tool handler is synchronous and bridges onto the adapter's loop via
-    `_live`; a connect that never publishes it leaves the tool permanently
-    reporting a disconnected gateway."""
+    `_live`, published by `_listen` (after its first anchor pass in
+    production) rather than by `connect` itself; a listen task that never
+    publishes it leaves the tool permanently reporting a disconnected
+    gateway."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     _mark_anchored(adapter, "cht_a")
@@ -1521,12 +1523,14 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     )
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
-    async def listen_once() -> None: ...
+    async def listen_once() -> None:
+        # Stands in for a real first anchor pass completing.
+        module._live = (adapter, asyncio.get_running_loop())
 
     monkeypatch.setattr(adapter, "_listen", listen_once)
     await adapter.connect(is_reconnect=True)
-    assert module._live is not None and module._live[0] is adapter
     await adapter._ws_task
+    assert module._live is not None and module._live[0] is adapter
     # A retired adapter must not keep serving a chat: its replacement's
     # backfill replays what this one still held, and two servers on one
     # chat would hand off twice and race the checkpoint.
@@ -1536,6 +1540,61 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     assert module._live is None
     assert server.cancelled() or server.cancelling()
     assert not adapter._inbound
+
+
+async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_connected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The production ordering this round's fix protects: `connect` no
+    longer publishes `_live` itself, and a genuine first install's newest-
+    message read (inside `_ensure_anchor`, under its lock) can take real
+    network time. A tool call that fires in that window must find the
+    gateway not connected -- `_plow_start_group_message`'s existing
+    contract -- rather than being able to reach `_ensure_anchor` at all and
+    race the still-in-progress newest-vs-empty decision."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    entered, resumed = asyncio.Event(), asyncio.Event()
+
+    class _SlowResp(_Resp):
+        async def __aenter__(self) -> "_Resp":
+            entered.set()
+            await resumed.wait()
+            return self
+
+    class _SlowFirstAnchorHTTP:
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            if url.endswith("/v1/chats"):
+                return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
+            return _SlowResp({"data": [], "has_more": False})  # the newest-message read, held open
+
+        def post(self, url: str, **kw: Any) -> _Resp:
+            return _Resp({"ticket": "tkt"})
+
+        def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
+            return _WS()
+
+        async def __aenter__(self) -> "_SlowFirstAnchorHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SlowFirstAnchorHTTP())
+
+    await adapter.connect(is_reconnect=True)
+    await entered.wait()  # `_listen` is mid first-install anchor read, still pre-publish
+    assert module._live is None, "the tool must not see a live adapter before the first anchor pass finishes"
+
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False and "not connected" in out["error"]
+
+    resumed.set()
+    with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with pytest.raises(StopAsyncIteration):
+            await adapter._ws_task
+    assert module._live is not None and module._live[0] is adapter, \
+        "the gate must lift once the first anchor pass actually finishes"
 
 
 async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoption(
@@ -1636,7 +1695,7 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
             with pytest.raises(StopAsyncIteration):
                 await adapter._listen()
     else:
-        monkeypatch.setattr(module, "_live", (adapter, None))  # published, as connect() would have
+        monkeypatch.setattr(module, "_live", (adapter, None))  # published, as an earlier successful connect would have
         with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"
