@@ -7,3 +7,7 @@ install-report.json
 
 # knightwatch materializes declared review siblings here during a review.
 .siblings/
+
+# Local Superpowers planning artifacts are working notes, not shipped behavior.
+docs/superpowers/plans/
+docs/superpowers/specs/
