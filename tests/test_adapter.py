@@ -842,6 +842,75 @@ async def test_a_restart_with_an_already_granted_unanchored_chat_never_newest_an
     assert handled == ["msg_reply"], "the reply survives via backfill instead of being skipped past"
 
 
+class _FirstInstallPartialFailureHTTP:
+    """A genuine first install granting two chats. cht_b's newest-message
+    read fails (500) -- whichever chat the anchor loop reaches first, the
+    loop aborts there and `_listen` retries 5s later, by which time a
+    reply for cht_b is already the newest message server-side.
+    `cht_b_history_reads` counts every `limit=1` read ever attempted for
+    cht_b: it must land at exactly one, from the failed first attempt --
+    the retry must never make a second."""
+
+    def __init__(self) -> None:
+        self.cht_b_history_reads = 0
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+        if url.endswith("/v1/chats"):
+            return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_b")], "has_more": False})
+        chat_uid = url.split("/v1/chats/")[1].split("/")[0]
+        if "limit=1" in url:
+            if chat_uid == "cht_b":
+                self.cht_b_history_reads += 1
+                return _Resp({}, status=500)
+            return _Resp({"data": [], "has_more": False})
+        if chat_uid == "cht_b":
+            return _Resp({"data": [{"uid": "msg_reply"}], "has_more": False})
+        return _Resp({"data": [], "has_more": False})
+
+    def post(self, url: str, **kw: Any) -> _Resp:
+        return _Resp({"ticket": "tkt"})
+
+    def ws_connect(self, url: str, *, heartbeat: int) -> _WS:
+        return _WS()
+
+    async def __aenter__(self) -> "_FirstInstallPartialFailureHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+
+async def test_a_failed_first_install_anchor_retries_the_remaining_chats_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The last crash-timing window at the gate: on a genuine first install
+    `first_connection` used to stay true until the WHOLE anchor loop
+    succeeded, so a chat that raised partway through (here cht_b's newest-
+    message read) left the chats after it unreached -- and the retry 5s
+    later still read `first_connection` as true, newest-anchoring them
+    right as a real reply could have landed server-side in that window.
+    `newest_anchor` is now snapshotted and `first_connection` consumed
+    BEFORE the anchor loop runs at all, so a retry after ANY partial
+    failure -- not just a fresh restart -- always empty-anchors what is
+    still unanchored, same as `first_install` already does across restarts."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b")])  # connect's own refresh: a genuine first install
+    assert not adapter._anchored_chats[adapter.home_chat_uid], "fresh install: no prior checkpoint"
+    http = _FirstInstallPartialFailureHTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    handled: list[str] = []
+    monkeypatch.setattr(adapter, "_on_message", lambda m, _chat_uid: handled.append(m["uid"]))
+
+    with mock.patch.object(module.asyncio, "sleep", side_effect=[None, StopAsyncIteration]):
+        with pytest.raises(StopAsyncIteration):
+            await adapter._listen()
+
+    assert http.cht_b_history_reads == 1, "the retry must never re-attempt a newest-message read for cht_b"
+    assert adapter._load_checkpoint("cht_b") is None, "its baseline must be empty, not a newest-message uid"
+    assert handled == ["msg_reply"], "the reply survives via backfill instead of being skipped past"
+
+
 async def test_an_initial_marker_that_will_not_persist_does_not_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """In-memory anchor state follows the disk; it never leads it.
 

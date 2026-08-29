@@ -808,16 +808,27 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # a chat's newest existing message can be a turn hermes
                     # has not yet accepted, and newest-anchoring it would
                     # risk checkpointing that turn ahead of the handoff that
-                    # accepts it. A chat stranded unanchored by a failed
-                    # empty-anchor write is retried empty again on every
-                    # later pass through here -- never newest, no matter how
-                    # many attempts, or restarts, it takes.
+                    # accepts it.
+                    #
+                    # Snapshotted and `first_connection` consumed BEFORE the
+                    # loop below, not after: a genuine first install can
+                    # anchor several chats, and `_ensure_anchor`/`_anchor`
+                    # raise on a checkpoint-write failure partway through --
+                    # a real turn can then land server-side in the 5s before
+                    # `_listen` retries. Reading `first_connection` again on
+                    # that retry would still see it true and newest-anchor
+                    # the chats this attempt never reached, checkpointing
+                    # that turn ahead of ever handling it. Consuming it here
+                    # instead means a retry -- like every other case where a
+                    # chat is stranded unanchored by a failed write -- always
+                    # empty-anchors, no matter how many attempts it takes.
+                    newest_anchor = first_connection and first_install
+                    first_connection = False
                     for chat_uid in self.chat_uids:
-                        if first_connection and first_install:
+                        if newest_anchor:
                             await self._ensure_anchor(http, chat_uid)
                         else:
                             await self._ensure_empty_anchor(chat_uid)
-                    first_connection = False
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()
