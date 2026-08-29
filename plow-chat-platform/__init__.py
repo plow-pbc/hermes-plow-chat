@@ -43,8 +43,8 @@ CHECKPOINT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes") / 
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
 
-_deferred_questions = None
-_plugin_llm = None
+_deferred_questions: object
+_plugin_llm: object
 
 
 def _resolve_chat_names(chats, home_uid):
@@ -667,17 +667,15 @@ class PlowChatAdapter(BasePlatformAdapter):
                     return SendResult(success=True)
             return await self._post_message(http, chat_id, {"body": body})
 
-    async def notify_owner_about_invite(self, kind, turn):
-        """Send one fixed invite-workflow notice to the configured home.
+    async def notify_owner_about_invite(self, turn):
+        """Send the fixed invite-created notice to the configured home.
 
-        This is deliberately not a generic send exception. The caller chooses
-        only the notice kind; its destination and content come from the active
-        inbound event, so a member turn cannot address another chat or supply
-        an arbitrary owner message.
+        This is deliberately not a generic send exception. Its destination and
+        content come from the active inbound event, so a
+        member turn cannot address another chat or supply an arbitrary owner
+        message.
         """
         chat_uid = turn["chat_uid"]
-        if kind != "invite_created":
-            raise ValueError("consent requests must use the deferred-question workflow")
         body = f"Invite created for someone in Plow chat {chat_uid}."
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, self.home_chat_uid, {"body": body})
@@ -693,8 +691,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                 return await resp.json(content_type=None)
 
     async def enqueue_invite_consent(self, turn):
-        if _deferred_questions is None:
-            raise RuntimeError("deferred questions are unavailable")
         required = ("participant_uid", "participant_identity", "triggered_at")
         if any(not turn.get(field) for field in required):
             raise RuntimeError("the active turn has no server participant identity")
@@ -710,6 +706,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             return {"skipped": "participant_is_existing_user"}
 
         home = await self.get_chat_info(self.home_chat_uid)
+        if home["type"] != "dm":
+            raise RuntimeError("invite consent requires a direct-message home")
         source = self.build_source(
             chat_id=self.home_chat_uid,
             chat_name=home["name"],
@@ -751,11 +749,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             raise RuntimeError("agent invite consent response has an invalid shape")
 
     async def resume_invite(self, context):
-        triggered_at = datetime.fromisoformat(str(context["triggered_at"]))
-        if triggered_at.tzinfo is None:
-            triggered_at = triggered_at.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - triggered_at.astimezone(timezone.utc)
-        if age.total_seconds() < 0 or age.total_seconds() >= 24 * 60 * 60:
+        triggered_at = datetime.fromisoformat(context["triggered_at"])
+        age = datetime.now(timezone.utc) - triggered_at
+        if age.total_seconds() >= 24 * 60 * 60:
             return False
 
         chat_uid = context["source_chat_uid"]
@@ -1563,8 +1559,6 @@ _INVITE_DECISION_SCHEMA = {
 
 
 async def _handle_invite_consent(question, response):
-    if _plugin_llm is None:
-        raise RuntimeError("plugin LLM is unavailable")
     result = await _plugin_llm.acomplete_structured(
         instructions=(
             "Classify whether the owner grants standing permission, declines it, "
@@ -1573,7 +1567,7 @@ async def _handle_invite_consent(question, response):
         ),
         input=[{
             "type": "text",
-            "text": f"Question: {question.question}\nOwner answer: {response}",
+            "text": f"Owner answer: {response}",
         }],
         json_schema=_INVITE_DECISION_SCHEMA,
         schema_name="invite_consent_decision",
@@ -1633,7 +1627,7 @@ def _plow_notify_owner_about_invite(args, **_kwargs):
         operation = (
             adapter.enqueue_invite_consent(turn)
             if kind == "consent_request"
-            else adapter.notify_owner_about_invite(kind, turn)
+            else adapter.notify_owner_about_invite(turn)
         )
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success

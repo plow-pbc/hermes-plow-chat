@@ -21,7 +21,12 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> Land the `agent-mgr` side first, then bump the pin.
+> This plugin also requires a Hermes host that exposes
+> `ctx.deferred_questions` and a Plow API that serves the agent-invite consent
+> and participant-eligibility routes. Deploy those two dependencies first,
+> then land the `agent-mgr` support above, and only then bump
+> `runtime/plow-chat-plugin.ref`. Installing this plugin before either API is
+> available fails loudly instead of silently skipping consent.
 
 ## Who consumes this
 
