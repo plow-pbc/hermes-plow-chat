@@ -528,9 +528,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._active_turn.set({
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
-            "user_name": event.source.user_name,
-            "chat_name": event.source.chat_name,
-            "text": event.text,
         })
 
     async def on_processing_complete(self, event, outcome):
@@ -565,22 +562,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         inbound event, so a member turn cannot address another chat or supply
         an arbitrary owner message.
         """
-        if self.home_chat_uid not in self.chat_uids:
-            return SendResult(success=False, error="the configured home is outside this agent's grant")
-        praise = " ".join(str(turn["text"]).split())
-        if len(praise) > 240:
-            praise = praise[:239] + "…"
-        who = " ".join(str(turn["user_name"]).split()) or "A chat member"
-        where = " ".join(str(turn["chat_name"]).split()) or turn["chat_uid"]
+        chat_uid = turn["chat_uid"]
         if kind == "consent_request":
             body = (
-                f"{who} in {where} said “{praise}”\n\n"
-                "Should I offer Plow invites when someone genuinely loves it? "
+                f"Someone in Plow chat {chat_uid} genuinely loved Plow.\n\n"
+                "Should I offer Plow invites when that happens? "
                 "I’d reply only in the thread where it happened, at most 3 times a day. "
                 "Reply yes or no."
             )
         else:
-            body = f"Invite created for {who} in {where} after they said “{praise}”"
+            body = f"Invite created for someone in Plow chat {chat_uid}."
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, self.home_chat_uid, {"body": body})
 
