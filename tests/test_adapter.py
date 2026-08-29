@@ -1348,12 +1348,17 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     async def reply_from_member_turn(event: Any) -> None:
         await adapter.on_processing_start(event)
         try:
+            assert adapter._active_turn.get() == {
+                "chat_uid": event.source.chat_id,
+                "owner": False,
+            }
             if event.message_id == "msg_no_reply":
                 return
             results["reply"] = await adapter.send(event.source.chat_id, "reply in B")
             results["cross_chat"] = await adapter.send("cht_a", "must not leave B")
         finally:
             await adapter.on_processing_complete(event, None)
+            assert adapter._active_turn.get() is None
 
     monkeypatch.setattr(adapter, "handle_message", reply_from_member_turn)
     await adapter._on_frame(_envelope("evt_b", "cht_b", "msg_b", role="member"))
@@ -1491,11 +1496,18 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     module = _load(monkeypatch, tmp_path)
     ctx = _ToolContext()
     module.register(ctx)
-    assert [t["name"] for t in ctx.tools] == ["plow_start_group_message"]
+    assert [t["name"] for t in ctx.tools] == [
+        "plow_start_group_message",
+        "plow_set_conversation_trusted",
+    ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
+
+    trust_tool = ctx.tools[1]
+    assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
+    assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
 
 def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, raises=None, record=None):
@@ -1520,6 +1532,133 @@ def _live_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, result=None, rai
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
     return adapter
+
+
+def _live_trust_tool(module: Any, monkeypatch: pytest.MonkeyPatch, *, raises=None, record=None):
+    import threading
+
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def stub(chat_uid: str, trusted: bool) -> dict[str, Any]:
+        if record is not None:
+            record.append((chat_uid, trusted))
+        if raises is not None:
+            raise raises
+        return {"trusted": trusted}
+
+    adapter.set_conversation_trusted = stub
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr(module, "_live", (adapter, loop))
+    return adapter
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_owner_can_set_current_conversation_trust(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    trusted: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls: list[tuple[str, bool]] = []
+    _live_trust_tool(module, monkeypatch, record=calls)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": trusted, "confirm": True}))
+
+    assert out == {"success": True, "chat_id": "cht_a", "trusted": trusted}
+    assert calls == [("cht_a", trusted)]
+
+
+@pytest.mark.parametrize(
+    ("turn", "confirm", "error"),
+    [
+        pytest.param(None, True, "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": False}, True, "owner", id="member-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, False, "confirm", id="unconfirmed"),
+    ],
+)
+def test_trust_tool_refuses_without_explicit_owner_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None,
+    confirm: bool,
+    error: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_trust_tool(module, monkeypatch, raises=AssertionError("must not write"))
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": confirm}))
+
+    assert out["success"] is False
+    assert error.lower() in out["error"].lower()
+
+
+def test_trust_tool_surfaces_api_error_without_claiming_a_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_trust_tool(module, monkeypatch, raises=RuntimeError("HTTP 503"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": True}))
+
+    assert out["success"] is False
+    assert "not confirm" in out["error"]
+
+
+async def test_trust_write_updates_cache_only_after_canonical_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+    puts: list[tuple[str, dict[str, Any]]] = []
+
+    class _TrustHTTP:
+        async def __aenter__(self) -> "_TrustHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+        def put(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            puts.append((url, json))
+            return _Resp({"trusted": True})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _TrustHTTP())
+
+    result = await adapter.set_conversation_trusted("cht_a", True)
+
+    assert result == {"trusted": True}
+    assert puts == [(f"{module.BASE}/v1/chats/cht_a/trusted", {"trusted": True})]
+    assert adapter._chats["cht_a"]["trusted"] is True
+
+
+async def test_failed_trust_write_preserves_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
+
+    class _FailedTrustHTTP:
+        async def __aenter__(self) -> "_FailedTrustHTTP":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> None: ...
+
+        def put(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            return _Resp({}, status=503)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _FailedTrustHTTP())
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        await adapter.set_conversation_trusted("cht_a", True)
+    assert adapter._chats["cht_a"]["trusted"] is False
 
 
 def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

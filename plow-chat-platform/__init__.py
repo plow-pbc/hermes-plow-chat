@@ -176,6 +176,7 @@ def _message_type(media_types):
 
 
 _MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
+_ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "send tool and will be refused on an external turn."
@@ -342,6 +343,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
         self._member_turn_chat = _MEMBER_TURN_CHAT
+        self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -528,10 +530,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._member_turn_chat.set(
             chat_uid if not event.source.role_authorized else None
         )
+        self._active_turn.set({
+            "chat_uid": chat_uid,
+            "owner": bool(event.source.role_authorized),
+        })
 
     async def on_processing_complete(self, event, outcome):
         self._cancel_typing(event.source.chat_id)
         self._member_turn_chat.set(None)
+        self._active_turn.set(None)
 
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within
@@ -552,6 +559,21 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, chat_id, {"body": content.strip()})
+
+    async def set_conversation_trusted(self, chat_uid, trusted):
+        """Write trust through Plow and update cache only from its response."""
+        if chat_uid not in self.chat_uids:
+            raise RuntimeError(f"Plow Chat {chat_uid!r} is outside this agent's grant")
+        async with aiohttp.ClientSession() as http:
+            async with http.put(f"{BASE}/v1/chats/{chat_uid}/trusted",
+                                json={"trusted": trusted}, headers=self.auth) as resp:
+                _auth_raise_for_status(resp)
+                body = await resp.json(content_type=None)
+        if not isinstance(body, dict) or not isinstance(body.get("trusted"), bool):
+            raise RuntimeError("trusted conversation response has an invalid shape")
+        self._chats[chat_uid] = {**self._chats[chat_uid],
+                                 "trusted": body["trusted"]}
+        return {"trusted": body["trusted"]}
 
     async def send_or_update_status(self, chat_id, status_key, content, metadata=None):
         """Absorb the gateway's agent status frames instead of texting them.
@@ -1090,6 +1112,18 @@ def _flag(value, *, default, safe):
     return safe
 
 
+def _required_boolean(value):
+    """Parse a required model-emitted boolean without choosing a fallback."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower() if value is not None else ""
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _normalize_thread_handle(recipients):
     """Build the Plow/Linq recipient handle.
 
@@ -1237,6 +1271,67 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
 }
 
 
+def _plow_set_conversation_trusted(args, **_kwargs):
+    """Set trust for the active conversation on an explicit owner request."""
+    trusted = _required_boolean(args.get("trusted"))
+    if trusted is None:
+        return json.dumps({"success": False,
+                           "error": "trusted must be an explicit boolean; nothing changed"})
+    if not _flag(args.get("confirm"), default=False, safe=False):
+        return json.dumps({"success": False,
+                           "error": "confirm=true is required; nothing changed"})
+    turn = _ACTIVE_TURN.get()
+    if turn is None:
+        return json.dumps({"success": False,
+                           "error": "this tool requires an active Plow Chat turn; nothing changed"})
+    if not turn["owner"]:
+        return json.dumps({"success": False,
+                           "error": "only the agent owner can change conversation trust; nothing changed"})
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing changed"})
+    adapter, loop = _live
+    try:
+        saved = asyncio.run_coroutine_threadsafe(
+            adapter.set_conversation_trusted(turn["chat_uid"], trusted), loop
+        ).result(timeout=20)
+    except Exception as exc:  # noqa: BLE001 - report no unconfirmed state as success
+        return json.dumps({
+            "success": False,
+            "error": f"could not confirm the trust change ({type(exc).__name__}); "
+                     "check the dashboard or repeat the same value",
+        })
+    return json.dumps({"success": True, "chat_id": turn["chat_uid"],
+                       "trusted": saved["trusted"]})
+
+
+PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
+    "name": "plow_set_conversation_trusted",
+    "description": (
+        "Enable or disable trusted status for the current Plow group conversation "
+        "after the owner explicitly asks. In a trusted conversation every participant "
+        "may ask the assistant to use connected accounts and requested results can be "
+        "shown in-thread. Requires confirm=true and only works during an owner-authored turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "trusted": {
+                "type": "boolean",
+                "description": "The exact trusted state to store.",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true after the owner explicitly requests the change.",
+                "default": False,
+            },
+        },
+        "required": ["trusted", "confirm"],
+        "additionalProperties": False,
+    },
+}
+
+
 def check_requirements():
     return bool(os.environ.get("PLOW_HOME_CHANNEL")
                 and os.environ.get("PLOW_AGENT_TOKEN"))
@@ -1261,6 +1356,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
         handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_set_conversation_trusted",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_SET_CONVERSATION_TRUSTED_SCHEMA,
+        handler=_plow_set_conversation_trusted,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )
