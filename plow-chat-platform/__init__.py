@@ -21,6 +21,7 @@ from gateway.platforms.base import (
 )
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
+BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 PLATFORM_NAME = "plow_chat"
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
@@ -552,7 +553,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
-            return await self._post_message(http, chat_id, {"body": content.strip()})
+            body = content.strip()
+            if body.startswith(BACKGROUND_REVIEW_PREFIX):
+                async with http.get(
+                    f"{BASE}/v1/api-keys/current/preferences", headers=self.auth
+                ) as resp:
+                    _auth_raise_for_status(resp)
+                    preference = await resp.json(content_type=None)
+                enabled = preference.get("memory_notifications_enabled")
+                if not isinstance(enabled, bool):
+                    raise RuntimeError("session preferences response has an invalid shape")
+                if not enabled:
+                    log.info("[plow_chat] dropped background review notification for %s", chat_id)
+                    return SendResult(success=True)
+            return await self._post_message(http, chat_id, {"body": body})
 
     async def set_conversation_trusted(self, chat_uid, trusted):
         """Write trust through Plow and update cache only from its response."""
@@ -582,8 +596,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         and reported as success so the gateway treats the frame as handled.
         PLOW_STATUS_MESSAGES=deliver opts a deployment (one agent, one owner)
         into receiving them as messages. The 💾 background-review summary
-        takes the gateway's plain send() path, not this hook; silence that
-        with display.memory_notifications in the hermes config.
+        takes the gateway's plain send() path, where send() applies its
+        credential preference.
         """
         if os.environ.get("PLOW_STATUS_MESSAGES", "").strip().lower() == "deliver":
             refused = self._send_guard(chat_id)

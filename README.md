@@ -55,7 +55,7 @@ URL in git.
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
 | `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
-| `PLOW_STATUS_MESSAGES` | no | `deliver` texts the gateway's agent status frames (compaction notices, retry chatter) into the chat; unset/anything else drops them — the typing indicator already shows the turn is running. The 💾 background-review summary is separate: silence it with `display.memory_notifications: off` in the hermes config |
+| `PLOW_STATUS_MESSAGES` | no | `deliver` texts the gateway's agent status frames (compaction notices, retry chatter) into the chat; unset/anything else drops them — the typing indicator already shows the turn is running. |
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
@@ -64,6 +64,12 @@ grant (`sessions.chat_uids`, served by `GET /v1/chats`) decides, refreshed on
 every reconnect. Per-chat checkpoints persist under the agent home, and a
 reconnect backfills each granted chat from its checkpoint, so a socket gap
 drops nothing.
+
+The dashboard's per-assistant memory-review switch is another credential
+preference. Ordinary replies take the direct send path; only Hermes's named
+`💾 Self-improvement review:` notification reads
+`GET /v1/api-keys/current/preferences` before delivery. Disabled notifications
+are acknowledged without entering the chat.
 
 One person's rapid-fire messages are one turn: inbound is buffered per chat
 for a 2s window that resets on each arrival — iMessage's bubble + link-preview
