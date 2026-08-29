@@ -208,6 +208,25 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
+class _ChatResourceHTTP:
+    def __init__(self, response: _Resp) -> None:
+        self.response = response
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def __aenter__(self) -> "_ChatResourceHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+    def get(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("get", url, kwargs))
+        return self.response
+
+    def put(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("put", url, kwargs))
+        return self.response
+
+
 def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
     """Simulate these chats having already been anchored -- by `_listen`'s
     pre-connect loop, the real precondition before any frame reaches
@@ -645,11 +664,11 @@ def test_guest_turn_does_not_register_a_tool_block(
 
     module.register(_Context())
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    turn = adapter._member_turn_chat.set("cht_b")
+    turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
         assert "pre_tool_call" not in hooks
     finally:
-        adapter._member_turn_chat.reset(turn)
+        adapter._active_turn.reset(turn)
 
 
 @pytest.mark.parametrize(
@@ -1126,19 +1145,8 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
     _mark_anchored(adapter, "cht_a")
     refreshed = _chat("cht_a", group=True, trusted=True)
-    gets: list[str] = []
-
-    class _CurrentChatHTTP:
-        async def __aenter__(self) -> "_CurrentChatHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            gets.append(url)
-            return _Resp(refreshed)
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _CurrentChatHTTP())
+    http = _ChatResourceHTTP(_Resp(refreshed))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
     handled = _capture_events(monkeypatch, adapter)
 
@@ -1148,7 +1156,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
         "cht_a",
     )
 
-    assert gets == [f"{module.BASE}/v1/chats/cht_a"]
+    assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
     assert handled[0]["channel_prompt"] == module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT
 
@@ -1162,16 +1170,8 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
     adapter._set_reach([_chat("cht_a", group=True, trusted=True)])
     _mark_anchored(adapter, "cht_a")
 
-    class _FailedHTTP:
-        async def __aenter__(self) -> "_FailedHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            return _Resp({}, status=503)
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _FailedHTTP())
+    http = _ChatResourceHTTP(_Resp({}, status=503))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     adapter._refresh_current_chat = types.MethodType(module._real_refresh_current_chat, adapter)
     handled = _capture_events(monkeypatch, adapter)
 
@@ -1616,24 +1616,15 @@ async def test_trust_write_updates_cache_only_after_canonical_success(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
-    puts: list[tuple[str, dict[str, Any]]] = []
-
-    class _TrustHTTP:
-        async def __aenter__(self) -> "_TrustHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-        def put(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
-            puts.append((url, json))
-            return _Resp({"trusted": True})
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _TrustHTTP())
+    http = _ChatResourceHTTP(_Resp({"trusted": True}))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     result = await adapter.set_conversation_trusted("cht_a", True)
 
     assert result == {"trusted": True}
-    assert puts == [(f"{module.BASE}/v1/chats/cht_a/trusted", {"trusted": True})]
+    assert http.calls == [("put", f"{module.BASE}/v1/chats/cht_a/trusted", {
+        "json": {"trusted": True}, "headers": adapter.auth,
+    })]
     assert adapter._chats["cht_a"]["trusted"] is True
 
 
@@ -1645,18 +1636,28 @@ async def test_failed_trust_write_preserves_cache(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True, trusted=False)])
 
-    class _FailedTrustHTTP:
-        async def __aenter__(self) -> "_FailedTrustHTTP":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None: ...
-
-        def put(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
-            return _Resp({}, status=503)
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _FailedTrustHTTP())
+    http = _ChatResourceHTTP(_Resp({}, status=503))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     with pytest.raises(RuntimeError, match="HTTP 503"):
+        await adapter.set_conversation_trusted("cht_a", True)
+    assert adapter._chats["cht_a"]["trusted"] is False
+
+
+async def test_direct_chat_trust_write_is_refused_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=False, trusted=False)])
+    monkeypatch.setattr(
+        module.aiohttp,
+        "ClientSession",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not issue PUT")),
+    )
+
+    with pytest.raises(RuntimeError, match="group conversation"):
         await adapter.set_conversation_trusted("cht_a", True)
     assert adapter._chats["cht_a"]["trusted"] is False
 

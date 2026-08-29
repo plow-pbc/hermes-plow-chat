@@ -175,7 +175,6 @@ def _message_type(media_types):
     return MessageType.DOCUMENT if media_types else MessageType.TEXT
 
 
-_MEMBER_TURN_CHAT = contextvars.ContextVar("plow_chat_member_turn", default=None)
 _ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
@@ -342,7 +341,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
-        self._member_turn_chat = _MEMBER_TURN_CHAT
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -527,9 +525,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat_uid = event.source.chat_id
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
-        self._member_turn_chat.set(
-            chat_uid if not event.source.role_authorized else None
-        )
         self._active_turn.set({
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
@@ -537,7 +532,6 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome):
         self._cancel_typing(event.source.chat_id)
-        self._member_turn_chat.set(None)
         self._active_turn.set(None)
 
     def _send_guard(self, chat_id):
@@ -545,9 +539,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         the member turn's chat while one is open. None means go."""
         if chat_id not in self.chat_uids:
             return SendResult(success=False, error=f"Plow Chat {chat_id!r} is outside this agent's grant")
-        member_turn_chat = self._member_turn_chat.get()
-        if member_turn_chat is not None and chat_id != member_turn_chat:
-            return SendResult(success=False, error=f"Plow Chat member turn is confined to {member_turn_chat!r}")
+        turn = self._active_turn.get()
+        if turn is not None and not turn["owner"] and chat_id != turn["chat_uid"]:
+            return SendResult(success=False, error=f"Plow Chat member turn is confined to {turn['chat_uid']!r}")
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -564,6 +558,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         """Write trust through Plow and update cache only from its response."""
         if chat_uid not in self.chat_uids:
             raise RuntimeError(f"Plow Chat {chat_uid!r} is outside this agent's grant")
+        if (await self.get_chat_info(chat_uid))["type"] == "dm":
+            raise RuntimeError("trust applies only to a group conversation")
         async with aiohttp.ClientSession() as http:
             async with http.put(f"{BASE}/v1/chats/{chat_uid}/trusted",
                                 json={"trusted": trusted}, headers=self.auth) as resp:
@@ -1112,18 +1108,6 @@ def _flag(value, *, default, safe):
     return safe
 
 
-def _required_boolean(value):
-    """Parse a required model-emitted boolean without choosing a fallback."""
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower() if value is not None else ""
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return None
-
-
 def _normalize_thread_handle(recipients):
     """Build the Plow/Linq recipient handle.
 
@@ -1273,7 +1257,9 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
 
 def _plow_set_conversation_trusted(args, **_kwargs):
     """Set trust for the active conversation on an explicit owner request."""
-    trusted = _required_boolean(args.get("trusted"))
+    value = args.get("trusted")
+    trusted = (None if value is None or str(value).strip() == ""
+               else _flag(value, default=None, safe=None))
     if trusted is None:
         return json.dumps({"success": False,
                            "error": "trusted must be an explicit boolean; nothing changed"})
