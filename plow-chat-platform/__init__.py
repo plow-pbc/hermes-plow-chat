@@ -459,11 +459,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # first-connect write; a failure fails the connect, loudly.
         if not is_reconnect:
             await self._persist_home()
-        # Published for the synchronous tool handler, which bridges its send
-        # onto this loop; cleared in disconnect so a tool call can never adopt
-        # a thread onto listeners that are being torn down.
-        global _live
-        _live = (self, asyncio.get_running_loop())
+        # _live is published inside `_listen`, not here -- see its comment
+        # for why publishing before that task has even run its first anchor
+        # pass let a tool call race it.
         self._ws_task = asyncio.create_task(self._listen())
         return True
 
@@ -636,16 +634,16 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data["adoption"] = "not-on-this-agents-line"
                 return data
             data["adoption"] = "adopted"
-            # Baseline the adopted chat NOW, through the same read _anchor
-            # always uses. The send response cannot supply the baseline: its
-            # message_id is the provider id, not the chat-API `msg_` uid the
-            # backfill cursor compares, so checkpointing it would never match a
-            # page. Anchoring here makes our own just-sent message the baseline
-            # in all but a heartbeat-sized race; deferring to the reconnect
-            # would baseline the NEWEST message instead — silently skipping any
-            # reply that arrived in between, the exact drop this prevents.
+            # The one deliberate exception to "only `_listen`'s per-connect
+            # loop calls this": that loop would eventually anchor this chat
+            # too, empty, on whatever reconnect comes next, but this call
+            # needs to know NOW, synchronously, whether the baseline
+            # actually landed -- `data["adoption"]` is this tool's honest
+            # answer to the caller. No `http` passed -- see `_ensure_anchor`
+            # for why empty, never the newest existing message, is always
+            # the right call here.
             try:
-                await self._ensure_anchor(http, chat_id)
+                await self._ensure_anchor(chat_id)
             except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
                 data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
@@ -678,59 +676,73 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "agent_name": _agent_name(chat)}
 
-    async def _ensure_anchor(self, http, chat_uid):
-        """Anchor once, no matter who asks or how concurrently.
+    async def _ensure_anchor(self, chat_uid, http=None):
+        """Baseline a chat once, no matter who asks or how concurrently.
 
-        The startup loop and a tool adoption can discover the same chat at the
-        same time; unserialized, the loser sees a half-done anchor as done and
-        starts a cursorless backfill (replaying history as new turns), or
-        double-sends the disclosure wave. One lock, re-checked inside, is the
-        whole mechanism -- anchoring is rare, so contention is nil.
+        `http` is given only by `_listen`'s first-install branch, for a
+        chat known at this process's true first-ever connect -- the one
+        deliberate, one-time skip of pre-existing history this mechanism
+        exists to gate. The newest-message read happens HERE, under the
+        lock and after the already-anchored check, never before taking it:
+        reading it first and passing the uid in left a window where a
+        concurrent empty anchor for the same chat_uid (a `start_group_thread`
+        call, or `_deliver` for a message that lands mid-read) could win the
+        lock first, leaving this call's own read to resolve into a
+        skipped, already-anchored no-op -- stranding the chat empty-anchored
+        instead of at newest, and `_backfill` would then replay its entire
+        pre-existing history to hermes as new turns. Every other caller --
+        `_listen` on any later connect, `start_group_thread` right after
+        its own send, `_deliver` for a chat it discovers is still
+        unanchored -- passes no `http`, empty: that chat's newest existing
+        message can be a turn hermes has not yet accepted (a reply that
+        beat the call, or one still sitting in an in-memory delivery
+        queue), and checkpointing it would risk marking it handled ahead of
+        the handoff that actually accepts it. `_backfill`'s
+        pages-to-exhaustion branch recovers an empty baseline instead; the
+        ack-after-handoff checkpoint `_deliver` writes becomes the first
+        durable one.
+
+        A write failure raises: `_listen` and `_deliver` both retry (the
+        reconnect loop, `_serve_chat`'s hand-off retry) and always pass no
+        `http` on the next attempt regardless of what this one tried, so a
+        chat stranded unanchored is retried empty, never newest, no matter
+        how many attempts it takes; `start_group_thread` reports it
+        honestly in `adoption` instead of retrying.
+
+        One lock, held for the whole check-read-write-greet sequence, is
+        the whole concurrency story: `_listen`'s first-connect sweep and a
+        `start_group_thread` call can race to discover the same brand-new
+        chat_uid, and whichever wins the lock completes atomically before
+        the other so much as reads `_anchored_chats` -- anchoring is rare,
+        so contention is nil.
         """
         async with self._anchor_lock:
-            if not self._anchored_chats.get(chat_uid):
-                await self._anchor(http, chat_uid)
+            if self._anchored_chats.get(chat_uid):
+                return
+            first_meeting = not self._checkpoint_path(chat_uid).exists()
+            uid = ""
+            if http is not None:
+                async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
+                                    headers=self.auth) as resp:
+                    _auth_raise_for_status(resp)
+                    page = (await resp.json(content_type=None)).get("data") or []
+                uid = page[0]["uid"] if page else ""
+            if not self._checkpoint(uid, chat_uid):
+                raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
+            await self._greet_first_meeting(chat_uid, first_meeting)
 
-    async def _anchor(self, http, chat_uid):
-        """Persist the newest existing uid as this agent's starting baseline.
-
-        **Before the socket, never inside it.** Anchoring after `ws_connect`
-        races the frames that connection is already buffering: a message
-        committed after connect can be swept into the baseline and then lose
-        its frame before iteration reaches it, and the next reconnect stops
-        paging at a uid it never handled - silently dropping the customer's
-        FIRST turn, which is the one failure this baseline exists to prevent.
-        Read before connecting and nothing the socket carries can be inside it.
-
-        Failures raise. They reach `_listen`, which is the component that owns
-        what to do about a broken API - retry in five seconds - and an agent
-        that starts with no recoverable baseline is exactly the state the
-        checkpoint exists to rule out.
-        """
-        first_meeting = not self._checkpoint_path(chat_uid).exists()
-        async with http.get(f"{BASE}/v1/chats/{chat_uid}/messages?limit=1",
-                            headers=self.auth) as resp:
-            _auth_raise_for_status(resp)
-            page = (await resp.json(content_type=None)).get("data") or []
-        # An empty chat still records that it anchored, with an empty cursor:
-        # nothing is behind us, and the marker is what stops a restart from
-        # anchoring a second time over messages that arrived in between.
-        #
-        # A marker that did not persist is a hard failure, not a warning: this
-        # agent would connect believing itself anchored and the next process
-        # would re-anchor over everything since. Raise into `_listen`, which
-        # already owns retrying.
-        if not self._checkpoint(page[0]["uid"] if page else "", chat_uid):
-            raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
-        # The 👋 is a first-meeting disclosure, sent once ever: the checkpoint
-        # file is the durable record of having met this chat, so it rides the
-        # anchor that creates it -- an in-memory latch re-greeted every granted
-        # chat on every gateway restart, a wave of noise into real rooms.
-        if first_meeting:
-            try:
-                await self.send(chat_uid, "👋")
-            except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
-                log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
+    async def _greet_first_meeting(self, chat_uid, first_meeting):
+        """The 👋 first-meeting disclosure, sent once ever: the checkpoint
+        file is the durable record of having met this chat, so it rides
+        whichever baseline write creates it -- an in-memory latch re-greeted
+        every granted chat on every gateway restart, a wave of noise into
+        real rooms."""
+        if not first_meeting:
+            return
+        try:
+            await self.send(chat_uid, "👋")
+        except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
+            log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
     async def _backfill(self, http, chat_uid):
         """Process what arrived while the socket was down.
@@ -778,13 +790,25 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] backfilled %d missed message(s)", len(missed))
 
     async def _listen(self):
+        global _live
         first_connection = True
+        # Durable across restarts, unlike `first_connection`: `connect`
+        # unconditionally refreshes reach before ever starting this loop
+        # (`__init__`'s own checkpoint read stands in for a raw `_listen`
+        # call with no `connect`), so `_anchored_chats` already reflects,
+        # by the time this runs, every chat currently granted -- including
+        # one this agent discovered in a PRIOR life and never finished
+        # anchoring. `first_connection` alone cannot tell that case apart
+        # from a genuine first-ever install: it is always true for a fresh
+        # process regardless of which life this is. The home checkpoint
+        # already existing on disk is what actually means "not the first
+        # life" -- read once, here, before anything below can change it.
+        first_install = not self._anchored_chats.get(self.home_chat_uid)
         while True:
             try:
                 async with aiohttp.ClientSession() as http:
                     if not first_connection:
                         await self._refresh_reach(http)
-                    first_connection = False
                     # Mint immediately before connecting: the ticket lives 60s
                     # and is single-use, and revocation is re-checked at
                     # consume, so a cached one is a 4401 close.
@@ -793,11 +817,44 @@ class PlowChatAdapter(BasePlatformAdapter):
                                          headers=self.auth) as resp:
                         _auth_raise_for_status(resp)
                         ticket = (await resp.json(content_type=None))["ticket"]
-                    # The first connection of this agent's life takes its
-                    # baseline here, while nothing is arriving. After this the
-                    # checkpoint only ever advances through a handled turn.
+                    # ONE gate decides newest vs empty for every chat this
+                    # agent ever anchors: `first_connection and first_install`
+                    # -- this process's first connect, AND this agent's
+                    # genuine first-ever life. Snapshotted and
+                    # `first_connection` consumed BEFORE the loop below, not
+                    # after: a genuine first install can anchor several
+                    # chats, and `_ensure_anchor` raises on a checkpoint-write
+                    # failure partway through -- a real turn can then land
+                    # server-side in the 5s before `_listen` retries. Reading
+                    # `first_connection` again on that retry would still see
+                    # it true and newest-anchor the chats this attempt never
+                    # reached. Consumed here, a retry always anchors empty
+                    # instead, same as every other case (see `_ensure_anchor`
+                    # for why empty is always the safe default).
+                    newest_anchor = first_connection and first_install
+                    first_connection = False
+                    # `http` only when newest_anchor: `_ensure_anchor` reads
+                    # the newest uid itself, under its own lock, so a
+                    # concurrent empty anchor for the same chat_uid (a
+                    # `start_group_thread` call racing this very first
+                    # connect) can never land between a read taken here and
+                    # a write made there. Before the socket either way,
+                    # never inside it -- reading after `ws_connect` races
+                    # the frames that connection is already buffering.
                     for chat_uid in self.chat_uids:
-                        await self._ensure_anchor(http, chat_uid)
+                        await self._ensure_anchor(chat_uid, http if newest_anchor else None)
+                    # Published only now, after every chat known at this
+                    # connect has been through the anchor decision above --
+                    # never in `connect`, where publishing let the
+                    # synchronous tool handler's bridged call reach
+                    # `_ensure_anchor` before this task had even run,
+                    # racing (and potentially winning) the newest-vs-empty
+                    # decision for a chat this pass was about to
+                    # newest-anchor. Republishing the same tuple on every
+                    # reconnect is harmless -- this task's own loop, same
+                    # adapter, same event loop for its whole life. Cleared
+                    # in `disconnect` and in the auth-terminal branch below.
+                    _live = (self, asyncio.get_running_loop())
                     url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
                     async with http.ws_connect(url, heartbeat=30) as ws:
                         self._mark_connected()
@@ -806,7 +863,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                             await self._backfill(http, chat_uid)
                         async for frame in ws:
                             if frame.type == aiohttp.WSMsgType.TEXT:
-                                await self._on_frame(frame.json())
+                                await self._on_frame(frame.json(), http)
             except _PlowAuthError:
                 # Revocation is terminal: every retry presents the same dead
                 # credential. Observed on the str agent 2026-08-27 -- one
@@ -817,7 +874,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                 log.error("[plow_chat] credential refused (401) -- stopping the "
                           "listen loop; re-credential this agent")
                 self._mark_disconnected()
-                global _live
                 if _live is not None and _live[0] is self:
                     _live = None
                 return
@@ -829,13 +885,29 @@ class PlowChatAdapter(BasePlatformAdapter):
                 self._mark_disconnected()
             await asyncio.sleep(5)
 
-    async def _on_frame(self, frame):
+    async def _on_frame(self, frame, http=None):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
         if chat_uid not in self.chat_uids:
-            log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
-            return
+            # A chat this agent has never seen -- one born after connect, or
+            # a `message_received` for one never seen. One refresh re-reads
+            # the grant's reach, ahead of the event_type gate below: a
+            # chat_created frame has no message to deliver, but still needs
+            # the reach update. A refresh failure propagates to `_listen`'s
+            # existing reconnect seam -- the same recovery already in place
+            # for a dropped socket, not a second one.
+            #
+            # No anchor call here: baselining a chat discovered mid-connection
+            # is `_listen`'s per-connect loop's job now, not this call's --
+            # see its comment for why that is the one place newest-vs-empty
+            # gets decided. Until that next connect, delivery below does not
+            # need one (the queue does not check `_anchored_chats`), and a
+            # message that lands acks its own real baseline via `_deliver`.
+            await self._refresh_reach(http)
+            if chat_uid not in self.chat_uids:
+                log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
+                return
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]
@@ -905,6 +977,15 @@ class PlowChatAdapter(BasePlatformAdapter):
                 queue.task_done()
 
     async def _deliver(self, burst, resolved, chat_uid):
+        # This chat's checkpoint below may be its first ever (discovered
+        # mid-connection, not yet reached by `_listen`'s per-connect loop)
+        # -- route through the greet-gated lifecycle before writing over it
+        # directly. BEFORE the handoff, never after: `_serve_chat`'s retry
+        # loop re-runs this whole call on any exception, and a failure here
+        # raises, same as `_ensure_anchor` always does -- placed after
+        # `handle_message`, that retry would hand the burst to hermes a
+        # second time.
+        await self._ensure_anchor(chat_uid)
         sender, role = burst[0].sender, burst[0].sender["role"]
         media_urls = [url for urls, _kinds, _text in resolved for url in urls]
         media_types = [kind for _urls, kinds, _text in resolved for kind in kinds]
