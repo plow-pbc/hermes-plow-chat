@@ -407,6 +407,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
         self._active_turn = _ACTIVE_TURN
+        self._invite_sources = {}
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -593,6 +594,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._active_turn.set({
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
+            "participant_id": event.source.user_id,
+            "message_id": event.message_id,
         })
 
     async def on_processing_complete(self, event, outcome):
@@ -641,17 +644,74 @@ class PlowChatAdapter(BasePlatformAdapter):
         an arbitrary owner message.
         """
         chat_uid = turn["chat_uid"]
-        if kind == "consent_request":
-            body = (
-                f"Someone in Plow chat {chat_uid} genuinely loved Plow.\n\n"
-                "Should I offer Plow invites when that happens? "
-                "I’d reply only in the thread where it happened, at most 3 times a day. "
-                "Reply yes or no."
-            )
-        else:
-            body = f"Invite created for someone in Plow chat {chat_uid}."
+        body = (
+            f"Someone in Plow chat {chat_uid} genuinely loved Plow.\n\n"
+            "Should I offer Plow invites when that happens? "
+            "I’d reply only in the thread where it happened, at most 3 times a day. "
+            "Reply yes or no."
+        )
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, self.home_chat_uid, {"body": body})
+
+    async def prepare_invite(self, turn):
+        """Bind this turn, or resume the server's pending opportunity."""
+        if turn["owner"]:
+            url = f"{BASE}/v1/auth/agent-invites/opportunities/prepare-pending"
+            payload = {}
+        else:
+            url = f"{BASE}/v1/auth/agent-invites/opportunities"
+            payload = {
+                "chat_id": turn["chat_uid"],
+                "participant_id": turn["participant_id"],
+                "message_id": turn["message_id"],
+            }
+        async with aiohttp.ClientSession() as http:
+            async with http.post(url, json=payload, headers=self.auth) as resp:
+                _auth_raise_for_status(resp)
+                data = await resp.json(content_type=None)
+        if not isinstance(data, dict) or data.get("status") not in {
+            "consent_required", "disabled", "ready", "none",
+        }:
+            raise RuntimeError("invite opportunity response has an invalid shape")
+        opportunity_id = data.get("opportunity_id")
+        source_chat_id = data.get("source_chat_id")
+        if opportunity_id is not None:
+            if not isinstance(opportunity_id, str) or not isinstance(source_chat_id, str):
+                raise RuntimeError("invite opportunity response has an invalid source")
+            self._invite_sources[opportunity_id] = source_chat_id
+        return {
+            key: data[key]
+            for key in ("status", "opportunity_id", "owner_name", "praise")
+            if key in data
+        }
+
+    async def send_invite(self, opportunity_id, message_template):
+        """Ask Plow to deliver, then send the owner a fixed non-secret FYI."""
+        source_chat_id = self._invite_sources.get(opportunity_id)
+        if source_chat_id is None:
+            raise RuntimeError("prepare this invite before sending it")
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{BASE}/v1/auth/agent-invites/opportunities/{opportunity_id}/send",
+                json={"message_template": message_template},
+                headers=self.auth,
+            ) as resp:
+                _auth_raise_for_status(resp)
+                data = await resp.json(content_type=None)
+            if data != {"status": "sent"}:
+                raise RuntimeError("invite delivery response has an invalid shape")
+            try:
+                notice = await self._post_message(
+                    http,
+                    self.home_chat_uid,
+                    {"body": f"Invite created for someone in Plow chat {source_chat_id}."},
+                )
+                if not notice.success:
+                    log.warning("[plow_chat] invite owner FYI failed after delivery")
+            except Exception:  # noqa: BLE001 - invite already delivered; never make it retryable
+                log.exception("[plow_chat] invite owner FYI failed after delivery")
+        self._invite_sources.pop(opportunity_id, None)
+        return {"status": "sent"}
 
     async def set_conversation_trusted(self, chat_uid, trusted):
         """Write trust through Plow and update cache only from its response."""
@@ -1422,14 +1482,14 @@ PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
 }
 
 
-_INVITE_OWNER_NOTIFICATION_KINDS = {"consent_request", "invite_created"}
+_INVITE_OWNER_NOTIFICATION_KINDS = {"consent_request"}
 
 
 def _plow_notify_owner_about_invite(args, **_kwargs):
     """Bridge the fixed invite-workflow notice to the live adapter's loop."""
     kind = args.get("kind")
     if kind not in _INVITE_OWNER_NOTIFICATION_KINDS:
-        return json.dumps({"success": False, "error": "kind must be consent_request or invite_created"})
+        return json.dumps({"success": False, "error": "kind must be consent_request"})
     turn = _ACTIVE_TURN.get()
     if turn is None:
         return json.dumps({"success": False,
@@ -1467,18 +1527,115 @@ PLOW_NOTIFY_OWNER_ABOUT_INVITE_SCHEMA = {
     "description": (
         "Send the agent owner one fixed Plow-invite workflow notification from the "
         "current non-owner turn. The destination and copy are fixed, and only the "
-        "server-issued current chat ID is included; callers choose whether this is "
-        "the first consent request or the FYI after an invite was created."
+        "server-issued current chat ID is included. This is only the first consent request."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "kind": {
                 "type": "string",
-                "enum": ["consent_request", "invite_created"],
+                "enum": ["consent_request"],
             },
         },
         "required": ["kind"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _plow_prepare_invite(args, **_kwargs):
+    """Bridge server-bound opportunity preparation to the adapter loop."""
+    if args:
+        return json.dumps({"success": False, "error": "this tool accepts no arguments"})
+    turn = _ACTIVE_TURN.get()
+    if turn is None:
+        return json.dumps({"success": False,
+                           "error": "this tool requires an active Plow Chat turn"})
+    if not turn["owner"] and not all(turn.get(key) for key in ("participant_id", "message_id")):
+        return json.dumps({"success": False, "error": "the active member source is incomplete"})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
+    adapter, loop = _live
+    try:
+        prepared = asyncio.run_coroutine_threadsafe(
+            adapter.prepare_invite(turn), loop
+        ).result(timeout=20)
+    except Exception as exc:  # noqa: BLE001 - report only the safe error class
+        return json.dumps({
+            "success": False,
+            "error": f"could not prepare the invite ({type(exc).__name__})",
+        })
+    return json.dumps({"success": True, **prepared})
+
+
+PLOW_PREPARE_INVITE_SCHEMA = {
+    "name": "plow_prepare_invite",
+    "description": (
+        "Record a delight opportunity from the active non-owner turn, or resume "
+        "the server-selected pending opportunity during an owner turn. Accepts no target."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+
+def _plow_send_invite(args, **_kwargs):
+    """Deliver a prepared invite without exposing trusted substitutions."""
+    opportunity_id = args.get("opportunity_id")
+    message_template = args.get("message_template")
+    if not isinstance(opportunity_id, str) or not opportunity_id.strip():
+        return json.dumps({"success": False, "error": "opportunity_id is required"})
+    if not isinstance(message_template, str) or not message_template.strip():
+        return json.dumps({"success": False, "error": "message_template is required"})
+    turn = _ACTIVE_TURN.get()
+    if turn is None:
+        return json.dumps({"success": False,
+                           "error": "this tool requires an active Plow Chat turn"})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
+    attempted = turn.setdefault("_invite_sends_attempted", set())
+    if opportunity_id in attempted:
+        return json.dumps({"success": False,
+                           "error": "this invite send was already attempted this turn"})
+    attempted.add(opportunity_id)
+    adapter, loop = _live
+    try:
+        sent = asyncio.run_coroutine_threadsafe(
+            adapter.send_invite(opportunity_id, message_template), loop
+        ).result(timeout=30)
+    except Exception as exc:  # noqa: BLE001 - never echo an API body containing trusted values
+        return json.dumps({
+            "success": False,
+            "error": f"could not confirm invite delivery ({type(exc).__name__}); do not retry this turn",
+        })
+    return json.dumps({"success": True, "status": sent["status"]})
+
+
+PLOW_SEND_INVITE_SCHEMA = {
+    "name": "plow_send_invite",
+    "description": (
+        "Deliver one prepared referral in its server-recorded original thread. "
+        "Use trusted placeholders exactly once; the tool never returns their values."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "opportunity_id": {
+                "type": "string",
+                "description": "The opportunity id returned by plow_prepare_invite.",
+            },
+            "message_template": {
+                "type": "string",
+                "description": (
+                    "Natural invite copy containing {{activation_code}} and "
+                    "{{destination}} exactly once each."
+                ),
+            },
+        },
+        "required": ["opportunity_id", "message_template"],
         "additionalProperties": False,
     },
 }
@@ -1526,4 +1683,20 @@ def register(ctx):
         handler=_plow_notify_owner_about_invite,
         check_fn=check_requirements,
         requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
+    )
+    ctx.register_tool(
+        name="plow_prepare_invite",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_PREPARE_INVITE_SCHEMA,
+        handler=_plow_prepare_invite,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_send_invite",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_SEND_INVITE_SCHEMA,
+        handler=_plow_send_invite,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
     )

@@ -71,6 +71,21 @@ preference. Ordinary replies take the direct send path; only Hermes's named
 `GET /v1/api-keys/current/preferences` before delivery. Disabled notifications
 are acknowledged without entering the chat.
 
+### Delight invites
+
+Invite continuation is server-bound, not a cron job. During a non-owner turn,
+`plow_prepare_invite` records the current chat participant and inbound message;
+during an owner turn it can only resume the server-selected pending record.
+Neither mode accepts a caller-chosen target. `plow_send_invite` sends natural
+model-written copy back through the recorded original thread, with the API
+substituting `{{activation_code}}` and `{{destination}}` after generation. The
+adapter returns neither trusted value to the model and sends the owner a fixed
+FYI only after delivery succeeds.
+
+These tools require the Plow API opportunity endpoints under
+`/v1/auth/agent-invites/opportunities`; deploy that API before pinning this
+plugin SHA.
+
 One person's rapid-fire messages are one turn: inbound is buffered per chat
 for a 2s window that resets on each arrival — iMessage's bubble + link-preview
 split, or a thought sent as two lines, reaches hermes as a single message
