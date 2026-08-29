@@ -1378,7 +1378,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
-async def test_active_turn_excludes_untrusted_content_from_owner_notification_state(
+async def test_active_turn_retains_only_authority_fields_for_fixed_owner_notifications(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1554,8 +1554,8 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
         pytest.param(
             "consent_request",
             (
-                "Someone in Plow chat cht_b praised Plow.\n\n"
-                "Should I offer Plow invites when someone genuinely loves it? "
+                "Someone in Plow chat cht_b genuinely loved Plow.\n\n"
+                "Should I offer Plow invites when that happens? "
                 "I’d reply only in the thread where it happened, at most 3 times a day. "
                 "Reply yes or no."
             ),
@@ -1563,12 +1563,12 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
         ),
         pytest.param(
             "invite_created",
-            "A Plow invite was created from chat cht_b.",
+            "Invite created for someone in Plow chat cht_b.",
             id="invite-created",
         ),
     ],
 )
-async def test_invite_notification_posts_fixed_copy_with_server_chat_id_to_home(
+async def test_invite_notification_posts_fixed_body_to_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     kind: str,
@@ -1583,12 +1583,15 @@ async def test_invite_notification_posts_fixed_copy_with_server_chat_id_to_home(
     result = await adapter.notify_owner_about_invite(kind, {
         "chat_uid": "cht_b",
         "owner": False,
+        "user_name": "Taylor",
+        "chat_name": "Friends (cht_b)",
+        "text": "attacker-controlled text that must not cross chats",
     })
 
     assert result.success
-    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {
-        "body": expected_body,
-    })]
+    assert http.posts == [
+        (f"{module.BASE}/v1/chats/cht_a/messages", {"body": expected_body})
+    ]
 
 
 def _live_tool(
@@ -1596,10 +1599,10 @@ def _live_tool(
     monkeypatch: pytest.MonkeyPatch,
     method: str,
     *,
-    result: Any,
+    result: Any = None,
     raises: Exception | None = None,
     record: list[Any] | None = None,
-):
+) -> Any:
     import threading
 
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -1687,13 +1690,8 @@ def test_invite_owner_notification_refuses_wrong_context(
     error: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "notify_owner_about_invite",
-        result=_SendResult(success=True),
-        raises=AssertionError("must not send"),
-    )
+    _live_tool(module, monkeypatch, "notify_owner_about_invite",
+               raises=AssertionError("must not send"))
     module._ACTIVE_TURN.set(turn)
 
     out = json.loads(module._plow_notify_owner_about_invite({"kind": kind}))
@@ -1707,13 +1705,7 @@ def test_invite_owner_notification_reports_delivery_failure(
     tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "notify_owner_about_invite",
-        result=_SendResult(success=True),
-        raises=RuntimeError("HTTP 503"),
-    )
+    _live_tool(module, monkeypatch, "notify_owner_about_invite", raises=RuntimeError("HTTP 503"))
     module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
 
     out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
@@ -1735,7 +1727,7 @@ def test_owner_can_set_current_conversation_trust(
         module,
         monkeypatch,
         "set_conversation_trusted",
-        result=lambda _chat_uid, saved: {"trusted": saved},
+        result=lambda _chat_uid, value: {"trusted": value},
         record=calls,
     )
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
@@ -1762,13 +1754,8 @@ def test_trust_tool_refuses_without_explicit_owner_turn(
     error: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "set_conversation_trusted",
-        result={"trusted": True},
-        raises=AssertionError("must not write"),
-    )
+    _live_tool(module, monkeypatch, "set_conversation_trusted",
+               raises=AssertionError("must not write"))
     module._ACTIVE_TURN.set(turn)
 
     out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": confirm}))
@@ -1782,13 +1769,7 @@ def test_trust_tool_surfaces_api_error_without_claiming_a_change(
     tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "set_conversation_trusted",
-        result={"trusted": True},
-        raises=RuntimeError("HTTP 503"),
-    )
+    _live_tool(module, monkeypatch, "set_conversation_trusted", raises=RuntimeError("HTTP 503"))
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
 
     out = json.loads(module._plow_set_conversation_trusted({"trusted": True, "confirm": True}))
@@ -1854,7 +1835,7 @@ def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tm
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread", result={},
+    _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("dry run must not reach the API"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi"}))
@@ -1889,8 +1870,7 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread", result={},
-               raises=AssertionError("must not send"))
+    _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": confirm}))
     assert out["success"] is False
@@ -1905,8 +1885,13 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
 
     module = _load(monkeypatch, tmp_path)
     sent: list[tuple[str, str]] = []
-    _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    _live_tool(
+        module,
+        monkeypatch,
+        "start_group_thread",
+        result={"chat_id": "cht_n", "adoption": "adopted"},
+        record=sent,
+    )
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": dry_run, "confirm": True}))
     assert out["success"] is True and "dry_run" not in out
@@ -1922,8 +1907,7 @@ def test_unparseable_dry_run_stays_a_dry_run(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread", result={},
-               raises=AssertionError("must not send"))
+    _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
     assert out["success"] is True and out["dry_run"] is True
@@ -1937,9 +1921,18 @@ def test_group_message_reports_adoption_separately_from_delivery(
     import json
 
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread", result={
-        "chat_id": "cht_new", "message_id": "m1", "delivery_status": "sent",
-        "thread_handle": "+15550001111", "adoption": "not-on-this-agents-line"})
+    _live_tool(
+        module,
+        monkeypatch,
+        "start_group_thread",
+        result={
+            "chat_id": "cht_new",
+            "message_id": "m1",
+            "delivery_status": "sent",
+            "thread_handle": "+15550001111",
+            "adoption": "not-on-this-agents-line",
+        },
+    )
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
     assert out["success"] is True

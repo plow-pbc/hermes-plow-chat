@@ -562,15 +562,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         inbound event, so a member turn cannot address another chat or supply
         an arbitrary owner message.
         """
+        chat_uid = turn["chat_uid"]
         if kind == "consent_request":
             body = (
-                f"Someone in Plow chat {turn['chat_uid']} praised Plow.\n\n"
-                "Should I offer Plow invites when someone genuinely loves it? "
+                f"Someone in Plow chat {chat_uid} genuinely loved Plow.\n\n"
+                "Should I offer Plow invites when that happens? "
                 "I’d reply only in the thread where it happened, at most 3 times a day. "
                 "Reply yes or no."
             )
         else:
-            body = f"A Plow invite was created from chat {turn['chat_uid']}."
+            body = f"Invite created for someone in Plow chat {chat_uid}."
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, self.home_chat_uid, {"body": body})
 
