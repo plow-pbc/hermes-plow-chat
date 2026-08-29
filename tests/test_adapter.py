@@ -2258,3 +2258,41 @@ async def test_status_frames_are_dropped_unless_the_deployment_opts_into_deliver
     assert delivered.success
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
     assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "expected_posts"),
+    [(False, 0), (True, 1)],
+    ids=["disabled", "enabled"],
+)
+async def test_background_review_delivery_follows_the_current_session_preference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    enabled: bool,
+    expected_posts: int,
+) -> None:
+    """The dashboard setting belongs to this assistant credential. Ordinary
+    replies must not pay for a preference lookup; only Hermes's named
+    background-review message consults it before crossing into iMessage."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+
+    class _PreferenceHTTP(_HTTP):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gets: list[str] = []
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            self.gets.append(url)
+            return _Resp({"memory_notifications_enabled": enabled})
+
+    http = _PreferenceHTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    ordinary = await adapter.send("cht_a", "You're welcome")
+    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+
+    assert ordinary.success and review.success
+    assert http.gets == [f"{module.BASE}/v1/api-keys/current/preferences"]
+    assert len(http.posts) == 1 + expected_posts
