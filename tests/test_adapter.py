@@ -198,6 +198,18 @@ class _Resp:
             raise RuntimeError(f"HTTP {self.status}")
 
 
+def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
+    """Simulate these chats having already been anchored -- by `_listen`'s
+    pre-connect loop, the real precondition before any frame reaches
+    `_on_frame` in production, or by an earlier delivery, since `_deliver`
+    now also routes a chat's first checkpoint through `_ensure_empty_anchor`.
+    A test that drives `_on_frame`/delivery directly, skipping `_listen`,
+    needs this so a chat it doesn't care about anchoring doesn't trip that
+    check on delivery."""
+    for chat_uid in chat_uids:
+        adapter._anchored_chats[chat_uid] = True
+
+
 def _chat(uid: str, *, name: str | None = None, group: bool = False) -> dict[str, Any]:
     participants = [
         {"type": "agent"},
@@ -307,6 +319,7 @@ async def test_inbound_media_reaches_hermes_as_local_files(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=status)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -340,6 +353,7 @@ async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
     logged, without dropping the good part that arrived alongside it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -370,6 +384,7 @@ async def test_duplicate_delivery_does_not_refetch(monkeypatch: pytest.MonkeyPat
     distinct wrapping events) must be deduped before the attachment fetch."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -388,6 +403,7 @@ async def test_a_burst_carries_every_part_s_media(monkeypatch: pytest.MonkeyPatc
     photo. One turn, both files, in arrival order, typed from the whole burst."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
@@ -412,6 +428,7 @@ async def test_a_slow_preview_fetch_does_not_split_the_turn(monkeypatch: pytest.
     hand-off's to wait for, not the window's."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     release = asyncio.Event()
 
     async def slow_fetch(item: Any, kind: str) -> str:
@@ -438,6 +455,7 @@ async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
     burst's, begun when the chat gets around to it."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     entered, release, fetched = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -487,6 +505,7 @@ async def test_a_burst_from_one_sender_is_one_turn(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
@@ -512,6 +531,7 @@ async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
     a1_entered, release_a1 = asyncio.Event(), asyncio.Event()
     order: list[str] = []
 
@@ -544,6 +564,7 @@ async def test_a_backfilled_duplicate_of_an_in_flight_uid_is_dropped(
     ack and is dropped — hermes never sees the message twice."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     entered, release = asyncio.Event(), asyncio.Event()
     handled: list[str] = []
 
@@ -574,6 +595,7 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
     a retry must not go back to a signed url that may have expired."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _ContentHTTP(status=200)
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled: list[str] = []
@@ -821,6 +843,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     config = SimpleNamespace(extra={})
     adapter = module.PlowChatAdapter(config)
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Project room", group=True)])
+    _mark_anchored(adapter, "cht_a", "cht_b")
     # cht_c is never granted; a refresh that leaves reach unchanged is what
     # a real ungranted chat looks like -- nothing here exercises adoption.
     monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
@@ -890,11 +913,14 @@ async def test_unknown_chat_frame_adoption_cases(
     reach refresh either reveals it (adopted; a carried message is delivered)
     or it stays outside the grant (dropped, logged, costing one refresh).
 
-    `_on_frame` does not baseline a revealed chat itself any more -- that is
-    `_listen`'s per-connect loop's job (see `test_a_chat_discovered_after_
-    first_connect_never_newest_anchors`), so neither anchor helper is called
-    here, no baseline is written, and no greeting fires yet; delivery below
-    does not need one either way."""
+    `_on_frame` itself never baselines a revealed chat -- `_ensure_anchor`
+    (newest) must never fire from this path at all, pinned below, and
+    `_listen`'s per-connect loop is what would empty-anchor it on the next
+    connect (see `test_a_chat_discovered_after_first_connect_never_newest_
+    anchors`). But a delivered message does not wait for that: `_deliver`
+    routes a chat's first-ever checkpoint through `_ensure_empty_anchor`
+    too, so the greeting still rides the delivery itself rather than being
+    silently dropped until some future reconnect."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     http = object()  # the listen loop's live session, opaque to a mocked refresh
@@ -906,9 +932,8 @@ async def test_unknown_chat_frame_adoption_cases(
             adapter._set_reach([_chat("cht_a"), _chat("cht_new")])
 
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
-    no_anchor = mock.AsyncMock(side_effect=AssertionError("_on_frame must not baseline a chat itself"))
-    monkeypatch.setattr(adapter, "_ensure_anchor", no_anchor)
-    monkeypatch.setattr(adapter, "_ensure_empty_anchor", no_anchor)
+    monkeypatch.setattr(adapter, "_ensure_anchor",
+                         mock.AsyncMock(side_effect=AssertionError("must not anchor at newest")))
     handled = _capture_events(monkeypatch, adapter)
     greetings: list[str] = []
 
@@ -929,11 +954,12 @@ async def test_unknown_chat_frame_adoption_cases(
     assert ("cht_new" in adapter.chat_uids) == reveals
     assert [event["message_id"] for event in handled] == (["msg_new"] if expect_delivered else [])
     assert ("outside the grant" in caplog.text) == (not reveals)
-    assert greetings == [], "the first-meeting greeting rides the next connect's anchor pass, not this frame"
+    assert greetings == (["cht_new"] if expect_delivered else []), \
+        "the greeting rides the delivery that creates the chat's first checkpoint, not the bare frame"
     if expect_delivered:
         # The delivered message's own ack-after-handoff checkpoint (written
-        # in `_deliver`) is the only baseline this chat gets from this call --
-        # never a `_on_frame`-side anchor of any kind.
+        # in `_deliver`) is the baseline this chat gets from this call --
+        # never a `_on_frame`-side anchor of any kind, and never at newest.
         assert adapter._load_checkpoint("cht_new") == "msg_new"
     else:
         assert not adapter._checkpoint_path("cht_new").exists()
@@ -1102,6 +1128,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    _mark_anchored(adapter, "cht_a", "cht_b")
     http = _HTTP()
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
@@ -1392,6 +1419,7 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     reporting a disconnected gateway."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    _mark_anchored(adapter, "cht_a")
     http = _HTTP()
     http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}

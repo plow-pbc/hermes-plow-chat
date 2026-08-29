@@ -678,9 +678,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         whichever baseline write creates it -- an in-memory latch re-greeted
         every granted chat on every gateway restart, a wave of noise into
         real rooms. Every caller that creates a chat's first checkpoint
-        (`_anchor`'s newest-message baseline, `_on_frame`'s empty baseline
-        for a mid-connection adopt) must route through here, or the chat
-        never gets introduced."""
+        (`_anchor`'s newest-message baseline, `_ensure_empty_anchor`'s empty
+        one) must route through here, or the chat never gets introduced."""
         if not first_meeting:
             return
         try:
@@ -691,21 +690,23 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _ensure_empty_anchor(self, chat_uid):
         """Baseline a chat empty, never at its newest existing message.
 
-        Two callers: `_listen`'s per-connect loop, for every chat it finds
+        Three callers: `_listen`'s per-connect loop, for every chat it finds
         past this process's true first-ever connect (a reconnect's own reach
         refresh, or one a frame-side adopt added to `chat_uids` mid the prior
-        connection); and `start_group_thread`, which needs to know
-        synchronously whether the baseline landed. Either way the newest
-        existing message can be a turn hermes has not yet accepted -- a
-        reply that beat this call, or one still sitting in an in-memory
-        delivery queue from mid-connection. Anchoring at newest would
-        checkpoint that turn before the handoff that accepts it runs, so a
-        crash (or a plain reconnect) in between would drop it silently. An
-        empty baseline instead lets `_backfill`'s pages-to-exhaustion branch
-        recover it; the normal ack-after-handoff checkpoint written in
-        `_deliver` becomes the first durable one. A write failure here
-        raises, same as `_ensure_anchor`/`_anchor` -- for the loop caller
-        that means retrying empty (never newest) on every later connect
+        connection); `start_group_thread`, which needs to know synchronously
+        whether the baseline landed; and `_deliver`, whose own checkpoint
+        would otherwise silently become a chat's first one -- routing
+        through here first is what still greets it. All three see the
+        newest existing message as a possible turn hermes has not yet
+        accepted -- a reply that beat this call, or one still sitting in an
+        in-memory delivery queue. Anchoring at newest would checkpoint that
+        turn before the handoff that accepts it runs, so a crash (or a plain
+        reconnect) in between would drop it silently. An empty baseline
+        instead lets `_backfill`'s pages-to-exhaustion branch recover it;
+        the normal ack-after-handoff checkpoint written in `_deliver`
+        becomes the first durable one. A write failure here raises, same as
+        `_ensure_anchor`/`_anchor` -- for the loop and `_deliver` that means
+        retrying empty (never newest) on every later connect or delivery
         until it lands; `start_group_thread` reports it honestly instead.
 
         Shares `_anchor_lock` with `_ensure_anchor`: the loop's first-connect
@@ -926,6 +927,22 @@ class PlowChatAdapter(BasePlatformAdapter):
                 queue.task_done()
 
     async def _deliver(self, burst, resolved, chat_uid):
+        # A chat this process has not yet anchored -- discovered mid-
+        # connection, with no reconnect since to run `_listen`'s per-connect
+        # loop over it -- can still reach here: delivery never needed an
+        # anchor to run. But the checkpoint below is then this chat's FIRST
+        # ever, and writing it directly (as it always has) would set
+        # `_anchored_chats[chat_uid] = True` without ever greeting it --
+        # short-circuiting `_ensure_empty_anchor`'s first_meeting check
+        # forever, on the next connect and every delivery after. Routing
+        # through it here first closes that gap; for the common case (a
+        # chat the loop already anchored) it is a cheap lock-and-check, not
+        # a write. BEFORE the handoff, never after: `_serve_chat`'s retry
+        # loop re-runs this whole call on any exception, and a failure here
+        # raises (same as `_ensure_anchor`/`_anchor`) -- placed after
+        # `handle_message`, that retry would hand the burst to hermes a
+        # second time.
+        await self._ensure_empty_anchor(chat_uid)
         sender, role = burst[0].sender, burst[0].sender["role"]
         media_urls = [url for urls, _kinds, _text in resolved for url in urls]
         media_types = [kind for _urls, kinds, _text in resolved for kind in kinds]
