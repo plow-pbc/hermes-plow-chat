@@ -117,6 +117,20 @@ so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
 authority stay with the credential's grant. A retitle mid-connection shows up
 on the next reconnect.
 
+### Multi-agent groups
+
+The chat roster identifies this line as `relationship: self`, any other Plow
+lines as `relationship: peer`, and joins each agent to the human it represents.
+The adapter turns that structured roster—plus the current sender—into one
+collaboration context on every turn. This lets Elm distinguish “Hey Ash” from
+an instruction to Elm without parsing names or inventing a second router.
+
+Peer-agent messages are real inbound turns and remain visible in the same group
+as every human message. Only this line's own outbound echo is ignored. The
+prompt asks agents to contribute when addressed or useful and to avoid empty
+acknowledgements, reciprocal delegation, impersonation, and repetition; it
+adds no hidden coordination channel or loop state.
+
 ## Media
 
 Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`
