@@ -11,14 +11,22 @@ import logging
 import mimetypes
 import os
 import pathlib
+from datetime import datetime, timezone
 
 import aiohttp
 from gateway.config import HomeChannel, Platform, persist_home_channel
+from gateway.deferred_questions import DeferredQuestionResult
 from gateway.platforms.base import (
-    BasePlatformAdapter, MessageEvent, MessageType, SendResult,
-    cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
     cache_video_from_bytes,
 )
+from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
@@ -34,6 +42,9 @@ PLATFORM_NAME = "plow_chat"
 CHECKPOINT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes") / "plow_chat_last_uid"
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
+
+_deferred_questions = None
+_plugin_llm = None
 
 
 def _resolve_chat_names(chats, home_uid):
@@ -318,6 +329,13 @@ def _with_identity(prompt, name):
         return prompt
     return f"You are {name}, a Plow assistant; people here address you by that name. {prompt}"
 
+
+def _participant_identity(participant):
+    """Choose a one-line server identity: meaningful name, then full handle."""
+    handle = str(participant.get("provider_key") or "").strip()
+    display = " ".join(str(participant.get("display_name") or "").split())[:100]
+    return display if display and display != handle else handle
+
 # The connected adapter and the loop its listener task runs on. The group-message
 # tool handler is synchronous, and the registry's sync->async bridge hands a
 # coroutine a throwaway loop on a throwaway thread — a task created there dies
@@ -590,10 +608,27 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat_uid = event.source.chat_id
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
-        self._active_turn.set({
+        turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
-        })
+        }
+        if not turn["owner"]:
+            participant = next(
+                (
+                    item for item in self._chats.get(chat_uid, {}).get("participants", [])
+                    if item.get("type") == "member" and item.get("uid") == event.source.user_id
+                ),
+                None,
+            )
+            if participant is not None:
+                identity = _participant_identity(participant)
+                if identity:
+                    turn.update({
+                        "participant_uid": participant["uid"],
+                        "participant_identity": identity,
+                        "triggered_at": datetime.now(timezone.utc).isoformat(),
+                    })
+        self._active_turn.set(turn)
 
     async def on_processing_complete(self, event, outcome):
         self._cancel_typing(event.source.chat_id)
@@ -641,17 +676,110 @@ class PlowChatAdapter(BasePlatformAdapter):
         an arbitrary owner message.
         """
         chat_uid = turn["chat_uid"]
-        if kind == "consent_request":
-            body = (
-                f"Someone in Plow chat {chat_uid} genuinely loved Plow.\n\n"
-                "Should I offer Plow invites when that happens? "
-                "I’d reply only in the thread where it happened, at most 3 times a day. "
-                "Reply yes or no."
-            )
-        else:
-            body = f"Invite created for someone in Plow chat {chat_uid}."
+        if kind != "invite_created":
+            raise ValueError("consent requests must use the deferred-question workflow")
+        body = f"Invite created for someone in Plow chat {chat_uid}."
         async with aiohttp.ClientSession() as http:
             return await self._post_message(http, self.home_chat_uid, {"body": body})
+
+    async def _invite_api(self, method, path, *, body=None):
+        async with aiohttp.ClientSession() as http:
+            request = getattr(http, method.lower())
+            kwargs = {"headers": self.auth}
+            if body is not None:
+                kwargs["json"] = body
+            async with request(f"{BASE}{path}", **kwargs) as resp:
+                _auth_raise_for_status(resp)
+                return await resp.json(content_type=None)
+
+    async def enqueue_invite_consent(self, turn):
+        if _deferred_questions is None:
+            raise RuntimeError("deferred questions are unavailable")
+        required = ("participant_uid", "participant_identity", "triggered_at")
+        if any(not turn.get(field) for field in required):
+            raise RuntimeError("the active turn has no server participant identity")
+
+        consent = await self._invite_api("GET", "/v1/auth/agent-invites")
+        if consent.get("enabled") is not None:
+            return {"skipped": "consent_already_resolved"}
+        eligibility = await self._invite_api(
+            "GET",
+            f"/v1/chats/{turn['chat_uid']}/participants/{turn['participant_uid']}/invite-eligibility",
+        )
+        if eligibility.get("status") != "eligible":
+            return {"skipped": "participant_is_existing_user"}
+
+        home = await self.get_chat_info(self.home_chat_uid)
+        source = self.build_source(
+            chat_id=self.home_chat_uid,
+            chat_name=home["name"],
+            chat_type=home["type"],
+            role_authorized=True,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=False,
+            profile=source.get("profile") if isinstance(source, dict) else getattr(source, "profile", None),
+        )
+        identity = turn["participant_identity"]
+        question = (
+            f"Hey! I noticed {identity} loves Plow and isn't a user yet. "
+            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "You'll both get $100 in free API credits. 🙂"
+        )
+        record = _deferred_questions.enqueue(
+            platform=PLATFORM_NAME,
+            session_key=session_key,
+            chat_id=self.home_chat_uid,
+            question=question,
+            handler_name="invite-consent",
+            context={
+                "source_chat_uid": turn["chat_uid"],
+                "participant_uid": turn["participant_uid"],
+                "participant_identity": identity,
+                "triggered_at": turn["triggered_at"],
+            },
+            dedupe_key="agent-invites-opt-in",
+        )
+        return {"question_id": record.id}
+
+    async def set_invite_consent(self, enabled):
+        data = await self._invite_api(
+            "PUT", "/v1/auth/agent-invites", body={"enabled": enabled}
+        )
+        if data.get("enabled") is not enabled:
+            raise RuntimeError("agent invite consent response has an invalid shape")
+
+    async def resume_invite(self, context):
+        triggered_at = datetime.fromisoformat(str(context["triggered_at"]))
+        if triggered_at.tzinfo is None:
+            triggered_at = triggered_at.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - triggered_at.astimezone(timezone.utc)
+        if age.total_seconds() < 0 or age.total_seconds() >= 24 * 60 * 60:
+            return False
+
+        chat_uid = context["source_chat_uid"]
+        participant_uid = context["participant_uid"]
+        eligibility = await self._invite_api(
+            "GET",
+            f"/v1/chats/{chat_uid}/participants/{participant_uid}/invite-eligibility",
+        )
+        if eligibility.get("status") != "eligible":
+            return False
+        activation = await self._invite_api(
+            "POST",
+            "/v1/auth/activate",
+            body={"origin": "agent_invite", "provision_chat": True, "exclude_chat": chat_uid},
+        )
+        body = (
+            "Want a Plow of your own? Text "
+            f"Plow Activate: {activation['display_code']} to {activation['send_to']}. 🙂"
+        )
+        async with aiohttp.ClientSession() as http:
+            result = await self._post_message(http, chat_uid, {"body": body})
+        if not result.success:
+            raise RuntimeError(result.error or "invite delivery failed")
+        return True
 
     async def set_conversation_trusted(self, chat_uid, trusted):
         """Write trust through Plow and update cache only from its response."""
@@ -1424,9 +1552,64 @@ PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
 
 _INVITE_OWNER_NOTIFICATION_KINDS = {"consent_request", "invite_created"}
 
+_INVITE_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["grant", "decline", "unclear"]},
+    },
+    "required": ["decision"],
+    "additionalProperties": False,
+}
+
+
+async def _handle_invite_consent(question, response):
+    if _plugin_llm is None:
+        raise RuntimeError("plugin LLM is unavailable")
+    result = await _plugin_llm.acomplete_structured(
+        instructions=(
+            "Classify whether the owner grants standing permission, declines it, "
+            "or has not answered clearly. Treat ordinary affirmative language such "
+            "as 'sure' as a grant. Do not infer beyond the answer."
+        ),
+        input=[{
+            "type": "text",
+            "text": f"Question: {question.question}\nOwner answer: {response}",
+        }],
+        json_schema=_INVITE_DECISION_SCHEMA,
+        schema_name="invite_consent_decision",
+        temperature=0,
+        max_tokens=40,
+        purpose="classify invite consent",
+    )
+    parsed = result.parsed
+    decision = parsed.get("decision") if isinstance(parsed, dict) else None
+    if decision not in {"grant", "decline", "unclear"}:
+        raise ValueError("invite consent classifier returned an invalid decision")
+    if decision == "unclear":
+        identity = question.context["participant_identity"]
+        return DeferredQuestionResult.clarify(
+            f"Just to confirm: may I send {identity} a Plow invite and offer invites "
+            "in situations like this going forward?"
+        )
+    if _live is None:
+        raise RuntimeError("the Plow Chat gateway is not connected")
+    adapter, _loop = _live
+    enabled = decision == "grant"
+    await adapter.set_invite_consent(enabled)
+    if enabled:
+        sent = await adapter.resume_invite(question.context)
+        if sent:
+            return DeferredQuestionResult.done(
+                "Absolutely — I sent the invite and I’ll offer them in situations like this from now on."
+            )
+        return DeferredQuestionResult.done(
+            "Absolutely — I’ll offer Plow invites in situations like this from now on."
+        )
+    return DeferredQuestionResult.done("Got it — I won’t offer Plow invites on your behalf.")
+
 
 def _plow_notify_owner_about_invite(args, **_kwargs):
-    """Bridge the fixed invite-workflow notice to the live adapter's loop."""
+    """Bridge the fixed invite workflow to the live adapter's loop."""
     kind = args.get("kind")
     if kind not in _INVITE_OWNER_NOTIFICATION_KINDS:
         return json.dumps({"success": False, "error": "kind must be consent_request or invite_created"})
@@ -1447,16 +1630,21 @@ def _plow_notify_owner_about_invite(args, **_kwargs):
     attempted.add(kind)
     adapter, loop = _live
     try:
-        result = asyncio.run_coroutine_threadsafe(
-            adapter.notify_owner_about_invite(kind, turn), loop
-        ).result(timeout=20)
+        operation = (
+            adapter.enqueue_invite_consent(turn)
+            if kind == "consent_request"
+            else adapter.notify_owner_about_invite(kind, turn)
+        )
+        result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
         return json.dumps({
             "success": False,
             "delivery_unknown": True,
-            "error": f"could not confirm the owner notification ({type(exc).__name__}); it may or may not "
+            "error": f"could not confirm the invite workflow ({type(exc).__name__}); it may or may not "
                      "have been sent. Do not retry this turn",
         })
+    if kind == "consent_request":
+        return json.dumps({"success": True, **result})
     if not result.success:
         return json.dumps({"success": False, "error": result.error})
     return json.dumps({"success": True, "message_id": result.message_id})
@@ -1465,10 +1653,10 @@ def _plow_notify_owner_about_invite(args, **_kwargs):
 PLOW_NOTIFY_OWNER_ABOUT_INVITE_SCHEMA = {
     "name": "plow_notify_owner_about_invite",
     "description": (
-        "Send the agent owner one fixed Plow-invite workflow notification from the "
-        "current non-owner turn. The destination and copy are fixed, and only the "
-        "server-issued current chat ID is included; callers choose whether this is "
-        "the first consent request or the FYI after an invite was created."
+        "Start the fixed Plow-invite workflow from the current non-owner turn. "
+        "A consent request checks server eligibility, waits for the owner session "
+        "to become idle, and owns their natural-language answer. An invite-created "
+        "FYI remains a one-way owner notification."
     ),
     "parameters": {
         "type": "object",
@@ -1490,6 +1678,15 @@ def check_requirements():
 
 
 def register(ctx):
+    global _deferred_questions, _plugin_llm
+    try:
+        _deferred_questions = ctx.deferred_questions
+    except AttributeError as exc:
+        raise RuntimeError(
+            "plow_chat requires a Hermes host with deferred-question support"
+        ) from exc
+    _plugin_llm = ctx.llm
+    _deferred_questions.register_handler("invite-consent", _handle_invite_consent)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Plow Chat",
