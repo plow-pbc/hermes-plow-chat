@@ -586,6 +586,36 @@ async def test_a_burst_from_one_sender_is_one_turn(
     assert len(handled) == len(turns)
 
 
+@pytest.mark.parametrize(
+    "bodies",
+    [
+        ("/approve", "follow up"),
+        ("follow up", "/approve"),
+    ],
+    ids=["command then text", "text then command"],
+)
+async def test_slash_command_closes_same_sender_burst_on_both_sides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    bodies: tuple[str, str],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+    module.INBOUND_DEBOUNCE_SECONDS = 0.05
+
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body=bodies[0]))
+    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", body=bodies[1]))
+    await _settle(adapter)
+
+    assert [(event["message_id"], event["text"]) for event in handled] == [
+        ("msg_1", bodies[0]),
+        ("msg_2", bodies[1]),
+    ]
+
+
 async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

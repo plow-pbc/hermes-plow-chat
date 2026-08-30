@@ -344,6 +344,7 @@ def _server_died(task):
 class _Inbound:
     uid: str
     sender: dict
+    starts_slash_command: bool
     resolved: asyncio.Task                   # of _resolve_parts: begun on arrival, awaited by the burst
 
 
@@ -1099,7 +1100,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             self._inbound[chat_uid] = (queue, server)
         # The fetch starts now, inside the signed urls' five minutes, whatever
         # is retrying ahead of this message; the burst awaits it once it closes.
-        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, asyncio.create_task(_resolve_parts(msg))))
+        self._inbound[chat_uid][0].put_nowait(
+            _Inbound(
+                uid,
+                sender,
+                str(msg["body"] or "").startswith("/"),
+                asyncio.create_task(_resolve_parts(msg)),
+            )
+        )
         # Seen at enqueue: queued, in flight or delivered, a second copy is the
         # same overlap. The durable ack is the checkpoint, written after the
         # hand-off; a replacement adapter starts with an empty `_seen` and its
@@ -1120,8 +1128,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                     nxt = await asyncio.wait_for(queue.get(), INBOUND_DEBOUNCE_SECONDS)
                 except asyncio.TimeoutError:
                     break
-                if _sender_key(nxt.sender) != _sender_key(burst[0].sender):
-                    carry = nxt              # another voice: what came before goes first
+                if (
+                    _sender_key(nxt.sender) != _sender_key(burst[0].sender)
+                    or burst[0].starts_slash_command
+                    or nxt.starts_slash_command
+                ):
+                    # Another voice or a command boundary: what came before
+                    # goes first, and the next message starts its own burst.
+                    carry = nxt
                     break
                 burst.append(nxt)
             resolved = [await m.resolved for m in burst]
