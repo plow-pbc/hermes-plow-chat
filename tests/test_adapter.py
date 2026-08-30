@@ -233,6 +233,9 @@ class _Resp:
     async def json(self, content_type: Any = None) -> Any:
         return self._payload
 
+    async def text(self) -> str:
+        return json.dumps(self._payload)
+
     def raise_for_status(self) -> None:
         if self.status >= 400:
             raise RuntimeError(f"HTTP {self.status}")
@@ -2548,13 +2551,6 @@ async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_conn
         "the gate must lift once the first anchor pass actually finishes"
 
 
-class _CreateTextResp(_Resp):
-    """The thread-creation POST reads the body with .text()."""
-
-    async def text(self) -> str:
-        return json.dumps(self._payload)
-
-
 def _create_http(posts: list[Any], *, resource: dict[str, Any] | None = None,
                  status: int = 200, granted: list[dict[str, Any]] | None = None) -> Any:
     """An HTTP stub for start_group_thread: the create POST (and the anchor
@@ -2563,7 +2559,7 @@ def _create_http(posts: list[Any], *, resource: dict[str, Any] | None = None,
     class _SendHTTP(_HTTP):
         def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
             posts.append((url, json, headers))
-            return _CreateTextResp(
+            return _Resp(
                 resource or {"uid": "cht_new", "created": True, "trusted": False}, status)
 
         def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
