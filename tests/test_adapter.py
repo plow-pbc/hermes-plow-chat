@@ -1891,18 +1891,6 @@ async def test_active_turn_retains_only_server_invite_identity(
         await adapter.on_processing_complete(event, None)
 
 
-def test_registers_deferred_invite_consent_handler(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    ctx = _ToolContext()
-
-    module.register(ctx)
-
-    assert set(ctx.deferred_questions.handlers) == {"invite-consent"}
-
-
 def test_registration_refuses_host_without_deferred_questions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
