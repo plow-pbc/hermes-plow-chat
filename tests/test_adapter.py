@@ -2279,38 +2279,59 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     assert len(sent) == 1
 
 
-def test_email_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
-
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_email_thread", raises=AssertionError("dry run must not reach the API"))
-    out = json.loads(module._plow_start_email_message({
-        "to": ["owner@example.com", "vendor@example.com"],
-        "subject": "Quote",
-        "body": "Can you send the quote?",
-    }))
-    assert out["success"] is True and out["dry_run"] is True
-    assert out["would_send"]["to_count"] == 2
-    assert out["would_send"]["cc_count"] == 0
-
-
-def test_email_message_requires_confirm_to_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
-
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_email_thread", raises=AssertionError("must not send without confirm"))
-    out = json.loads(module._plow_start_email_message({
-        "to": ["owner@example.com", "vendor@example.com"],
-        "subject": "Quote",
-        "body": "Can you send the quote?",
-        "dry_run": False,
-    }))
-    assert out["success"] is False
-    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
-
-
-def test_email_message_uses_gateway_email_thread_method(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize(
+    ("args", "result", "raises", "expected", "expected_sent"),
+    [
+        pytest.param(
+            {
+                "to": ["owner@example.com", "vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+            },
+            None,
+            AssertionError("dry run must not reach the API"),
+            {"success": True, "dry_run": True, "to_count": 2, "cc_count": 0},
+            [],
+            id="dry-run",
+        ),
+        pytest.param(
+            {
+                "to": ["owner@example.com", "vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+                "dry_run": False,
+            },
+            None,
+            AssertionError("must not send without confirm"),
+            {"success": False, "error_contains": "confirm"},
+            [],
+            id="missing-confirm",
+        ),
+        pytest.param(
+            {
+                "to": ["owner@example.com"],
+                "cc": ["vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+                "dry_run": False,
+                "confirm": True,
+            },
+            {"chat_id": "cht_email", "message_id": "msg_email", "adoption": "adopted"},
+            None,
+            {"success": True, "chat_id": "cht_email", "message_id": "msg_email"},
+            [(["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")],
+            id="confirmed-send",
+        ),
+    ],
+)
+def test_email_message_start_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    args: dict[str, Any],
+    result: dict[str, Any] | None,
+    raises: Exception | None,
+    expected: dict[str, Any],
+    expected_sent: list[tuple[Any, ...]],
 ) -> None:
     import json
 
@@ -2320,21 +2341,23 @@ def test_email_message_uses_gateway_email_thread_method(
         module,
         monkeypatch,
         "start_email_thread",
-        result={"chat_id": "cht_email", "message_id": "msg_email", "adoption": "adopted"},
+        result=result,
+        raises=raises,
         record=sent,
     )
-    out = json.loads(module._plow_start_email_message({
-        "to": ["owner@example.com"],
-        "cc": ["vendor@example.com"],
-        "subject": "Quote",
-        "body": "Can you send the quote?",
-        "dry_run": False,
-        "confirm": True,
-    }))
-    assert out["success"] is True
-    assert out["chat_id"] == "cht_email"
-    assert out["message_id"] == "msg_email"
-    assert sent == [(["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")]
+    out = json.loads(module._plow_start_email_message(args))
+
+    assert out["success"] is expected["success"]
+    if expected.get("dry_run"):
+        assert out["dry_run"] is True
+        assert out["would_send"]["to_count"] == expected["to_count"]
+        assert out["would_send"]["cc_count"] == expected["cc_count"]
+    if expected.get("error_contains"):
+        assert expected["error_contains"] in out["error"] and "nothing was sent" in out["error"]
+    if expected.get("chat_id"):
+        assert out["chat_id"] == expected["chat_id"]
+        assert out["message_id"] == expected["message_id"]
+    assert sent == expected_sent
 
 
 @pytest.mark.parametrize(
@@ -2575,16 +2598,12 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     assert adapter._load_checkpoint("cht_new") is None
 
 
-async def test_start_email_thread_posts_line_endpoint_and_reports_adoption(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
+def _email_thread_http(
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]],
+    *,
+    refresh_error: Exception | None = None,
+) -> Any:
     import json as jsonlib
-
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a", agent_name="Elm")])
-
-    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
 
     class _TextResp(_Resp):
         async def text(self) -> str:
@@ -2596,13 +2615,37 @@ async def test_start_email_thread_posts_line_endpoint_and_reports_adoption(
             return _TextResp({"chat_uid": "cht_email", "uid": "msg_email"})
 
         def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            if refresh_error is not None:
+                raise refresh_error
             return _Resp({
                 "object": "list",
                 "data": [_chat("cht_a", agent_name="Elm"), _chat("cht_email", agent_name="Elm")],
                 "has_more": False,
             })
 
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
+    return _SendHTTP()
+
+
+@pytest.mark.parametrize(
+    ("refresh_error", "expected_adoption", "expected_chats"),
+    [
+        pytest.param(None, "adopted", frozenset({"cht_a", "cht_email"}), id="refresh-success"),
+        pytest.param(RuntimeError("reach failed"), "failed: RuntimeError: reach failed", frozenset({"cht_a"}), id="refresh-failure"),
+    ],
+)
+async def test_start_email_thread_posts_line_endpoint_and_records_no_greeting_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    refresh_error: Exception | None,
+    expected_adoption: str,
+    expected_chats: frozenset[str],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", agent_name="Elm")])
+
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _email_thread_http(posts, refresh_error=refresh_error))
     data = await adapter.start_email_thread(
         ["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")
 
@@ -2617,38 +2660,8 @@ async def test_start_email_thread_posts_line_endpoint_and_reports_adoption(
         adapter.auth,
     )]
     assert data["message_id"] == "msg_email"
-    assert data["adoption"] == "adopted"
-    assert adapter.chat_uids == frozenset({"cht_a", "cht_email"})
-    assert adapter._anchored_chats.get("cht_email") is True
-    assert adapter._load_checkpoint("cht_email") is None
-
-
-async def test_start_email_thread_preserves_message_id_when_reach_refresh_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    import json as jsonlib
-
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a", agent_name="Elm")])
-
-    class _TextResp(_Resp):
-        async def text(self) -> str:
-            return jsonlib.dumps(self._payload)
-
-    class _SendHTTP(_HTTP):
-        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
-            return _TextResp({"chat_uid": "cht_email", "uid": "msg_email"})
-
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            raise RuntimeError("reach failed")
-
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
-    data = await adapter.start_email_thread(["owner@example.com"], [], "Quote", "Can you send the quote?")
-
-    assert data["chat_id"] == "cht_email"
-    assert data["message_id"] == "msg_email"
-    assert data["adoption"] == "failed: RuntimeError: reach failed"
+    assert data["adoption"] == expected_adoption
+    assert adapter.chat_uids == expected_chats
     assert adapter._anchored_chats.get("cht_email") is True
     assert adapter._load_checkpoint("cht_email") is None
 
