@@ -1641,13 +1641,7 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert invite_tool["schema"]["name"] == "plow_notify_owner_about_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["consent_request"],
-            },
-        },
-        "required": ["kind"],
+        "properties": {},
         "additionalProperties": False,
     }
     assert invite_tool["requires_env"] == ["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"]
@@ -1675,7 +1669,7 @@ async def test_invite_notification_posts_fixed_body_to_home(
     http = _HTTP()
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
-    result = await adapter.notify_owner_about_invite("consent_request", {
+    result = await adapter.notify_owner_about_invite({
         "chat_uid": "cht_b",
         "owner": False,
         "user_name": "Taylor",
@@ -1699,9 +1693,42 @@ async def test_invite_notification_posts_fixed_body_to_home(
     ]
 
 
-async def test_prepare_invite_binds_nonowner_turn_and_keeps_source_internal(
+@pytest.mark.parametrize(
+    ("turn", "path", "payload", "expected"),
+    [
+        pytest.param(
+            {
+                "chat_uid": "cht_b",
+                "owner": False,
+                "participant_id": "cp_taylor",
+                "message_id": "msg_delight",
+            },
+            "",
+            {"chat_id": "cht_b", "participant_id": "cp_taylor", "message_id": "msg_delight"},
+            {
+                "status": "ready",
+                "opportunity_id": "agi_ready",
+                "owner_name": "Sam",
+                "praise": "Go Plow!",
+            },
+            id="member-source",
+        ),
+        pytest.param(
+            {"chat_uid": "cht_a", "owner": True},
+            "/prepare-pending",
+            {},
+            {"status": "ready", "opportunity_id": "agi_ready", "owner_name": "Sam"},
+            id="owner-resume",
+        ),
+    ],
+)
+async def test_prepare_invite_uses_turn_bound_route(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    turn: dict[str, Any],
+    path: str,
+    payload: dict[str, Any],
+    expected: dict[str, Any],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -1723,60 +1750,12 @@ async def test_prepare_invite_binds_nonowner_turn_and_keeps_source_internal(
     http = _InviteHTTP()
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
 
-    result = await adapter.prepare_invite(
-        {
-            "chat_uid": "cht_b",
-            "owner": False,
-            "participant_id": "cp_taylor",
-            "message_id": "msg_delight",
-        }
-    )
+    result = await adapter.prepare_invite(turn)
 
-    assert result == {
-        "status": "ready",
-        "opportunity_id": "agi_ready",
-        "owner_name": "Sam",
-        "praise": "Go Plow!",
-    }
+    assert result == expected
     assert adapter._invite_sources == {"agi_ready": "cht_b"}
     assert http.posts == [
-        (
-            f"{module.BASE}/v1/auth/agent-invites/opportunities",
-            {"chat_id": "cht_b", "participant_id": "cp_taylor", "message_id": "msg_delight"},
-        )
-    ]
-
-
-async def test_prepare_invite_owner_turn_resumes_without_a_caller_chosen_target(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-
-    class _InviteHTTP(_HTTP):
-        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
-            self.posts.append((url, json))
-            return _Resp(
-                {
-                    "status": "ready",
-                    "opportunity_id": "agi_deferred",
-                    "source_chat_id": "cht_b",
-                    "owner_name": "Sam",
-                    "praise": "Go Plow!",
-                }
-            )
-
-    http = _InviteHTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
-
-    result = await adapter.prepare_invite({"chat_uid": "cht_a", "owner": True})
-
-    assert result["opportunity_id"] == "agi_deferred"
-    assert "source_chat_id" not in result
-    assert adapter._invite_sources == {"agi_deferred": "cht_b"}
-    assert http.posts == [
-        (f"{module.BASE}/v1/auth/agent-invites/opportunities/prepare-pending", {})
+        (f"{module.BASE}/v1/auth/agent-invites/opportunities{path}", payload)
     ]
 
 
@@ -1881,21 +1860,7 @@ def test_prepare_invite_tool_uses_only_active_turn_authority(
     assert calls == [(turn,)]
 
 
-def test_prepare_invite_tool_refuses_incomplete_member_source(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "prepare_invite", raises=AssertionError("must not call"))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
-
-    out = json.loads(module._plow_prepare_invite({}))
-
-    assert out["success"] is False
-    assert "source" in out["error"]
-
-
-def test_send_invite_tool_returns_only_status_and_attempts_once(
+def test_send_invite_tool_returns_only_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1914,12 +1879,9 @@ def test_send_invite_tool_returns_only_status_and_attempts_once(
         "message_template": "Text {{activation_code}} to {{destination}}.",
     }
 
-    first = json.loads(module._plow_send_invite(args))
-    second = json.loads(module._plow_send_invite(args))
+    out = json.loads(module._plow_send_invite(args))
 
-    assert first == {"success": True, "status": "sent"}
-    assert second["success"] is False
-    assert "already attempted" in second["error"]
+    assert out == {"success": True, "status": "sent"}
     assert calls == [("agi_ready", args["message_template"])]
 
 
@@ -1945,10 +1907,10 @@ def test_member_turn_can_send_fixed_invite_consent_notification_to_owner(
     }
     module._ACTIVE_TURN.set(turn)
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    out = json.loads(module._plow_notify_owner_about_invite({}))
 
     assert out == {"success": True, "message_id": "msg_notice"}
-    assert calls == [("consent_request", turn)]
+    assert calls == [(turn,)]
 
 
 def test_invite_owner_notification_is_attempted_once_per_turn(
@@ -1967,8 +1929,8 @@ def test_invite_owner_notification_is_attempted_once_per_turn(
     turn = {"chat_uid": "cht_b", "owner": False}
     module._ACTIVE_TURN.set(turn)
 
-    first = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
-    second = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    first = json.loads(module._plow_notify_owner_about_invite({}))
+    second = json.loads(module._plow_notify_owner_about_invite({}))
 
     assert first["success"] is True
     assert second["success"] is False
@@ -1977,18 +1939,16 @@ def test_invite_owner_notification_is_attempted_once_per_turn(
 
 
 @pytest.mark.parametrize(
-    ("turn", "kind", "error"),
+    ("turn", "error"),
     [
-        pytest.param(None, "consent_request", "active Plow Chat turn", id="outside-turn"),
-        pytest.param({"chat_uid": "cht_a", "owner": True}, "consent_request", "non-owner", id="owner-turn"),
-        pytest.param({"chat_uid": "cht_b", "owner": False}, "other", "kind", id="unknown-kind"),
+        pytest.param(None, "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, "non-owner", id="owner-turn"),
     ],
 )
 def test_invite_owner_notification_refuses_wrong_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     turn: dict[str, Any] | None,
-    kind: str,
     error: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
@@ -1996,7 +1956,7 @@ def test_invite_owner_notification_refuses_wrong_context(
                raises=AssertionError("must not send"))
     module._ACTIVE_TURN.set(turn)
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": kind}))
+    out = json.loads(module._plow_notify_owner_about_invite({}))
 
     assert out["success"] is False
     assert error.lower() in out["error"].lower()
@@ -2010,7 +1970,7 @@ def test_invite_owner_notification_reports_delivery_failure(
     _live_tool(module, monkeypatch, "notify_owner_about_invite", raises=RuntimeError("HTTP 503"))
     module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    out = json.loads(module._plow_notify_owner_about_invite({}))
 
     assert out["success"] is False
     assert "may or may not" in out["error"]

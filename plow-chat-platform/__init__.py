@@ -635,7 +635,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                     return SendResult(success=True)
             return await self._post_message(http, chat_id, {"body": body})
 
-    async def notify_owner_about_invite(self, kind, turn):
+    async def notify_owner_about_invite(self, turn):
         """Send one fixed invite-workflow notice to the configured home.
 
         This is deliberately not a generic send exception. The caller chooses
@@ -679,9 +679,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             if not isinstance(opportunity_id, str) or not isinstance(source_chat_id, str):
                 raise RuntimeError("invite opportunity response has an invalid source")
             self._invite_sources[opportunity_id] = source_chat_id
+        safe_keys = ("status", "opportunity_id", "owner_name") if turn["owner"] else (
+            "status", "opportunity_id", "owner_name", "praise",
+        )
         return {
             key: data[key]
-            for key in ("status", "opportunity_id", "owner_name", "praise")
+            for key in safe_keys
             if key in data
         }
 
@@ -1482,14 +1485,10 @@ PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
 }
 
 
-_INVITE_OWNER_NOTIFICATION_KINDS = {"consent_request"}
-
-
 def _plow_notify_owner_about_invite(args, **_kwargs):
     """Bridge the fixed invite-workflow notice to the live adapter's loop."""
-    kind = args.get("kind")
-    if kind not in _INVITE_OWNER_NOTIFICATION_KINDS:
-        return json.dumps({"success": False, "error": "kind must be consent_request"})
+    if args:
+        return json.dumps({"success": False, "error": "this tool accepts no arguments"})
     turn = _ACTIVE_TURN.get()
     if turn is None:
         return json.dumps({"success": False,
@@ -1500,15 +1499,14 @@ def _plow_notify_owner_about_invite(args, **_kwargs):
     if _live is None:
         return json.dumps({"success": False,
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
-    attempted = turn.setdefault("_invite_owner_notifications_attempted", set())
-    if kind in attempted:
+    if turn.get("_invite_owner_notification_attempted"):
         return json.dumps({"success": False,
-                           "error": f"the {kind} owner notification was already attempted this turn"})
-    attempted.add(kind)
+                           "error": "the owner notification was already attempted this turn"})
+    turn["_invite_owner_notification_attempted"] = True
     adapter, loop = _live
     try:
         result = asyncio.run_coroutine_threadsafe(
-            adapter.notify_owner_about_invite(kind, turn), loop
+            adapter.notify_owner_about_invite(turn), loop
         ).result(timeout=20)
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
         return json.dumps({
@@ -1531,13 +1529,7 @@ PLOW_NOTIFY_OWNER_ABOUT_INVITE_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["consent_request"],
-            },
-        },
-        "required": ["kind"],
+        "properties": {},
         "additionalProperties": False,
     },
 }
@@ -1551,8 +1543,6 @@ def _plow_prepare_invite(args, **_kwargs):
     if turn is None:
         return json.dumps({"success": False,
                            "error": "this tool requires an active Plow Chat turn"})
-    if not turn["owner"] and not all(turn.get(key) for key in ("participant_id", "message_id")):
-        return json.dumps({"success": False, "error": "the active member source is incomplete"})
     if _live is None:
         return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
     adapter, loop = _live
@@ -1596,11 +1586,6 @@ def _plow_send_invite(args, **_kwargs):
                            "error": "this tool requires an active Plow Chat turn"})
     if _live is None:
         return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
-    attempted = turn.setdefault("_invite_sends_attempted", set())
-    if opportunity_id in attempted:
-        return json.dumps({"success": False,
-                           "error": "this invite send was already attempted this turn"})
-    attempted.add(opportunity_id)
     adapter, loop = _live
     try:
         sent = asyncio.run_coroutine_threadsafe(
