@@ -1769,6 +1769,20 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
     }
 
 
+def _invite_send_call(owner_name: str = "Sam") -> tuple[str, str, dict[str, Any]]:
+    return (
+        "POST",
+        "/v1/auth/agent-invites/opportunities/agi_1/send",
+        {
+            "message_template": (
+                f"Love that you love Plow! {owner_name} gave me permission to share an invite. "
+                "Text Plow Activate: {{activation_code}} to {{destination}} to get early access! "
+                "You both will get $100 in cloud credits."
+            )
+        },
+    )
+
+
 def test_member_turn_can_start_fixed_invite_workflow(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -1924,14 +1938,14 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     ctx.llm.decision = decision
     module.register(ctx)
     consent: list[bool] = []
-    resumed: list[tuple[dict[str, Any], str]] = []
+    resumed: list[dict[str, Any]] = []
     adapter = _live_tool(module, monkeypatch, "_unused")
 
     async def persist(value: bool) -> None:
         consent.append(value)
 
-    async def resume(context: dict[str, Any], *, idempotency_key: str) -> str:
-        resumed.append((context, idempotency_key))
+    async def resume(context: dict[str, Any]) -> str:
+        resumed.append(context)
         return "sent"
 
     monkeypatch.setattr(adapter, "set_invite_consent", persist, raising=False)
@@ -1940,8 +1954,8 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
         id="dq_invite_1",
         question="Can I invite Taylor?",
         context={
-            "source_chat_uid": "cht_b",
-            "participant_uid": "cp_taylor",
+            "opportunity_id": "agi_1",
+            "owner_name": "Alex",
             "participant_identity": "Taylor",
             "triggered_at": "2026-08-29T12:00:00+00:00",
         },
@@ -1951,7 +1965,7 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
 
     assert result.resolved is resolved
     assert consent == ([] if enabled is None else [enabled])
-    assert resumed == ([(question.context, question.id)] if enabled is True else [])
+    assert resumed == ([question.context] if enabled is True else [])
     if decision == "unclear":
         assert "Taylor" in result.question
     assert ctx.llm.calls[0]["json_schema"]["properties"]["decision"]["enum"] == [
@@ -1960,6 +1974,41 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     classifier_text = ctx.llm.calls[0]["input"][0]["text"]
     assert classifier_text == "Owner answer: Sure, sounds good"
     assert question.question not in classifier_text
+
+
+async def test_legacy_deferred_invite_context_resolves_without_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    ctx = _ToolContext()
+    module.register(ctx)
+    consent: list[bool] = []
+    adapter = _live_tool(module, monkeypatch, "_unused")
+
+    async def persist(value: bool) -> None:
+        consent.append(value)
+
+    async def resume(_context: dict[str, Any]) -> str:
+        raise AssertionError("legacy contexts have no opportunity to send")
+
+    monkeypatch.setattr(adapter, "set_invite_consent", persist, raising=False)
+    monkeypatch.setattr(adapter, "resume_invite", resume, raising=False)
+    question = SimpleNamespace(
+        id="dq_legacy",
+        context={
+            "source_chat_uid": "cht_b",
+            "participant_uid": "cp_taylor",
+            "participant_identity": "Taylor",
+            "triggered_at": "2026-08-29T12:00:00+00:00",
+        },
+    )
+
+    result = await ctx.deferred_questions.handlers["invite-consent"](question, "Sure")
+
+    assert result.resolved is True
+    assert consent == [True]
+    assert "from now on" in result.reply
 
 
 async def test_offer_checks_consent_and_eligibility_before_fixed_question(
@@ -1975,7 +2024,12 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
 
     async def api(method: str, path: str, **_kwargs: Any) -> dict[str, Any]:
         calls.append((method, path))
-        return {"enabled": None} if path.endswith("agent-invites") else {"status": "eligible"}
+        return {
+            "status": "consent_required",
+            "opportunity_id": "agi_1",
+            "owner_name": "Alex",
+            "praise": "I love Plow — this is amazing.",
+        }
 
     monkeypatch.setattr(adapter, "_invite_api", api)
     turn = _invite_turn()
@@ -1984,8 +2038,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
 
     assert result == {"question_id": "dq_1"}
     assert calls == [
-        ("GET", "/v1/auth/agent-invites"),
-        ("GET", "/v1/chats/cht_b/participants/cp_taylor/invite-eligibility"),
+        ("POST", "/v1/auth/agent-invites/opportunities"),
     ]
     assert ctx.deferred_questions.enqueued == [{
         "session_key": "agent:main:plow_chat:dm:cht_a",
@@ -2003,8 +2056,8 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
         ),
         "handler_name": "invite-consent",
         "context": {
-            "source_chat_uid": "cht_b",
-            "participant_uid": "cp_taylor",
+            "opportunity_id": "agi_1",
+            "owner_name": "Alex",
             "participant_identity": "Taylor",
             "triggered_at": turn["triggered_at"],
         },
@@ -2034,18 +2087,29 @@ async def test_resolved_consent_sends_once_or_stays_declined(
 
     async def api(method: str, path: str, *, body: Any = None) -> dict[str, Any]:
         calls.append((method, path, body))
-        return {"enabled": enabled} if path == "/v1/auth/agent-invites" else {"status": "sent"}
+        if enabled:
+            if path == "/v1/auth/agent-invites/opportunities":
+                return {
+                    "status": "ready",
+                    "opportunity_id": "agi_1",
+                    "source_chat_id": "cht_b",
+                    "owner_name": "Alex",
+                    "praise": "I love Plow — this is amazing.",
+                }
+            return {"status": "sent"}
+        return {"status": "disabled"}
 
     monkeypatch.setattr(adapter, "_invite_api", api)
     result = await adapter.offer_invite(_invite_turn())
 
-    assert calls[0] == ("GET", "/v1/auth/agent-invites", None)
+    assert calls[0] == (
+        "POST",
+        "/v1/auth/agent-invites/opportunities",
+        {"chat_id": "cht_b", "participant_id": "cp_taylor", "message_id": "msg_delight_1"},
+    )
     if enabled:
         assert result == {"invite_status": "sent"}
-        assert calls[1][0:2] == ("POST", "/v1/chats/cht_b/participants/cp_taylor/agent-invite")
-        operation_key = calls[1][2]["idempotency_key"]
-        assert operation_key.startswith("delight:")
-        assert len(operation_key) == len("delight:") + 64
+        assert calls[1] == _invite_send_call("Alex")
     else:
         assert result == {"skipped": "consent_declined"}
         assert len(calls) == 1
@@ -2070,21 +2134,17 @@ async def test_only_fresh_approval_resumes_original_thread(
 
     monkeypatch.setattr(adapter, "_invite_api", api)
     context = {
-        "source_chat_uid": "cht_b",
-        "participant_uid": "cp_taylor",
+        "opportunity_id": "agi_1",
+        "owner_name": "Alex",
         "participant_identity": "Taylor",
         "triggered_at": (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat(),
     }
 
-    resumed = await adapter.resume_invite(context, idempotency_key="dq_stable")
+    resumed = await adapter.resume_invite(context)
 
     if hours_old == 23:
         assert resumed == "sent"
-        assert api_calls == [(
-            "POST",
-            "/v1/chats/cht_b/participants/cp_taylor/agent-invite",
-            {"idempotency_key": "dq_stable"},
-        )]
+        assert api_calls == [_invite_send_call("Alex")]
     else:
         assert resumed is False
         assert api_calls == []
