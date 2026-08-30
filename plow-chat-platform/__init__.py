@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 
 import aiohttp
 from gateway.config import HomeChannel, Platform, persist_home_channel
-from gateway.deferred_questions import DeferredQuestionResult
+try:
+    from gateway.deferred_questions import DeferredQuestionResult
+except ModuleNotFoundError:
+    DeferredQuestionResult = None
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -44,8 +47,8 @@ CHECKPOINT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes") / 
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
 
-_deferred_questions: object
-_plugin_llm: object
+_deferred_questions: object | None = None
+_plugin_llm: object | None = None
 
 
 def _resolve_chat_names(chats, home_uid):
@@ -714,6 +717,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         )
         if eligibility.get("status") != "eligible":
             return {"skipped": "participant_is_existing_user"}
+        if _deferred_questions is None:
+            return {"skipped": "deferred_consent_unavailable"}
 
         home = await self.get_chat_info(self.home_chat_uid)
         home_members = [
@@ -1657,8 +1662,9 @@ PLOW_OFFER_INVITE_SCHEMA = {
     "description": (
         "Start the fixed Plow-invite workflow from the current non-owner turn. "
         "If standing consent exists, the server checks the participant and sends one "
-        "replay-safe invite in the current thread. Otherwise it waits for the owner "
-        "session to become idle and owns their natural-language consent answer."
+        "replay-safe invite in the current thread. Otherwise it asks the owner for "
+        "consent when the Hermes host supports deferred questions; older hosts skip "
+        "that consent flow without disabling Plow Chat."
     ),
     "parameters": {
         "type": "object",
@@ -1675,14 +1681,14 @@ def check_requirements():
 
 def register(ctx):
     global _deferred_questions, _plugin_llm
-    try:
-        _deferred_questions = ctx.deferred_questions
-    except AttributeError as exc:
-        raise RuntimeError(
-            "plow_chat requires a Hermes host with deferred-question support"
-        ) from exc
-    _plugin_llm = ctx.llm
-    _deferred_questions.register_handler("invite-consent", _handle_invite_consent)
+    _plugin_llm = getattr(ctx, "llm", None)
+    _deferred_questions = (
+        getattr(ctx, "deferred_questions", None)
+        if DeferredQuestionResult is not None and _plugin_llm is not None
+        else None
+    )
+    if _deferred_questions is not None:
+        _deferred_questions.register_handler("invite-consent", _handle_invite_consent)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="Plow Chat",

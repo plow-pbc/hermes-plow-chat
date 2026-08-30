@@ -31,7 +31,7 @@ class _SendResult:
     error: str | None = None
 
 
-def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
+def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
     """Import the plugin against stub `gateway` modules."""
     config = types.ModuleType("gateway.config")
     config.HomeChannel = lambda **kw: kw  # type: ignore[attr-defined]
@@ -112,14 +112,18 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Any:
         lambda source, **_kwargs: f"agent:main:{source.platform}:dm:{source.chat_id}"
     )
 
-    for name, module in {
+    modules = {
         "gateway": types.ModuleType("gateway"),
         "gateway.config": config,
         "gateway.platforms": types.ModuleType("gateway.platforms"),
         "gateway.platforms.base": base,
-        "gateway.deferred_questions": deferred,
         "gateway.session": session,
-    }.items():
+    }
+    if deferred_questions:
+        modules["gateway.deferred_questions"] = deferred
+    else:
+        monkeypatch.delitem(sys.modules, "gateway.deferred_questions", raising=False)
+    for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
     # The checkpoint base honors the fleet's HERMES_HOME; pin it here so the
@@ -1691,8 +1695,13 @@ class _Llm:
         return SimpleNamespace(parsed={"decision": self.decision})
 
 
-def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    module = _load(monkeypatch, tmp_path)
+@pytest.mark.parametrize("deferred_questions", [True, False])
+def test_tools_register_with_optional_deferred_questions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    deferred_questions: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path, deferred_questions=deferred_questions)
     ctx = _ToolContext()
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
@@ -1747,13 +1756,15 @@ def _live_tool(
 
 
 def _invite_turn(**overrides: Any) -> dict[str, Any]:
+    from datetime import datetime, timezone
+
     return {
         "chat_uid": "cht_b",
         "owner": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
         "source_message_id": "msg_delight_1",
-        "triggered_at": "2026-08-29T12:00:00+00:00",
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
         **overrides,
     }
 
@@ -1897,17 +1908,6 @@ async def test_active_turn_retains_only_server_invite_identity(
         await adapter.on_processing_complete(event, None)
 
 
-def test_registration_refuses_host_without_deferred_questions(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    ctx = SimpleNamespace()
-
-    with pytest.raises(RuntimeError, match="deferred-question support"):
-        module.register(ctx)
-
-
 @pytest.mark.parametrize(
     ("decision", "enabled", "resolved"),
     [("grant", True, True), ("decline", False, True), ("unclear", None, False)],
@@ -2006,7 +2006,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "source_chat_uid": "cht_b",
             "participant_uid": "cp_taylor",
             "participant_identity": "Taylor",
-            "triggered_at": "2026-08-29T12:00:00+00:00",
+            "triggered_at": turn["triggered_at"],
         },
         "dedupe_key": "agent-invites-opt-in",
     }]
