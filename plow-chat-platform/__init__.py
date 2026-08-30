@@ -706,8 +706,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             return {"skipped": "participant_is_existing_user"}
 
         home = await self.get_chat_info(self.home_chat_uid)
-        if home["type"] != "dm":
-            raise RuntimeError("invite consent requires a direct-message home")
+        home_members = [
+            participant
+            for participant in self._chats[self.home_chat_uid]["participants"]
+            if participant.get("type") == "member"
+        ]
+        if home["type"] != "dm" or len(home_members) != 1 or home_members[0].get("role") != "owner":
+            raise RuntimeError("invite consent requires an owner-authenticated direct-message home")
         source = self.build_source(
             chat_id=self.home_chat_uid,
             chat_name=home["name"],
@@ -748,7 +753,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         if data.get("enabled") is not enabled:
             raise RuntimeError("agent invite consent response has an invalid shape")
 
-    async def resume_invite(self, context):
+    async def resume_invite(self, context, *, idempotency_key):
         triggered_at = datetime.fromisoformat(context["triggered_at"])
         age = datetime.now(timezone.utc) - triggered_at
         if age.total_seconds() >= 24 * 60 * 60:
@@ -756,26 +761,15 @@ class PlowChatAdapter(BasePlatformAdapter):
 
         chat_uid = context["source_chat_uid"]
         participant_uid = context["participant_uid"]
-        eligibility = await self._invite_api(
-            "GET",
-            f"/v1/chats/{chat_uid}/participants/{participant_uid}/invite-eligibility",
-        )
-        if eligibility.get("status") != "eligible":
-            return False
-        activation = await self._invite_api(
+        result = await self._invite_api(
             "POST",
-            "/v1/auth/activate",
-            body={"origin": "agent_invite", "provision_chat": True, "exclude_chat": chat_uid},
+            f"/v1/chats/{chat_uid}/participants/{participant_uid}/agent-invite",
+            body={"idempotency_key": idempotency_key},
         )
-        body = (
-            "Want a Plow of your own? Text "
-            f"Plow Activate: {activation['display_code']} to {activation['send_to']}. 🙂"
-        )
-        async with aiohttp.ClientSession() as http:
-            result = await self._post_message(http, chat_uid, {"body": body})
-        if not result.success:
-            raise RuntimeError(result.error or "invite delivery failed")
-        return True
+        status = result.get("status")
+        if status not in {"sent", "delivery_unknown", "ineligible"}:
+            raise RuntimeError("agent invite response has an invalid shape")
+        return status
 
     async def set_conversation_trusted(self, chat_uid, trusted):
         """Write trust through Plow and update cache only from its response."""
@@ -1591,10 +1585,15 @@ async def _handle_invite_consent(question, response):
     enabled = decision == "grant"
     await adapter.set_invite_consent(enabled)
     if enabled:
-        sent = await adapter.resume_invite(question.context)
-        if sent:
+        invite_status = await adapter.resume_invite(question.context, idempotency_key=question.id)
+        if invite_status == "sent":
             return DeferredQuestionResult.done(
                 "Absolutely — I sent the invite and I’ll offer them in situations like this from now on."
+            )
+        if invite_status == "delivery_unknown":
+            return DeferredQuestionResult.done(
+                "Absolutely — I’ll offer Plow invites in situations like this from now on. "
+                "I couldn’t confirm this invite’s delivery, so I didn’t send it twice."
             )
         return DeferredQuestionResult.done(
             "Absolutely — I’ll offer Plow invites in situations like this from now on."

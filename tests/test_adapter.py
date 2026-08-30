@@ -1930,19 +1930,20 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     ctx.llm.decision = decision
     module.register(ctx)
     consent: list[bool] = []
-    resumed: list[dict[str, Any]] = []
+    resumed: list[tuple[dict[str, Any], str]] = []
     adapter = _live_tool(module, monkeypatch, "_unused")
 
     async def persist(value: bool) -> None:
         consent.append(value)
 
-    async def resume(context: dict[str, Any]) -> bool:
-        resumed.append(context)
-        return True
+    async def resume(context: dict[str, Any], *, idempotency_key: str) -> str:
+        resumed.append((context, idempotency_key))
+        return "sent"
 
     monkeypatch.setattr(adapter, "set_invite_consent", persist, raising=False)
     monkeypatch.setattr(adapter, "resume_invite", resume, raising=False)
     question = SimpleNamespace(
+        id="dq_invite_1",
         question="Can I invite Taylor?",
         context={
             "source_chat_uid": "cht_b",
@@ -1956,7 +1957,7 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
 
     assert result.resolved is resolved
     assert consent == ([] if enabled is None else [enabled])
-    assert resumed == ([question.context] if enabled is True else [])
+    assert resumed == ([(question.context, question.id)] if enabled is True else [])
     if decision == "unclear":
         assert "Taylor" in result.question
     assert ctx.llm.calls[0]["json_schema"]["properties"]["decision"]["enum"] == [
@@ -1965,27 +1966,6 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     classifier_text = ctx.llm.calls[0]["input"][0]["text"]
     assert classifier_text == "Owner answer: Sure, sounds good"
     assert question.question not in classifier_text
-
-
-async def test_consent_is_not_enqueued_to_a_shared_group_home(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    ctx = _ToolContext()
-    module.register(ctx)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a", group=True), _chat("cht_b", group=True)])
-
-    async def api(_method: str, path: str, **_kwargs: Any) -> dict[str, Any]:
-        return {"enabled": None} if path.endswith("agent-invites") else {"status": "eligible"}
-
-    monkeypatch.setattr(adapter, "_invite_api", api)
-
-    with pytest.raises(RuntimeError, match="direct-message home"):
-        await adapter.enqueue_invite_consent(_invite_turn())
-
-    assert ctx.deferred_questions.enqueued == []
 
 
 async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
@@ -2032,6 +2012,14 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
         "dedupe_key": "agent-invites-opt-in",
     }]
 
+    for invalid_home in (_chat("cht_a", group=True), _chat("cht_a")):
+        if len(invalid_home["participants"]) == 2:
+            invalid_home["participants"][1]["role"] = "member"
+        adapter._chats["cht_a"] = invalid_home
+        with pytest.raises(RuntimeError, match="owner-authenticated direct-message home"):
+            await adapter.enqueue_invite_consent(turn)
+    assert len(ctx.deferred_questions.enqueued) == 1
+
 
 @pytest.mark.parametrize("resolved", [True, False])
 async def test_resolved_consent_never_checks_or_enqueues_eligibility(
@@ -2068,27 +2056,12 @@ async def test_only_fresh_approval_resumes_original_thread(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     api_calls: list[tuple[str, str, Any]] = []
-    sent: list[tuple[str, dict[str, Any]]] = []
 
     async def api(method: str, path: str, *, body: Any = None) -> dict[str, Any]:
         api_calls.append((method, path, body))
-        if path.endswith("invite-eligibility"):
-            return {"status": "eligible"}
-        return {"display_code": "ABC123", "send_to": "+15550000001"}
-
-    async def post(_http: Any, chat_uid: str, body: dict[str, Any]) -> _SendResult:
-        sent.append((chat_uid, body))
-        return _SendResult(success=True, message_id="msg_invite")
-
-    class _EmptyHTTP:
-        async def __aenter__(self) -> _EmptyHTTP:
-            return self
-
-        async def __aexit__(self, *_exc: object) -> None: ...
+        return {"status": "sent"}
 
     monkeypatch.setattr(adapter, "_invite_api", api)
-    monkeypatch.setattr(adapter, "_post_message", post)
-    monkeypatch.setattr(module.aiohttp, "ClientSession", _EmptyHTTP)
     context = {
         "source_chat_uid": "cht_b",
         "participant_uid": "cp_taylor",
@@ -2096,21 +2069,18 @@ async def test_only_fresh_approval_resumes_original_thread(
         "triggered_at": (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat(),
     }
 
-    resumed = await adapter.resume_invite(context)
+    resumed = await adapter.resume_invite(context, idempotency_key="dq_stable")
 
     if hours_old == 23:
-        assert resumed is True
-        assert [path for _method, path, _body in api_calls] == [
-            "/v1/chats/cht_b/participants/cp_taylor/invite-eligibility",
-            "/v1/auth/activate",
-        ]
-        assert sent == [("cht_b", {"body": (
-            "Want a Plow of your own? Text Plow Activate: ABC123 to +15550000001. 🙂"
-        )})]
+        assert resumed == "sent"
+        assert api_calls == [(
+            "POST",
+            "/v1/chats/cht_b/participants/cp_taylor/agent-invite",
+            {"idempotency_key": "dq_stable"},
+        )]
     else:
         assert resumed is False
         assert api_calls == []
-        assert sent == []
 
 
 @pytest.mark.parametrize("trusted", [True, False])
