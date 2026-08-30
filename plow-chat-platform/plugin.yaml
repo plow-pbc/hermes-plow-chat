@@ -8,6 +8,8 @@ description: >
   stream: chat membership comes from the credential's grants, not client-side
   configuration.
 author: Plow / Hermes Agent seed
+capabilities:
+  - gateway.platform_actions
 requires_env:
   - name: PLOW_AGENT_TOKEN
     description: "Chat-scoped agent bearer token minted by Plow"
