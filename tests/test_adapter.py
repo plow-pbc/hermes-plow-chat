@@ -2623,6 +2623,19 @@ async def test_start_group_thread_posts_the_v1_chats_contract_and_reports_adopti
     assert adapter._load_checkpoint("cht_new") is None
 
 
+async def test_a_malformed_create_response_raises_instead_of_degrading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A 2xx missing a required field must raise (the tool reports it as
+    delivery-unknown), never degrade into a null-valued success."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"created": True, "trusted": False})  # no uid
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    with pytest.raises(KeyError):
+        await adapter.start_group_thread(["+15550001111"], "hello", trusted=False)
+
+
 async def test_a_created_thread_off_the_grant_is_not_adopted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
