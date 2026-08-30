@@ -733,7 +733,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         record = _deferred_questions.enqueue(
             platform=PLATFORM_NAME,
             session_key=session_key,
-            chat_id=self.home_chat_uid,
+            delivery_source=(
+                dict(source) if isinstance(source, dict) else source.to_dict()
+            ),
             question=question,
             handler_name="invite-consent",
             context={

@@ -1984,7 +1984,13 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
     assert ctx.deferred_questions.enqueued == [{
         "platform": "plow_chat",
         "session_key": "agent:main:plow_chat:dm:cht_a",
-        "chat_id": "cht_a",
+        "delivery_source": {
+            "platform": "plow_chat",
+            "chat_id": "cht_a",
+            "chat_name": "Plow Chat",
+            "chat_type": "dm",
+            "role_authorized": True,
+        },
         "question": (
             "Hey! I noticed Taylor loves Plow and isn't a user yet. "
             "Can I send them a Plow invite—and do that in situations like this on your behalf? "
