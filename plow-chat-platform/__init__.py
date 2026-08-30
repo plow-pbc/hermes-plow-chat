@@ -945,6 +945,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         if not chat_id:
             data["adoption"] = "no-chat-id-in-response"
             return data
+        if not greet and not self._anchored_chats.get(chat_id):
+            if not self._checkpoint("", chat_id):
+                data["adoption"] = "delivered-unanchored: checkpoint"
+                return data
         try:
             await self._refresh_reach(http)
         except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly

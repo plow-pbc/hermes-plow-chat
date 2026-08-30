@@ -2649,6 +2649,19 @@ async def test_start_email_thread_preserves_message_id_when_reach_refresh_fails(
     assert data["chat_id"] == "cht_email"
     assert data["message_id"] == "msg_email"
     assert data["adoption"] == "failed: RuntimeError: reach failed"
+    assert adapter._anchored_chats.get("cht_email") is True
+    assert adapter._load_checkpoint("cht_email") is None
+
+    restarted = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    greetings: list[str] = []
+
+    async def send(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        greetings.append(content)
+        return _SendResult(success=True)
+
+    monkeypatch.setattr(restarted, "send", send)
+    await restarted._ensure_anchor("cht_email")
+    assert greetings == []
 
 
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
