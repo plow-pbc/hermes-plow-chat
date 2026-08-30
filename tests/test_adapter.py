@@ -2585,6 +2585,34 @@ async def test_start_email_thread_posts_line_endpoint_and_reports_adoption(
     assert adapter._load_checkpoint("cht_email") is None
 
 
+async def test_start_email_thread_preserves_message_id_when_reach_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    import json as jsonlib
+
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", agent_name="Elm")])
+
+    class _TextResp(_Resp):
+        async def text(self) -> str:
+            return jsonlib.dumps(self._payload)
+
+    class _SendHTTP(_HTTP):
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            return _TextResp({"chat_uid": "cht_email", "uid": "msg_email"})
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            raise RuntimeError("reach failed")
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
+    data = await adapter.start_email_thread(["owner@example.com"], [], "Quote", "Can you send the quote?")
+
+    assert data["chat_id"] == "cht_email"
+    assert data["message_id"] == "msg_email"
+    assert data["adoption"] == "failed: RuntimeError: reach failed"
+
+
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:

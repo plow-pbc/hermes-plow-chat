@@ -921,31 +921,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                     raise _PlowSendError(resp.status, text)
                 data = json.loads(text or "{}")
 
-            chat_id = data.get("chat_id")
-            if not chat_id:
-                data["adoption"] = "no-chat-id-in-response"
-                return data
-            try:
-                await self._refresh_reach(http)
-            except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
-                data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
-                return data
-            if chat_id not in self.chat_uids:
-                data["adoption"] = "not-on-this-agents-line"
-                return data
-            data["adoption"] = "adopted"
-            # The one deliberate exception to "only `_listen`'s per-connect
-            # loop calls this": that loop would eventually anchor this chat
-            # too, empty, on whatever reconnect comes next, but this call
-            # needs to know NOW, synchronously, whether the baseline
-            # actually landed -- `data["adoption"]` is this tool's honest
-            # answer to the caller. No `http` passed -- see `_ensure_anchor`
-            # for why empty, never the newest existing message, is always
-            # the right call here.
-            try:
-                await self._ensure_anchor(chat_id)
-            except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
-                data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
+            data = await self._finish_started_thread(http, data)
         return data
 
     async def start_email_thread(self, to, cc, subject, body):
@@ -963,25 +939,33 @@ class PlowChatAdapter(BasePlatformAdapter):
                     raise _PlowSendError(resp.status, text)
                 data = json.loads(text or "{}")
 
-            chat_id = data.get("chat_uid") or data.get("chat_id")
-            if not chat_id:
-                data["adoption"] = "no-chat-id-in-response"
-                return data
-            try:
-                await self._refresh_reach(http)
-            except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
-                data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
-                return data
-            if chat_id not in self.chat_uids:
-                data["adoption"] = "not-on-this-agents-line"
-                return data
-            data["adoption"] = "adopted"
-            data["chat_id"] = chat_id
-            data["message_id"] = data.get("uid") or data.get("message_id")
-            try:
-                await self._ensure_anchor(chat_id)
-            except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
-                data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
+            data = await self._finish_started_thread(http, data)
+        return data
+
+    async def _finish_started_thread(self, http, data):
+        chat_id = data.get("chat_uid") or data.get("chat_id")
+        data["chat_id"] = chat_id
+        data["message_id"] = data.get("uid") or data.get("message_id")
+        if not chat_id:
+            data["adoption"] = "no-chat-id-in-response"
+            return data
+        try:
+            await self._refresh_reach(http)
+        except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
+            data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
+            return data
+        if chat_id not in self.chat_uids:
+            data["adoption"] = "not-on-this-agents-line"
+            return data
+        data["adoption"] = "adopted"
+        # The one deliberate exception to "only `_listen`'s per-connect loop
+        # calls this": that loop would eventually anchor this chat too, empty,
+        # on whatever reconnect comes next, but the start-message tool needs to
+        # know NOW, synchronously, whether the baseline actually landed.
+        try:
+            await self._ensure_anchor(chat_id)
+        except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
+            data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
     async def _typing_until_reply(self, chat_uid):
@@ -1436,11 +1420,6 @@ def _normalize_email_addresses(addresses, *, field, required):
         raise ValueError(f"{field} must include at least one email address")
     if any("," in address for address in cleaned):
         raise ValueError(f"{field} entries may not contain commas; pass one email address per entry")
-    if any("@" not in address for address in cleaned):
-        raise ValueError(f"{field} includes an invalid email address")
-    folded = [address.casefold() for address in cleaned]
-    if len(folded) != len(set(folded)):
-        raise ValueError(f"{field} includes duplicates")
     return cleaned
 
 
