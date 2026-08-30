@@ -75,9 +75,10 @@ One person's rapid-fire messages are one turn: inbound is buffered per chat
 for a 2s window that resets on each arrival — iMessage's bubble + link-preview
 split, or a thought sent as two lines, reaches hermes as a single message
 instead of the second interrupting the first. A change of speaker closes the
-burst, so a group's order holds. The ack is the burst's last uid, so a restart
-mid-burst backfills the whole burst; a hand-off that fails is retried where it
-sits, with the rest of the chat waiting behind it.
+burst, and a slash-prefixed message closes it on both sides so commands remain
+distinct turns. The ack is the burst's last uid, so a restart mid-burst
+backfills the whole burst; a hand-off that fails is retried where it sits, with
+the rest of the chat waiting behind it.
 
 ### Trusted group conversations
 

@@ -328,7 +328,8 @@ _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 # intent into a text bubble and a link preview; people send a thought as two
 # lines. Each used to reach hermes as its own turn, the second interrupting
 # the first. 2s is what plow#442 measured for the bubble/preview split. A
-# change of speaker closes the burst, so a group's order is never reshuffled.
+# slash command or change of speaker closes the burst, so command semantics
+# and a group's order are never reshuffled.
 INBOUND_DEBOUNCE_SECONDS = 2.0
 HAND_OFF_RETRY_SECONDS = 5.0
 
@@ -1104,7 +1105,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             _Inbound(
                 uid,
                 sender,
-                str(msg["body"] or "").startswith("/"),
+                msg["body"].startswith("/"),
                 asyncio.create_task(_resolve_parts(msg)),
             )
         )
