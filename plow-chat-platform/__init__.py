@@ -93,17 +93,14 @@ def _agent_name(chat):
     of the listing readers: a pre-persona server omits `line`, and an unnamed
     line omits `display_name`.
     """
-    for participant in chat.get("participants") or []:
-        if participant.get("type") == "agent" and participant.get("relationship") in (None, "self"):
-            return (participant.get("line") or {}).get("display_name") or None
-    return None
+    return _agent_line(chat).get("display_name") or None
 
 
-def _agent_line_uid(chat):
+def _agent_line(chat):
     for participant in chat.get("participants") or []:
         if participant.get("type") == "agent" and participant.get("relationship") in (None, "self"):
-            return (participant.get("line") or {}).get("uid")
-    return None
+            return participant.get("line") or {}
+    return {}
 
 
 def _represented_member(chat, agent):
@@ -438,7 +435,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
         self._active_turn = _ACTIVE_TURN
-        self.line_uid = None
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -503,7 +499,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             self._cancel_typing(chat_uid)
         self.home_chat_uid = next_home
         self._chats = next_chats
-        self.line_uid = _agent_line_uid(next_chats[next_home])
         self.chat_uids = frozenset(next_chats)
         self._anchored_chats = {
             chat_uid: self._checkpoint_path(chat_uid).exists()
@@ -926,11 +921,12 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def start_email_thread(self, to, cc, subject, body):
         """POST a new Plow/Gmail line thread, then refresh reach so we listen to it."""
-        if not self.line_uid:
+        line_uid = _agent_line(self._chats[self.home_chat_uid]).get("uid")
+        if not line_uid:
             raise _PlowPreflightError("home line has not been discovered; nothing was sent")
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"{BASE}/v1/email-lines/{self.line_uid}/messages",
+                f"{BASE}/v1/email-lines/{line_uid}/messages",
                 json={"to": to, "cc": cc, "subject": subject, "body": body},
                 headers=self.auth,
             ) as resp:

@@ -2349,7 +2349,7 @@ def test_email_message_requires_discovered_home_line(monkeypatch: pytest.MonkeyP
         "dry_run": False,
         "confirm": True,
     }))
-    assert adapter.line_uid is None
+    assert module._agent_line(adapter._chats[adapter.home_chat_uid]) == {}
     assert out["success"] is False
     assert "home line" in out["error"]
 
