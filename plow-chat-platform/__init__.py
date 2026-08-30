@@ -1594,7 +1594,7 @@ def _plow_send_invite(args, **_kwargs):
     except Exception as exc:  # noqa: BLE001 - never echo an API body containing trusted values
         return json.dumps({
             "success": False,
-            "error": f"could not confirm invite delivery ({type(exc).__name__}); do not retry this turn",
+            "error": f"could not confirm invite delivery ({type(exc).__name__})",
         })
     return json.dumps({"success": True, "status": sent["status"]})
 

@@ -1885,6 +1885,24 @@ def test_send_invite_tool_returns_only_status(
     assert calls == [("agi_ready", args["message_template"])]
 
 
+def test_send_invite_tool_leaves_retry_decision_to_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send_invite", raises=RuntimeError("HTTP 503"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_send_invite({
+        "opportunity_id": "agi_ready",
+        "message_template": "Text {{activation_code}} to {{destination}}.",
+    }))
+
+    assert out["success"] is False
+    assert "could not confirm invite delivery" in out["error"]
+    assert "do not retry" not in out["error"].lower()
+
+
 def test_member_turn_can_send_fixed_invite_consent_notification_to_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
