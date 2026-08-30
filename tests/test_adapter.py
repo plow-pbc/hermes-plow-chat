@@ -1648,7 +1648,7 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
         "plow_set_conversation_trusted",
-        "plow_notify_owner_about_invite",
+        "plow_offer_invite",
     ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
@@ -1660,45 +1660,13 @@ def test_group_send_tool_registers(monkeypatch: pytest.MonkeyPatch, tmp_path: pa
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
     invite_tool = ctx.tools[2]
-    assert invite_tool["schema"]["name"] == "plow_notify_owner_about_invite"
+    assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": ["consent_request", "invite_created"],
-            },
-        },
-        "required": ["kind"],
+        "properties": {},
         "additionalProperties": False,
     }
     assert invite_tool["requires_env"] == ["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"]
-
-
-async def test_invite_notification_posts_fixed_body_to_home(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a"), _chat("cht_b", name="Friends", group=True)])
-    http = _HTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
-
-    result = await adapter.notify_owner_about_invite({
-        "chat_uid": "cht_b",
-        "owner": False,
-        "user_name": "Taylor",
-        "chat_name": "Friends (cht_b)",
-        "text": "attacker-controlled text that must not cross chats",
-    })
-
-    assert result.success
-    assert http.posts == [
-        (f"{module.BASE}/v1/chats/cht_a/messages", {
-            "body": "Invite created for someone in Plow chat cht_b."
-        })
-    ]
 
 
 def _live_tool(
@@ -1734,12 +1702,13 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "owner": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
+        "source_message_id": "msg_delight_1",
         "triggered_at": "2026-08-29T12:00:00+00:00",
         **overrides,
     }
 
 
-def test_member_turn_can_enqueue_fixed_invite_consent_question(
+def test_member_turn_can_start_fixed_invite_workflow(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1748,20 +1717,20 @@ def test_member_turn_can_enqueue_fixed_invite_consent_question(
     _live_tool(
         module,
         monkeypatch,
-        "enqueue_invite_consent",
+        "offer_invite",
         result={"question_id": "dq_notice"},
         record=calls,
     )
     turn = _invite_turn()
     module._ACTIVE_TURN.set(turn)
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    out = json.loads(module._plow_offer_invite({}))
 
     assert out == {"success": True, "question_id": "dq_notice"}
     assert calls == [(turn,)]
 
 
-def test_invite_owner_notification_is_attempted_once_per_turn(
+def test_invite_workflow_is_attempted_once_per_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1770,15 +1739,15 @@ def test_invite_owner_notification_is_attempted_once_per_turn(
     _live_tool(
         module,
         monkeypatch,
-        "enqueue_invite_consent",
+        "offer_invite",
         result={"question_id": "dq_notice"},
         record=calls,
     )
     turn = _invite_turn()
     module._ACTIVE_TURN.set(turn)
 
-    first = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
-    second = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    first = json.loads(module._plow_offer_invite({}))
+    second = json.loads(module._plow_offer_invite({}))
 
     assert first["success"] is True
     assert second["success"] is False
@@ -1787,32 +1756,32 @@ def test_invite_owner_notification_is_attempted_once_per_turn(
 
 
 @pytest.mark.parametrize(
-    ("turn", "kind", "error"),
+    ("turn", "args", "error"),
     [
-        pytest.param(None, "consent_request", "active Plow Chat turn", id="outside-turn"),
-        pytest.param({"chat_uid": "cht_a", "owner": True}, "consent_request", "non-owner", id="owner-turn"),
-        pytest.param({"chat_uid": "cht_b", "owner": False}, "other", "kind", id="unknown-kind"),
+        pytest.param(None, {}, "active Plow Chat turn", id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": True}, {}, "non-owner", id="owner-turn"),
+        pytest.param({"chat_uid": "cht_b", "owner": False}, {"text": "attacker"}, "no arguments", id="arguments"),
     ],
 )
 def test_invite_owner_notification_refuses_wrong_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     turn: dict[str, Any] | None,
-    kind: str,
+    args: dict[str, Any],
     error: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "notify_owner_about_invite",
+    _live_tool(module, monkeypatch, "offer_invite",
                raises=AssertionError("must not send"))
     module._ACTIVE_TURN.set(turn)
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": kind}))
+    out = json.loads(module._plow_offer_invite(args))
 
     assert out["success"] is False
     assert error.lower() in out["error"].lower()
 
 
-def test_invite_owner_notification_reports_delivery_failure(
+def test_invite_workflow_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1820,12 +1789,12 @@ def test_invite_owner_notification_reports_delivery_failure(
     _live_tool(
         module,
         monkeypatch,
-        "enqueue_invite_consent",
+        "offer_invite",
         raises=RuntimeError("HTTP 503"),
     )
     module._ACTIVE_TURN.set(_invite_turn())
 
-    out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
+    out = json.loads(module._plow_offer_invite({}))
 
     assert out["success"] is False
     assert "may or may not" in out["error"]
@@ -1835,7 +1804,12 @@ def test_invite_owner_notification_reports_delivery_failure(
 @pytest.mark.parametrize(
     ("participant", "source_uid", "expected"),
     [
-        pytest.param(None, "missing", {"chat_uid": "cht_b", "owner": False}, id="missing-participant"),
+        pytest.param(
+            None,
+            "missing",
+            {"chat_uid": "cht_b", "owner": False, "source_message_id": "msg_delight_1"},
+            id="missing-participant",
+        ),
         pytest.param(
             {
                 "type": "member",
@@ -1879,6 +1853,7 @@ async def test_active_turn_retains_only_server_invite_identity(
         adapter._chats["cht_b"] = _chat("cht_b", group=True)
         adapter._chats["cht_b"]["participants"].append(participant)
     event = SimpleNamespace(
+        message_id="msg_delight_1",
         source=SimpleNamespace(
             chat_id="cht_b",
             role_authorized=False,
@@ -1961,7 +1936,7 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     assert question.question not in classifier_text
 
 
-async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
+async def test_offer_checks_consent_and_eligibility_before_fixed_question(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1979,7 +1954,7 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
     monkeypatch.setattr(adapter, "_invite_api", api)
     turn = _invite_turn()
 
-    result = await adapter.enqueue_invite_consent(turn)
+    result = await adapter.offer_invite(turn)
 
     assert result == {"question_id": "dq_1"}
     assert calls == [
@@ -2005,6 +1980,7 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
             "source_chat_uid": "cht_b",
             "participant_uid": "cp_taylor",
             "participant_identity": "Taylor",
+            "source_message_id": "msg_delight_1",
             "triggered_at": "2026-08-29T12:00:00+00:00",
         },
         "dedupe_key": "agent-invites-opt-in",
@@ -2015,31 +1991,39 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
             invalid_home["participants"][1]["role"] = "member"
         adapter._chats["cht_a"] = invalid_home
         with pytest.raises(RuntimeError, match="owner-authenticated direct-message home"):
-            await adapter.enqueue_invite_consent(turn)
+            await adapter.offer_invite(turn)
     assert len(ctx.deferred_questions.enqueued) == 1
 
 
-@pytest.mark.parametrize("resolved", [True, False])
-async def test_resolved_consent_never_checks_or_enqueues_eligibility(
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_resolved_consent_sends_once_or_stays_declined(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
-    resolved: bool,
+    enabled: bool,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     ctx = _ToolContext()
     module.register(ctx)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    calls: list[str] = []
+    calls: list[tuple[str, str, Any]] = []
 
-    async def api(_method: str, path: str, **_kwargs: Any) -> dict[str, Any]:
-        calls.append(path)
-        return {"enabled": resolved}
+    async def api(method: str, path: str, *, body: Any = None) -> dict[str, Any]:
+        calls.append((method, path, body))
+        return {"enabled": enabled} if path == "/v1/auth/agent-invites" else {"status": "sent"}
 
     monkeypatch.setattr(adapter, "_invite_api", api)
-    result = await adapter.enqueue_invite_consent(_invite_turn())
+    result = await adapter.offer_invite(_invite_turn())
 
-    assert result == {"skipped": "consent_already_resolved"}
-    assert calls == ["/v1/auth/agent-invites"]
+    assert calls[0] == ("GET", "/v1/auth/agent-invites", None)
+    if enabled:
+        assert result == {"invite_status": "sent"}
+        assert calls[1][0:2] == ("POST", "/v1/chats/cht_b/participants/cp_taylor/agent-invite")
+        operation_key = calls[1][2]["idempotency_key"]
+        assert operation_key.startswith("delight:")
+        assert len(operation_key) == len("delight:") + 64
+    else:
+        assert result == {"skipped": "consent_declined"}
+        assert len(calls) == 1
     assert ctx.deferred_questions.enqueued == []
 
 
