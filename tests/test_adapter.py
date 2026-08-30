@@ -2307,13 +2307,17 @@ async def test_home_line_uid_raises_when_the_home_chat_has_no_agent_line(
 
 
 def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The dry run is what the owner approves, so it must show whether the new
+    thread would be a trusted line."""
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("dry run must not reach the API"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi"}))
+        {"recipients": ["+15550001111"], "body": "hi", "trusted": True}))
     assert out["success"] is True and out["dry_run"] is True
     assert out["would_send"]["recipient_count"] == 1
+    assert out["would_send"]["trusted"] is True
 
 
 @pytest.mark.parametrize("recipients,message", [
@@ -2384,6 +2388,7 @@ def test_group_message_reports_adoption_separately_from_delivery(
     """A thread nobody is listening to is the bug this tool shipped with, so
     delivery must not read as reachability."""
     module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
     _live_tool(
         module,
         monkeypatch,
@@ -2391,42 +2396,43 @@ def test_group_message_reports_adoption_separately_from_delivery(
         result={
             "chat_id": "cht_new",
             "created": True,
-            "trusted": False,
+            "trusted": True,
             "adoption": "not-on-this-agents-line",
         },
+        record=sent,
     )
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
-    assert out["success"] is True
-    assert out["chat_id"] == "cht_new" and out["created"] is True
-    assert out["adoption"] == "not-on-this-agents-line"
-
-
-def test_dry_run_echoes_trusted(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    """The dry run is what the owner approves, so it must show whether the new
-    thread would be a trusted line."""
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread",
-               raises=AssertionError("dry run must not reach the API"))
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi", "trusted": True}))
-    assert out["success"] is True and out["dry_run"] is True
-    assert out["would_send"]["trusted"] is True
-
-
-def test_confirmed_send_passes_trusted_through(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    sent: list[Any] = []
-    _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_n", "trusted": True, "adoption": "adopted"},
-               record=sent)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": True}))
+    assert out["success"] is True
+    assert out["chat_id"] == "cht_new" and out["created"] is True
     assert sent == [(["+15550001111"], "hi", True)]
     assert out["trusted"] is True
+    assert out["adoption"] == "not-on-this-agents-line"
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        pytest.param(None, id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": False}, id="member-turn"),
+    ],
+)
+def test_only_an_owner_turn_can_start_a_trusted_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None
+) -> None:
+    """Trust hands the new participants the owner's agent — a member of a
+    trusted group must not be able to mint themselves a fresh trusted line."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=AssertionError("must not send"))
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": True}))
+    assert out["success"] is False
+    assert "owner" in out["error"] and "nothing was sent" in out["error"]
 
 
 @pytest.mark.parametrize("trusted", ["tru", "maybe", None, "false"])

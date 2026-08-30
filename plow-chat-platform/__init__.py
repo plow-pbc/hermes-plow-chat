@@ -87,6 +87,14 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _self_agent_line(chat):
+    """The self agent participant's line dict, {} when the roster lacks one."""
+    agent = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "agent"
+                  and p.get("relationship") in (None, "self")), {})
+    return agent.get("line") or {}
+
+
 def _agent_name(chat):
     """The line's persona name ("Elm"), or None for an unnamed line.
 
@@ -98,10 +106,7 @@ def _agent_name(chat):
     of the listing readers: a pre-persona server omits `line`, and an unnamed
     line omits `display_name`.
     """
-    for participant in chat.get("participants") or []:
-        if participant.get("type") == "agent" and participant.get("relationship") in (None, "self"):
-            return (participant.get("line") or {}).get("display_name") or None
-    return None
+    return _self_agent_line(chat).get("display_name") or None
 
 
 def _represented_member(chat, agent):
@@ -915,14 +920,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
-                resource = json.loads(text or "{}")
+                resource = json.loads(text)
 
-            chat_id = resource.get("uid")
-            data = {"chat_id": chat_id, "created": resource.get("created"),
-                    "trusted": resource.get("trusted")}
-            if not chat_id:
-                data["adoption"] = "no-chat-id-in-response"
-                return data
+            # Required response fields, read strictly: a malformed 2xx raises
+            # here and reports as delivery-unknown rather than a null-valued
+            # "success" nobody can act on.
+            chat_id = resource["uid"]
+            data = {"chat_id": chat_id, "created": resource["created"],
+                    "trusted": resource["trusted"]}
             try:
                 await self._refresh_reach(http)
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
@@ -984,11 +989,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         sibling agent's.
         """
         def _line_uid():
-            for participant in self._chats.get(self.home_chat_uid, {}).get("participants") or []:
-                if (participant.get("type") == "agent"
-                        and participant.get("relationship") in (None, "self")):
-                    return (participant.get("line") or {}).get("uid")
-            return None
+            return _self_agent_line(self._chats.get(self.home_chat_uid, {})).get("uid")
 
         line = _line_uid()
         if not line:
@@ -1443,6 +1444,15 @@ def _plow_start_group_message(args, **_kwargs):
         return json.dumps({"success": False, "error": str(exc)})
     if not body:
         return json.dumps({"success": False, "error": "body is required"})
+    if trusted:
+        # Trust hands the new participants the owner's agent — only the owner
+        # grants it, same rule as plow_set_conversation_trusted. Checked before
+        # the dry-run branch so a non-owner never even previews a trusted send.
+        turn = _ACTIVE_TURN.get()
+        if turn is None or not turn["owner"]:
+            return json.dumps({"success": False,
+                               "error": "only the agent owner can start a trusted "
+                                        "thread; nothing was sent"})
     # A caller that asked to send and forgot confirm sent nothing, and must not
     # read back as a dry run it did not request: "success": true on an unasked dry
     # run is how the agent comes to report an undelivered message as sent.
