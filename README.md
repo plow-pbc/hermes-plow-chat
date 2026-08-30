@@ -21,14 +21,15 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> This plugin also requires a Hermes host that exposes
-> `ctx.deferred_questions` and a Plow API that serves the agent-invite consent,
+> This plugin also requires a Plow API that serves the agent-invite consent,
 > participant-eligibility, and
 > `/v1/chats/{chat_uid}/participants/{participant_uid}/agent-invite` delivery
-> routes. Deploy those two dependencies first,
+> routes. Hermes hosts without deferred-question support still run Plow Chat and
+> standing-consent invites, but skip the ask-owner-first invite flow. Deploy the
+> API first,
 > then land the `agent-mgr` support above, and only then bump
-> `runtime/plow-chat-plugin.ref`. Installing this plugin before either API is
-> available fails loudly instead of silently skipping consent.
+> `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
+> available fails loudly instead of silently skipping delivery.
 
 ## Who consumes this
 
