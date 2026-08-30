@@ -732,7 +732,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             "You'll both get $100 in free API credits. 🙂"
         )
         record = _deferred_questions.enqueue(
-            platform=PLATFORM_NAME,
             session_key=session_key,
             delivery_source=source_data,
             question=question,

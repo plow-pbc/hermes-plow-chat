@@ -1987,7 +1987,6 @@ async def test_enqueue_checks_consent_and_eligibility_before_fixed_question(
         ("GET", "/v1/chats/cht_b/participants/cp_taylor/invite-eligibility"),
     ]
     assert ctx.deferred_questions.enqueued == [{
-        "platform": "plow_chat",
         "session_key": "agent:main:plow_chat:dm:cht_a",
         "delivery_source": {
             "platform": "plow_chat",
