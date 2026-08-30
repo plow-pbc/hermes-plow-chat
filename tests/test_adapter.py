@@ -1860,9 +1860,22 @@ def test_prepare_invite_tool_uses_only_active_turn_authority(
     assert calls == [(turn,)]
 
 
-def test_send_invite_tool_returns_only_status(
+@pytest.mark.parametrize(
+    ("raises", "expected"),
+    [
+        pytest.param(None, {"success": True, "status": "sent"}, id="sent"),
+        pytest.param(
+            RuntimeError("HTTP 503"),
+            {"success": False, "error": "could not confirm invite delivery (RuntimeError)"},
+            id="transport-failure",
+        ),
+    ],
+)
+def test_send_invite_tool_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    raises: Exception | None,
+    expected: dict[str, Any],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     calls: list[tuple[str, str]] = []
@@ -1871,6 +1884,7 @@ def test_send_invite_tool_returns_only_status(
         monkeypatch,
         "send_invite",
         result={"status": "sent", "display_code": "MUST_NOT_ESCAPE", "destination": "+16505551212"},
+        raises=raises,
         record=calls,
     )
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
@@ -1881,26 +1895,8 @@ def test_send_invite_tool_returns_only_status(
 
     out = json.loads(module._plow_send_invite(args))
 
-    assert out == {"success": True, "status": "sent"}
+    assert out == expected
     assert calls == [("agi_ready", args["message_template"])]
-
-
-def test_send_invite_tool_leaves_retry_decision_to_server(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "send_invite", raises=RuntimeError("HTTP 503"))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
-
-    out = json.loads(module._plow_send_invite({
-        "opportunity_id": "agi_ready",
-        "message_template": "Text {{activation_code}} to {{destination}}.",
-    }))
-
-    assert out["success"] is False
-    assert "could not confirm invite delivery" in out["error"]
-    assert "do not retry" not in out["error"].lower()
 
 
 def test_member_turn_can_send_fixed_invite_consent_notification_to_owner(
