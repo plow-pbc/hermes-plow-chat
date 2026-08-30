@@ -892,33 +892,31 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, **_kwargs):
         return await self._send_attachment(chat_id, file_path, caption=caption, filename=file_name)
 
-    async def start_group_thread(self, thread_handle, body):
-        """POST a new Plow/Linq thread, then refresh reach so we listen to it.
+    async def start_group_thread(self, members, body, trusted=False):
+        """POST /v1/chats to create (or resume) a thread, then refresh reach so
+        we listen to it.
 
         On the adapter, and on its loop, so it uses the same base URL and token
         as every other call. Reach is refreshed rather than adopting the
         returned id directly: the grant is the authority, so a response naming
         a sibling agent's thread cannot make this gateway listen there.
-
-        The endpoint is unversioned on purpose. Every *documented* Plow
-        endpoint is under /v1 and the docs describe no thread-creation call at
-        all — but this one exists and routes: a live call reached it and came
-        back 422 with a semantic complaint about the phone number, which a
-        wrong path answers 404. Do not "correct" it to /v1 without a 2xx from
-        the versioned path.
         """
+        line_uid = await self._home_line_uid()
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"{BASE}/channels/linq/send",
-                json={"thread_handle": thread_handle, "text": body},
+                f"{BASE}/v1/chats",
+                json={"line_uid": line_uid, "members": members,
+                      "body": body, "trusted": trusted},
                 headers=self.auth,
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
-                data = json.loads(text or "{}")
+                resource = json.loads(text or "{}")
 
-            chat_id = data.get("chat_id")
+            chat_id = resource.get("uid")
+            data = {"chat_id": chat_id, "created": resource.get("created"),
+                    "trusted": resource.get("trusted")}
             if not chat_id:
                 data["adoption"] = "no-chat-id-in-response"
                 return data
@@ -1390,25 +1388,21 @@ def _flag(value, *, default, safe):
     return safe
 
 
-def _normalize_thread_handle(recipients):
-    """Build the Plow/Linq recipient handle.
+def _normalize_members(recipients):
+    """The cleaned member list for POST /v1/chats. Kept out of logs — phones are PII.
 
-    For a new iMessage group the handle is the comma-separated list of participant
-    addresses. The value is kept out of logs because phone numbers are PII.
+    Members stay a list end-to-end now, so the comma check is a malformed-entry
+    guard rather than a delimiter rule: one array element carrying two addresses
+    would be approved as one recipient and delivered to two.
     """
     cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
     if not cleaned:
         raise ValueError("Provide at least one recipient")
-    # The comma is the delimiter, so a recipient containing one is not a recipient
-    # — it is two, smuggled through as a single array element. The dry run would
-    # count it as one and report one, and the confirmed send would then reach an
-    # address the operator never approved. Reject rather than split: an element
-    # with a comma in it is malformed either way.
     if any("," in r for r in cleaned):
         raise ValueError("A recipient may not contain a comma — pass one address per entry")
     if len(cleaned) != len(set(cleaned)):
         raise ValueError("Recipients include duplicates")
-    return ",".join(cleaned)
+    return cleaned
 
 
 def _plow_start_group_message(args, **_kwargs):
@@ -1428,7 +1422,7 @@ def _plow_start_group_message(args, **_kwargs):
     dry_run = _flag(args.get("dry_run"), default=True, safe=True)
     confirm = _flag(args.get("confirm"), default=False, safe=False)
     try:
-        thread_handle = _normalize_thread_handle(recipients)
+        members = _normalize_members(recipients)
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
     if not body:
@@ -1444,9 +1438,9 @@ def _plow_start_group_message(args, **_kwargs):
             "success": True,
             "dry_run": True,
             "would_send": {
-                # From the validated handle, so the reported count can never
+                # From the validated list, so the reported count can never
                 # desync from the recipient set a confirmed send would use.
-                "recipient_count": len(thread_handle.split(",")),
+                "recipient_count": len(members),
                 "body": body,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "
@@ -1461,7 +1455,7 @@ def _plow_start_group_message(args, **_kwargs):
     adapter, loop = _live
     try:
         data = asyncio.run_coroutine_threadsafe(
-            adapter.start_group_thread(thread_handle, body), loop).result(timeout=45)
+            adapter.start_group_thread(members, body), loop).result(timeout=45)
     except _PlowSendError as exc:
         if exc.status >= 500:
             # A 5xx is usually a proxy or gateway speaking, not Plow — it can
@@ -1491,10 +1485,9 @@ def _plow_start_group_message(args, **_kwargs):
     # tool shipped with, so delivery must not read as reachability.
     return json.dumps({
         "success": True,
-        "thread_handle": data.get("thread_handle"),
-        "message_id": data.get("message_id"),
         "chat_id": data.get("chat_id"),
-        "delivery_status": data.get("delivery_status"),
+        "created": data.get("created"),
+        "trusted": data.get("trusted"),
         "adoption": data.get("adoption"),
     })
 
