@@ -901,7 +901,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         returned id directly: the grant is the authority, so a response naming
         a sibling agent's thread cannot make this gateway listen there.
         """
-        line_uid = await self._home_line_uid()
+        try:
+            line_uid = await self._home_line_uid()
+        except Exception as exc:
+            raise _PlowPreflightError(f"{type(exc).__name__}: {exc}") from exc
         async with aiohttp.ClientSession() as http:
             async with http.post(
                 f"{BASE}/v1/chats",
@@ -1366,6 +1369,16 @@ class _PlowSendError(Exception):
         self.detail = detail
 
 
+class _PlowPreflightError(Exception):
+    """A failure before the create POST was ever issued.
+
+    Distinct from the generic post-POST bucket because it is definitive:
+    nothing was sent, there is no thread to check, and retrying after the
+    underlying problem is fixed is safe — the opposite of what the
+    delivery-unknown message tells the model.
+    """
+
+
 def _flag(value, *, default, safe):
     """A tool argument read as a boolean, tolerating the strings models emit.
 
@@ -1474,6 +1487,13 @@ def _plow_start_group_message(args, **_kwargs):
                          f"was accepted. Do NOT retry; check the thread.",
             })
         return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except _PlowPreflightError as exc:
+        # Failed before the POST was issued: definitive, and safe to retry once
+        # the underlying problem is fixed — the delivery-unknown message below
+        # would wrongly forbid that.
+        return json.dumps({"success": False,
+                           "error": f"could not resolve this agent's line ({exc}); "
+                                    "nothing was sent"})
     except Exception as exc:
         # No answer. A timeout or dropped connection says nothing about whether
         # Plow committed the POST, so reporting an ordinary failure invites a

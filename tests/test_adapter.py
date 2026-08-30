@@ -2436,11 +2436,13 @@ def test_confirmed_send_passes_trusted_through(
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
-    json.loads(module._plow_start_group_message(
+               result={"chat_id": "cht_n", "trusted": True, "adoption": "adopted"},
+               record=sent)
+    out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": True}))
     assert sent == [(["+15550001111"], "hi", True)]
+    assert out["trusted"] is True
 
 
 @pytest.mark.parametrize("trusted", ["tru", "maybe", None, "false"])
@@ -2665,6 +2667,32 @@ async def test_a_failed_reach_refresh_after_create_reports_adoption_failed(
     data = await adapter.start_group_thread(["+15550001111"], "hello")
     assert data["chat_id"] == "cht_new"
     assert data["adoption"].startswith("failed:")
+
+
+async def test_a_missing_home_line_is_a_definitive_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failure before the create POST means nothing was sent, so it must not
+    surface through the post-POST delivery-unknown path."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))  # empty home roster
+    with pytest.raises(module._PlowPreflightError):
+        await adapter.start_group_thread(["+15550001111"], "hello")
+
+
+def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=module._PlowPreflightError("RuntimeError: home chat has no agent line"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False
+    assert "nothing was sent" in out["error"]
+    assert "delivery_unknown" not in out
 
 
 async def test_start_group_thread_raises_plow_send_error_on_4xx(
