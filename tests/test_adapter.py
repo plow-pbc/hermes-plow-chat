@@ -576,32 +576,42 @@ async def test_media_queued_behind_a_stalled_hand_off_fetches_on_arrival(
 
 
 @pytest.mark.parametrize(
-    "second_role,turns",
+    "second_role,bodies,turns",
     [
-        ("owner", [("msg_2", "msg_1\n\nmsg_2")]),
-        ("member", [("msg_1", "msg_1"), ("msg_2", "msg_2")]),
+        ("owner", ("msg_1", "msg_2"), [("msg_2", "msg_1\n\nmsg_2")]),
+        ("member", ("msg_1", "msg_2"), [("msg_1", "msg_1"), ("msg_2", "msg_2")]),
+        ("owner", ("/approve", "follow up"), [("msg_1", "/approve"), ("msg_2", "follow up")]),
+        ("owner", ("follow up", "/approve"), [("msg_1", "follow up"), ("msg_2", "/approve")]),
     ],
-    ids=["same sender -> one turn", "another sender -> its own turn"],
+    ids=[
+        "same sender -> one turn",
+        "another sender -> its own turn",
+        "command then text",
+        "text then command",
+    ],
 )
-async def test_a_burst_from_one_sender_is_one_turn(
+async def test_inbound_burst_boundaries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     second_role: str,
+    bodies: tuple[str, str],
     turns: list[tuple[str, str]],
 ) -> None:
-    """iMessage splits one intent into bubble + link preview; a person sends
-    two lines in a row. Both used to reach hermes as separate turns — the
-    second interrupting the first. Inside the window they are one turn whose
-    ack is the LAST uid, so a restart mid-burst backfills the whole burst."""
+    """Ordinary same-sender text coalesces, while speaker and slash-command
+    boundaries preserve individual turns and ordered acknowledgement."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a", group=True)])
     _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
     module.INBOUND_DEBOUNCE_SECONDS = 0.05
-    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1"))
-    await adapter._on_frame(_envelope("evt_2", "cht_a", "msg_2", role=second_role))
-    await adapter._on_frame(_envelope("evt_2_again", "cht_a", "msg_2", role=second_role))
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body=bodies[0]))
+    await adapter._on_frame(
+        _envelope("evt_2", "cht_a", "msg_2", role=second_role, body=bodies[1])
+    )
+    await adapter._on_frame(
+        _envelope("evt_2_again", "cht_a", "msg_2", role=second_role, body=bodies[1])
+    )
     await _settle(adapter)
 
     assert [(event["message_id"], event["text"]) for event in handled] == turns

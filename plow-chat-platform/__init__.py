@@ -347,7 +347,8 @@ _live = None  # tuple[PlowChatAdapter, asyncio.AbstractEventLoop] | None
 # intent into a text bubble and a link preview; people send a thought as two
 # lines. Each used to reach hermes as its own turn, the second interrupting
 # the first. 2s is what plow#442 measured for the bubble/preview split. A
-# change of speaker closes the burst, so a group's order is never reshuffled.
+# slash command or change of speaker closes the burst, so command semantics
+# and a group's order are never reshuffled.
 INBOUND_DEBOUNCE_SECONDS = 2.0
 HAND_OFF_RETRY_SECONDS = 5.0
 
@@ -363,6 +364,7 @@ def _server_died(task):
 class _Inbound:
     uid: str
     sender: dict
+    starts_slash_command: bool
     resolved: asyncio.Task                   # of _resolve_parts: begun on arrival, awaited by the burst
 
 
@@ -1225,7 +1227,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             self._inbound[chat_uid] = (queue, server)
         # The fetch starts now, inside the signed urls' five minutes, whatever
         # is retrying ahead of this message; the burst awaits it once it closes.
-        self._inbound[chat_uid][0].put_nowait(_Inbound(uid, sender, asyncio.create_task(_resolve_parts(msg))))
+        self._inbound[chat_uid][0].put_nowait(
+            _Inbound(
+                uid,
+                sender,
+                msg["body"].startswith("/"),
+                asyncio.create_task(_resolve_parts(msg)),
+            )
+        )
         # Seen at enqueue: queued, in flight or delivered, a second copy is the
         # same overlap. The durable ack is the checkpoint, written after the
         # hand-off; a replacement adapter starts with an empty `_seen` and its
@@ -1246,8 +1255,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                     nxt = await asyncio.wait_for(queue.get(), INBOUND_DEBOUNCE_SECONDS)
                 except asyncio.TimeoutError:
                     break
-                if _sender_key(nxt.sender) != _sender_key(burst[0].sender):
-                    carry = nxt              # another voice: what came before goes first
+                if (
+                    _sender_key(nxt.sender) != _sender_key(burst[0].sender)
+                    or burst[0].starts_slash_command
+                    or nxt.starts_slash_command
+                ):
+                    # Another voice or a command boundary: what came before
+                    # goes first, and the next message starts its own burst.
+                    carry = nxt
                     break
                 burst.append(nxt)
             resolved = [await m.resolved for m in burst]
