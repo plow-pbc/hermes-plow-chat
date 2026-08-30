@@ -6,7 +6,6 @@ See HERMES_INTEGRATION.md for deployment and protocol constraints.
 import asyncio
 import contextvars
 import dataclasses
-import hashlib
 import json
 import logging
 import mimetypes
@@ -35,6 +34,12 @@ from gateway.session import build_session_key
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 PLATFORM_NAME = "plow_chat"
+def _invite_message_template(owner_name):
+    return (
+        f"Love that you love Plow! {owner_name} gave me permission to share an invite. "
+        "Text Plow Activate: {{activation_code}} to {{destination}} to get early access! "
+        "You both will get $100 in cloud credits."
+    )
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -692,31 +697,31 @@ class PlowChatAdapter(BasePlatformAdapter):
         if any(not turn.get(field) for field in required):
             raise RuntimeError("the active turn has no server participant identity")
 
-        consent = await self._invite_api("GET", "/v1/auth/agent-invites")
-        enabled = consent.get("enabled")
-        if enabled is False:
-            return {"skipped": "consent_declined"}
-        if enabled is True:
-            operation_material = ":".join((turn["chat_uid"], turn["participant_uid"], turn["source_message_id"]))
-            operation_key = "delight:" + hashlib.sha256(operation_material.encode()).hexdigest()
-            status = await self.resume_invite(
-                {
-                    "source_chat_uid": turn["chat_uid"],
-                    "participant_uid": turn["participant_uid"],
-                    "triggered_at": turn["triggered_at"],
-                },
-                idempotency_key=operation_key,
-            )
-            return {"invite_status": status}
-        if enabled is not None:
-            raise RuntimeError("agent invite consent response has an invalid shape")
-
-        eligibility = await self._invite_api(
-            "GET",
-            f"/v1/chats/{turn['chat_uid']}/participants/{turn['participant_uid']}/invite-eligibility",
+        opportunity = await self._invite_api(
+            "POST",
+            "/v1/auth/agent-invites/opportunities",
+            body={
+                "chat_id": turn["chat_uid"],
+                "participant_id": turn["participant_uid"],
+                "message_id": turn["source_message_id"],
+            },
         )
-        if eligibility.get("status") != "eligible":
-            return {"skipped": "participant_is_existing_user"}
+        status = opportunity.get("status")
+        if status == "disabled":
+            return {"skipped": "consent_declined"}
+        if status == "none":
+            return {"skipped": "no_invite_opportunity"}
+        if status == "ready":
+            invite_status = await self.resume_invite(
+                {
+                    "opportunity_id": opportunity.get("opportunity_id"),
+                    "owner_name": opportunity.get("owner_name") or "your owner",
+                    "triggered_at": turn["triggered_at"],
+                }
+            )
+            return {"invite_status": invite_status}
+        if status != "consent_required":
+            raise RuntimeError("agent invite opportunity response has an invalid shape")
         if _deferred_questions is None:
             return {"skipped": "deferred_consent_unavailable"}
 
@@ -752,8 +757,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             question=question,
             handler_name="invite-consent",
             context={
-                "source_chat_uid": turn["chat_uid"],
-                "participant_uid": turn["participant_uid"],
+                "opportunity_id": opportunity.get("opportunity_id"),
+                "owner_name": opportunity.get("owner_name") or "your owner",
                 "participant_identity": identity,
                 "triggered_at": turn["triggered_at"],
             },
@@ -768,21 +773,22 @@ class PlowChatAdapter(BasePlatformAdapter):
         if data.get("enabled") is not enabled:
             raise RuntimeError("agent invite consent response has an invalid shape")
 
-    async def resume_invite(self, context, *, idempotency_key):
+    async def resume_invite(self, context):
         triggered_at = datetime.fromisoformat(context["triggered_at"])
         age = datetime.now(timezone.utc) - triggered_at
         if age.total_seconds() >= 24 * 60 * 60:
             return False
 
-        chat_uid = context["source_chat_uid"]
-        participant_uid = context["participant_uid"]
+        opportunity_id = context.get("opportunity_id")
+        if not opportunity_id:
+            raise RuntimeError("agent invite opportunity is missing")
         result = await self._invite_api(
             "POST",
-            f"/v1/chats/{chat_uid}/participants/{participant_uid}/agent-invite",
-            body={"idempotency_key": idempotency_key},
+            f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send",
+            body={"message_template": _invite_message_template(context.get("owner_name") or "your owner")},
         )
         status = result.get("status")
-        if status not in {"sent", "delivery_unknown", "ineligible"}:
+        if status != "sent":
             raise RuntimeError("agent invite response has an invalid shape")
         return status
 
@@ -1613,15 +1619,15 @@ async def _handle_invite_consent(question, response):
     enabled = decision == "grant"
     await adapter.set_invite_consent(enabled)
     if enabled:
-        invite_status = await adapter.resume_invite(question.context, idempotency_key=question.id)
+        if not question.context.get("opportunity_id"):
+            return DeferredQuestionResult.done(
+                "Absolutely — I’ll offer Plow invites in situations like this from now on. "
+                "This older invite request cannot be sent after the upgrade, so ask me again in that thread."
+            )
+        invite_status = await adapter.resume_invite(question.context)
         if invite_status == "sent":
             return DeferredQuestionResult.done(
                 "Absolutely — I sent the invite and I’ll offer them in situations like this from now on."
-            )
-        if invite_status == "delivery_unknown":
-            return DeferredQuestionResult.done(
-                "Absolutely — I’ll offer Plow invites in situations like this from now on. "
-                "I couldn’t confirm this invite’s delivery, so I didn’t send it twice."
             )
         return DeferredQuestionResult.done(
             "Absolutely — I’ll offer Plow invites in situations like this from now on."
