@@ -1421,6 +1421,9 @@ def _plow_start_group_message(args, **_kwargs):
     # This is the only guard on the tool's one irreversible effect.
     dry_run = _flag(args.get("dry_run"), default=True, safe=True)
     confirm = _flag(args.get("confirm"), default=False, safe=False)
+    # safe=False: trusted hands the new participants access to the agent, so an
+    # unrecognised value must resolve to the direction that grants nothing.
+    trusted = _flag(args.get("trusted"), default=False, safe=False)
     try:
         members = _normalize_members(recipients)
     except ValueError as exc:
@@ -1442,6 +1445,7 @@ def _plow_start_group_message(args, **_kwargs):
                 # desync from the recipient set a confirmed send would use.
                 "recipient_count": len(members),
                 "body": body,
+                "trusted": trusted,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "
                          "explicit user approval.",
@@ -1455,7 +1459,7 @@ def _plow_start_group_message(args, **_kwargs):
     adapter, loop = _live
     try:
         data = asyncio.run_coroutine_threadsafe(
-            adapter.start_group_thread(members, body), loop).result(timeout=45)
+            adapter.start_group_thread(members, body, trusted), loop).result(timeout=45)
     except _PlowSendError as exc:
         if exc.status >= 500:
             # A 5xx is usually a proxy or gateway speaking, not Plow — it can
@@ -1502,7 +1506,12 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "does not. Read `adoption` and tell the user plainly when it is anything "
         "other than `adopted` — replies in that thread will not reach Hermes until "
         "the next discovery poll, if ever. Defaults to dry-run; only send with "
-        "explicit user approval using dry_run=false and confirm=true."
+        "explicit user approval using dry_run=false and confirm=true. Before "
+        "confirming, ask the owner whether the new participants should have "
+        "access to the assistant ('Do you want them to be able to talk to me "
+        "and use my tools? If so I'll make this a trusted line.') and set "
+        "trusted accordingly; when trusted is false the thread is created "
+        "untrusted and can be upgraded later with plow_set_conversation_trusted."
     ),
     "parameters": {
         "type": "object",
@@ -1521,6 +1530,12 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             "confirm": {
                 "type": "boolean",
                 "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+            "trusted": {
+                "type": "boolean",
+                "description": "Whether the new participants get access to the "
+                               "assistant — only after the owner explicitly says so.",
                 "default": False,
             },
         },

@@ -2414,6 +2414,67 @@ def test_group_message_reports_adoption_separately_from_delivery(
     assert out["adoption"] == "not-on-this-agents-line"
 
 
+def test_dry_run_echoes_trusted(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The dry run is what the owner approves, so it must show whether the new
+    thread would be a trusted line."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=AssertionError("dry run must not reach the API"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "trusted": True}))
+    assert out["success"] is True and out["dry_run"] is True
+    assert out["would_send"]["trusted"] is True
+
+
+def test_confirmed_send_passes_trusted_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
+    _live_tool(module, monkeypatch, "start_group_thread",
+               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": True}))
+    assert sent == [(["+15550001111"], "hi", True)]
+
+
+@pytest.mark.parametrize("trusted", ["tru", "maybe", None, "false"])
+def test_no_falsy_or_unparseable_trusted_grants_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any
+) -> None:
+    """trusted hands out access to the agent, so absent and falsy values read
+    as False and an unparseable one falls to the same side — the direction
+    that grants nothing."""
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
+    _live_tool(module, monkeypatch, "start_group_thread",
+               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": trusted}))
+    assert sent == [(["+15550001111"], "hi", False)]
+
+
+def test_the_schema_carries_the_trusted_consent_question(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The tool description is where the model learns to ask the owner before
+    granting the new participants access to the assistant."""
+    module = _load(monkeypatch, tmp_path)
+    schema = module.PLOW_START_GROUP_MESSAGE_SCHEMA
+    assert schema["parameters"]["properties"]["trusted"]["default"] is False
+    desc = schema["description"]
+    assert "access" in desc
+    assert "plow_set_conversation_trusted" in desc
+
+
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     import json
 
