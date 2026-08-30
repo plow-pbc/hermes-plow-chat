@@ -973,6 +973,30 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}
 
+    async def _home_line_uid(self):
+        """The uid of the line this agent sends from, off the home chat's roster.
+
+        The cached resource usually carries it; the pre-connect seed does not,
+        so one refresh through the same per-chat GET the trust reads use fills
+        it in. No fallback chain past that — a home chat with no agent line has
+        nothing to create a chat on, and guessing one would send from a
+        sibling agent's.
+        """
+        def _line_uid():
+            for participant in self._chats.get(self.home_chat_uid, {}).get("participants") or []:
+                if (participant.get("type") == "agent"
+                        and participant.get("relationship") in (None, "self")):
+                    return (participant.get("line") or {}).get("uid")
+            return None
+
+        line = _line_uid()
+        if not line:
+            await self._refresh_current_chat(self.home_chat_uid)
+            line = _line_uid()
+        if not line:
+            raise RuntimeError("home chat has no agent line")
+        return line
+
     async def _ensure_anchor(self, chat_uid, http=None):
         """Baseline a chat once, no matter who asks or how concurrently.
 

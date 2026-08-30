@@ -2266,6 +2266,46 @@ async def test_direct_chat_trust_write_is_refused_before_http(
     assert adapter._chats["cht_a"]["trusted"] is False
 
 
+async def test_home_line_uid_reads_the_home_chats_agent_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_a"] = _chat("cht_a", agent_name="Elm")
+    assert await adapter._home_line_uid() == "ln_x"
+
+
+async def test_home_line_uid_fetches_fresh_when_the_cached_roster_lacks_the_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The pre-connect cache seeds the home chat with an empty roster, so a tool
+    call that lands early still has to resolve the line — through the same
+    per-chat GET the trust reads use."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    refreshed: list[str] = []
+
+    async def refresh(chat_uid: str) -> None:
+        refreshed.append(chat_uid)
+        adapter._chats[chat_uid] = _chat(chat_uid, agent_name="Elm")
+
+    adapter._refresh_current_chat = refresh
+    assert await adapter._home_line_uid() == "ln_x"
+    assert refreshed == ["cht_a"]
+
+
+async def test_home_line_uid_raises_when_the_home_chat_has_no_agent_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Fail loud, no fallback chain: without the agent line there is nothing to
+    create a chat on, and guessing one would send from a sibling agent's."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_a"] = _chat("cht_a")  # an agent participant, but no line
+    with pytest.raises(RuntimeError, match="home chat has no agent line"):
+        await adapter._home_line_uid()
+
+
 def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     import json
 
