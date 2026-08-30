@@ -2636,6 +2636,20 @@ async def test_a_malformed_create_response_raises_instead_of_degrading(
         await adapter.start_group_thread(["+15550001111"], "hello", trusted=False)
 
 
+def test_a_malformed_create_response_surfaces_as_delivery_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The strict-read KeyError reaches the tool's generic handler: the POST
+    may have been committed, so the answer is delivery-unknown, not retry."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread", raises=KeyError("uid"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True}))
+    assert out["success"] is False and out["delivery_unknown"] is True
+    assert "Do NOT retry" in out["error"]
+
+
 async def test_a_created_thread_off_the_grant_is_not_adopted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
