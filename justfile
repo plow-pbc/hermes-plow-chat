@@ -1,2 +1,2 @@
 test:
-    uvx pytest -q
+    uvx --with pytest-asyncio --with aiohttp pytest -q

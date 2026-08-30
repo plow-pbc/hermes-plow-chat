@@ -21,7 +21,15 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> Land the `agent-mgr` side first, then bump the pin.
+> This plugin also requires a Plow API that serves the agent-invite consent,
+> participant-eligibility, and
+> `/v1/chats/{chat_uid}/participants/{participant_uid}/agent-invite` delivery
+> routes. Hermes hosts without deferred-question support still run Plow Chat and
+> standing-consent invites, but skip the ask-owner-first invite flow. Deploy the
+> API first,
+> then land the `agent-mgr` support above, and only then bump
+> `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
+> available fails loudly instead of silently skipping delivery.
 
 ## Who consumes this
 
@@ -52,84 +60,126 @@ URL in git.
 
 | var | required | meaning |
 |---|---|---|
-| `PLOW_CHAT_TOKEN` | yes | the session bearer token activation mints |
-| `PLOW_CHAT_CHAT_UID` | yes | the chat this agent serves, `cht_…` |
-| `PLOW_CHAT_BASE_URL` | no | API base, default `https://api.plow.co` |
-| `PLOW_CHAT_GROUP_UIDS` | no | grants standing tool authority, and overrides the name, for `<cht_id>=<display name>`, comma-separated |
-| `PLOW_CHAT_HOME_CHANNEL` | no | delivery target for cron, defaults to `PLOW_CHAT_CHAT_UID` |
-| `PLOW_CHAT_WELCOME_MESSAGE` / `PLOW_CHAT_AUTO_WELCOME` | no | one-time message on `chat_active` |
-| `PLOW_CHAT_AUTO_APPROVE_PAIRING` | no | best-effort approval of verified Plow members |
+| `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
+| `PLOW_STATUS_MESSAGES` | no | `deliver` texts the gateway's agent status frames (compaction notices, retry chatter) into the chat; unset/anything else drops them — the typing indicator already shows the turn is running. |
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
+**Which chats the agent serves is not configured here at all.** The credential's
+grant (`sessions.chat_uids`, served by `GET /v1/chats`) decides, refreshed on
+every reconnect. Per-chat checkpoints persist under the agent home, and a
+reconnect backfills each granted chat from its checkpoint, so a socket gap
+drops nothing.
+
+The dashboard's per-assistant memory-review switch is another credential
+preference. Ordinary replies take the direct send path; only Hermes's named
+`💾 Self-improvement review:` notification reads
+`GET /v1/api-keys/current/preferences` before delivery. Disabled notifications
+are acknowledged without entering the chat.
+
+One person's rapid-fire messages are one turn: inbound is buffered per chat
+for a 2s window that resets on each arrival — iMessage's bubble + link-preview
+split, or a thought sent as two lines, reaches hermes as a single message
+instead of the second interrupting the first. A change of speaker closes the
+burst, and a slash-prefixed message closes it on both sides so commands remain
+distinct turns. The ack is the burst's last uid, so a restart mid-burst
+backfills the whole burst; a hand-off that fails is retried where it sits, with
+the rest of the chat waiting behind it.
+
+### Trusted group conversations
+
+Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
+Before handing off each inbound burst, the adapter refreshes that chat so a
+dashboard change applies to the next message. An untrusted group keeps owner
+data private. In a trusted group, every participant may ask the assistant to
+use its normal tools and connected accounts, and requested results such as
+calendar details may be answered in the thread; credential, authentication,
+token, and payment-card secrets remain excluded.
+
+The `plow_set_conversation_trusted` tool writes the same API preference as the
+dashboard. It only succeeds during an owner-authored Plow Chat turn and after
+the model passes `confirm=true` for an explicit owner request. Member turns and
+calls outside an active chat turn cannot change it.
+
+This plugin version requires a Plow API that publishes the required `trusted`
+chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
+older API the per-message refresh fails loudly and the chat waits for retry
+rather than guessing a trust state.
+
 ### What a group thread is called
 
-Nothing has to be configured for a thread to have a name. Every 60s poll reads
-`GET /v1/chats` and names each reachable chat:
+The home chat is always `Plow Chat`. Every other granted thread is named from
+its own iMessage title — `<title> (<cht_ id>)`, the uid suffix making a title
+structurally unable to take another room's name — or by its bare `cht_` id
+when nobody has titled it. Titling the thread in iMessage is how it gets a
+name; there is no name configuration here.
 
-1. its `PLOW_CHAT_GROUP_UIDS` entry, when the operator set one — published
-   exactly as written, and the only name without a uid in it;
-2. otherwise the chat's own `display_name` — the iMessage thread title — always
-   published as `<title> (<cht_ id>)`;
-3. and a thread nobody has titled is its `cht_` id, as before.
+The result is published into the image's `channel_aliases.json` overlay on
+every (re)connect, which is re-applied on every channel-directory build and
+load, so a granted thread is addressable — and visible to `send_message
+action="list"` — before it has ever spoken. The suffix does not get in the way
+of addressing: the image's resolver falls back to an unambiguous prefix match,
+so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
+`Snoqualmie Cabin Cleaning (cht_...)`. A name grants nothing — reach and
+authority stay with the credential's grant. A retitle mid-connection shows up
+on the next reconnect.
 
-The result is published into the image's own `~/.hermes/channel_aliases.json`
-overlay, which is re-applied on every channel-directory build and every load and
-carries ids that have produced no traffic yet. So a thread is addressable — and
-visible to `send_message action="list"` — from the first poll after it is
-created, without a restart and without a dotenv edit. The uid suffix does not
-get in the way of addressing it: the image's resolver falls back to an
-unambiguous prefix match, so `plow_chat:#Snoqualmie Cabin Cleaning` reaches
-`Snoqualmie Cabin Cleaning (cht_…)`. **That file's `plow_chat` block is written
-by this adapter**: to change a name, retitle the thread in iMessage or list it
-in `PLOW_CHAT_GROUP_UIDS`, rather than hand-editing the block.
+### Multi-agent groups
 
-Two properties make provider-supplied text safe to consume here, and both are
-asserted in the suite. A name **grants nothing** — tool authority stays
-configured-in-dotenv or earned by the operator speaking in the thread. And
-because an iMessage title is chosen by whoever is in the thread while the
-image's resolver takes the first exact match, the uid suffix makes every
-unconfigured name unique *by construction* — no title can equal another room's
-name, so there is no ordering or history to keep in order to hold that true.
+The chat roster identifies this line as `relationship: self`, any other Plow
+lines as `relationship: peer`, and joins each agent to the human it represents.
+The adapter turns that structured roster—plus the current sender—into one
+collaboration context on every turn. This lets Elm distinguish “Hey Ash” from
+an instruction to Elm without parsing names or inventing a second router.
 
-A name is deliberately **never derived from the participants**. The channel
-directory is listable by any member holding tool authority, so a name built from
-who is in a room would publish that room's names and handles to the members of
-every other room. An untitled thread shows as its id instead; titling it in
-iMessage is the fix, and it takes effect on the next poll.
+Peer-agent messages are real inbound turns and remain visible in the same group
+as every human message. Only this line's own outbound echo is ignored. The
+prompt asks agents to contribute when addressed or useful and to avoid empty
+acknowledgements, reciprocal delegation, impersonation, and repetition; it
+adds no hidden coordination channel or loop state.
 
-## There is a second implementation, and it is not this one
+## Media
 
-`plow-pbc/plow`'s `cloud-agents/hermes/plugins/plow_chat/` registers the **same
-plugin id** for Plow's multi-tenant cloud agents. Same wire path — `POST
-/v1/ws/ticket` → `WSS /v1/ws?ticket=` → `POST /v1/chats/{uid}/messages` — but a
-different env contract and a different feature set:
+Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`
+as files in the image's own media cache — the same place the bundled iMessage
+adapter puts them, so the vision path and the skills that say "a texted photo
+arrives as a file path" need nothing new. Each part is fetched once, begun
+the moment the message arrives — inside the five-minute Plow-signed content
+URL's life, whatever is retrying ahead of it in the chat — and awaited when its
+burst closes; without the bearer: the signature is the authorization. A part Plow reports as `failed`, or
+one whose bytes cannot be fetched, is named in the turn as
+`[attachment: <type> delivery failed | unavailable]` and logged — never dropped
+with the message.
 
-| | this repo | plow tenant |
-|---|---|---|
-| token / chat env | `PLOW_CHAT_TOKEN` / `PLOW_CHAT_CHAT_UID` | `PLOW_AGENT_TOKEN` / `PLOW_HOME_CHANNEL` |
-| base env | `PLOW_CHAT_BASE_URL` | `PLOW_API_BASE`, **without** `/v1` |
-| group chats | yes | none |
-| persisted checkpoint, history backfill | **none** | yes |
+Outbound files the model emits go through Hermes' `send_image_file` /
+`send_voice` / `send_video` / `send_document` hooks, which this adapter
+implements as the Plow contract — declare the attachment, PUT the bytes to the
+provider's upload URL with exactly the headers Plow returned, then send the
+message with `attachment_uids`. Content types are limited to what the provider
+accepts; a `415` from the declare comes back as the send's error.
 
-So `plugins.enabled: [plow-chat-platform]` means different things depending on
-which side installed it. **Convergence is the goal; this repo is not there yet.**
-Tracked in [`#2`](https://github.com/plow-pbc/hermes-plow-chat/issues/2) (this
-adapter drops inbound turns across a socket gap — the tenant's
-`_anchor`/`_backfill` is the solved prior art) and
-[`plow-pbc/plow#1394`](https://github.com/plow-pbc/plow/issues/1394). The first
-was `plow-pbc/seed-hermes-plow#15`; it moved here because an archived repo's
-issues are read-only.
+Both halves need the attachments API — `plow-pbc/plow#1435`. Against an older
+API the inbound path sees no `attachments` field (a `KeyError`, loud, per
+REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
+the frame loop on every inbound message, so the socket is torn down and
+reconnected every 5s and the phone line is mute until the API catches up:
+`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
+until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+to.
 
-A merge is constrained in one direction: the group path here calls
-`GET /v1/chats`, which is user-wide, while a tenant deliberately holds a
-chat-scoped token that cannot enumerate chats. Unifying means one adapter with
-the reconcile path gated on token capability — not a file move.
+## One implementation, two delivery paths
 
-`plow-pbc/plow`'s `cloud-agents/hermes/HERMES_INTEGRATION.md` is the best
-reference for the underlying Hermes behaviour either implementation has to live
-with — cron `deliver` semantics, the literal-token trap, why a request/response
-shim cannot work.
+This adapter is the only plow_chat implementation. `agent-mgr` installs it into
+Docker-fleet agents at the SHA pinned in its `runtime/plow-chat-plugin.ref`;
+`plow-pbc/plow`'s blessed exe.dev image bakes the same tree at the same pin.
+The old second implementation in `plow`'s `cloud-agents/` was retired by the
+unification (`plow-pbc/plow#1420`); its multi-chat credential-scope design is
+what this adapter now is.
+
+`plow-pbc/plow`'s `cloud-agents/hermes/HERMES_INTEGRATION.md` remains the best
+reference for the underlying Hermes behaviour.
 
 ## Development
 
