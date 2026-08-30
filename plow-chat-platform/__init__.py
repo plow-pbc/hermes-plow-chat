@@ -935,10 +935,10 @@ class PlowChatAdapter(BasePlatformAdapter):
                     raise _PlowSendError(resp.status, text)
                 data = json.loads(text or "{}")
 
-            data = await self._finish_started_thread(http, data)
+            data = await self._finish_started_thread(http, data, greet=False)
         return data
 
-    async def _finish_started_thread(self, http, data):
+    async def _finish_started_thread(self, http, data, *, greet=True):
         chat_id = data.get("chat_uid") or data.get("chat_id")
         data["chat_id"] = chat_id
         data["message_id"] = data.get("uid") or data.get("message_id")
@@ -959,7 +959,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # on whatever reconnect comes next, but the start-message tool needs to
         # know NOW, synchronously, whether the baseline actually landed.
         try:
-            await self._ensure_anchor(chat_id)
+            await self._ensure_anchor(chat_id, greet=greet)
         except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
             data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
@@ -992,7 +992,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}
 
-    async def _ensure_anchor(self, chat_uid, http=None):
+    async def _ensure_anchor(self, chat_uid, http=None, *, greet=True):
         """Baseline a chat once, no matter who asks or how concurrently.
 
         `http` is given only by `_listen`'s first-install branch, for a
@@ -1045,7 +1045,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                 uid = page[0]["uid"] if page else ""
             if not self._checkpoint(uid, chat_uid):
                 raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
-            await self._greet_first_meeting(chat_uid, first_meeting)
+            if greet:
+                await self._greet_first_meeting(chat_uid, first_meeting)
 
     async def _greet_first_meeting(self, chat_uid, first_meeting):
         """The 👋 first-meeting disclosure, sent once ever: the checkpoint
@@ -1543,6 +1544,14 @@ def _plow_start_email_message(args, **_kwargs):
         return json.dumps({"success": False,
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
     adapter, loop = _live
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn["owner"]:
+        chat = adapter._chats.get(turn["chat_uid"], {})
+        if not chat.get("trusted"):
+            return json.dumps({
+                "success": False,
+                "error": "email sends from a member turn require a trusted Plow Chat conversation; nothing was sent",
+            })
     try:
         data = asyncio.run_coroutine_threadsafe(
             adapter.start_email_thread(to, cc, subject, body), loop).result(timeout=45)
