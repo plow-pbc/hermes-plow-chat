@@ -119,6 +119,10 @@ class _PlowSendError(Exception):
         self.detail = detail
 
 
+class _PlowPreflightError(Exception):
+    """A definitive local refusal before any outbound message POST is attempted."""
+
+
 _ADDRESSED_ONLY = (
     "This is a shared group chat. Respond only when you reasonably infer, "
     "as a human participant would, that Hermes is directly or contextually "
@@ -450,6 +454,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # rebuilt wholesale every pass. Empty until the first one, which is why
         # _label still carries the answers a not-yet-polled process needs.
         self.chat_names: dict[str, str] = {}
+        self.line_uid: Optional[str] = None
         self._http_session = None
         self._ws_tasks: dict[str, asyncio.Task] = {}
         self._reconcile_task: Optional[asyncio.Task] = None
@@ -653,6 +658,40 @@ class PlowChatAdapter(BasePlatformAdapter):
         data["adoption"] = "adopted" if chat_id in self.chat_uids else "not-on-this-agents-line"
         return data
 
+    async def start_email_thread(self, to: list[str], cc: list[str], subject: str, body: str) -> dict:
+        """POST a new Plow/Gmail line thread, then reconcile so we listen to it."""
+        import aiohttp
+
+        if not self.line_uid:
+            await self._reconcile_once()
+        if not self.line_uid:
+            raise _PlowPreflightError("home line has not been discovered; nothing was sent")
+
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{self.base_url}/v1/email-lines/{self.line_uid}/messages",
+                json={"to": to, "cc": cc, "subject": subject, "body": body},
+                headers={"Authorization": f"Bearer {self.token}"},
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                data = json.loads(text or "{}")
+
+        chat_id = data.get("chat_uid") or data.get("chat_id")
+        if not chat_id:
+            data["adoption"] = "no-chat-id-in-response"
+            return data
+        try:
+            await self._reconcile_once()
+        except Exception as exc:
+            data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
+            return data
+        data["chat_id"] = chat_id
+        data["message_id"] = data.get("uid") or data.get("message_id")
+        data["adoption"] = "adopted" if chat_id in self.chat_uids else "not-on-this-agents-line"
+        return data
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         # Plow Chat currently exposes no typing endpoint.
         return None
@@ -711,6 +750,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._operator_resolved = False
         self.operator_vouched.clear()
         self.chat_names = {}
+        self.line_uid = None
         await self._set_reach({self.chat_uid})
 
     async def _set_reach(self, wanted: "frozenset[str] | set[str]") -> None:
@@ -848,6 +888,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # pass before removal ever ran — so a departed room kept its socket and its
             # authority because reading some *other* room's history timed out.
             wanted = {chat["uid"] for chat in mine}
+            self.line_uid = home_line
             if listing.get("has_more"):
                 # Only the ids this page could not speak to. A chat that IS on this page
                 # and not on our line has been positively classified as a sibling's —
@@ -1175,6 +1216,21 @@ def _normalize_thread_handle(recipients: list[str] | None) -> str:
     return ",".join(cleaned)
 
 
+def _normalize_email_addresses(addresses: list[str] | None, *, field: str, required: bool) -> list[str]:
+    cleaned = [str(address).strip() for address in (addresses or []) if str(address).strip()]
+    if required and not cleaned:
+        raise ValueError(f"{field} must include at least one email address")
+    if any("," in address for address in cleaned):
+        raise ValueError(f"{field} entries may not contain commas; pass one email address per entry")
+    invalid = [address for address in cleaned if "@" not in address]
+    if invalid:
+        raise ValueError(f"{field} includes an invalid email address")
+    folded = [address.casefold() for address in cleaned]
+    if len(folded) != len(set(folded)):
+        raise ValueError(f"{field} includes duplicates")
+    return cleaned
+
+
 def _plow_start_group_message(args: dict, **_kwargs) -> str:
     """Start or resume a Plow/iMessage thread by sending the first message.
 
@@ -1261,6 +1317,73 @@ def _plow_start_group_message(args: dict, **_kwargs) -> str:
     })
 
 
+def _plow_start_email_message(args: dict, **_kwargs) -> str:
+    """Start a Plow/Gmail line thread by sending the first message."""
+    body = (args.get("body") or "").strip()
+    subject = (args.get("subject") or "").strip()
+    dry_run = _flag(args.get("dry_run"), default=True, safe=True)
+    confirm = _flag(args.get("confirm"), default=False, safe=False)
+    try:
+        to = _normalize_email_addresses(args.get("to"), field="to", required=True)
+        cc = _normalize_email_addresses(args.get("cc"), field="cc", required=False)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    if not subject:
+        return json.dumps({"success": False, "error": "subject is required"})
+    if not body:
+        return json.dumps({"success": False, "error": "body is required"})
+    if not dry_run and not confirm:
+        return json.dumps({
+            "success": False,
+            "error": "confirm=true is required to send; nothing was sent",
+        })
+    if dry_run:
+        return json.dumps({
+            "success": True,
+            "dry_run": True,
+            "would_send": {
+                "to_count": len(to),
+                "cc_count": len(cc),
+                "subject": subject,
+                "body": body,
+            },
+            "next_step": "Call again with dry_run=false and confirm=true only after explicit user approval.",
+        })
+
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    try:
+        data = asyncio.run_coroutine_threadsafe(
+            adapter.start_email_thread(to, cc, subject, body), loop).result(timeout=45)
+    except _PlowPreflightError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    except _PlowSendError as exc:
+        if exc.status >= 500:
+            return json.dumps({
+                "success": False,
+                "status": exc.status,
+                "delivery_unknown": True,
+                "error": f"{exc.detail} — a {exc.status} can arrive after the message "
+                         f"was accepted. Do NOT retry; check the thread.",
+            })
+        return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"{exc} — the request failed without a response, so the message "
+                     f"may or may not have been sent. Do NOT retry; check the thread.",
+        })
+    return json.dumps({
+        "success": True,
+        "message_id": data.get("message_id"),
+        "chat_id": data.get("chat_id") or data.get("chat_uid"),
+        "adoption": data.get("adoption"),
+    })
+
+
 PLOW_START_GROUP_MESSAGE_SCHEMA = {
     "name": "plow_start_group_message",
     "description": (
@@ -1294,6 +1417,48 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             },
         },
         "required": ["recipients", "body"],
+        "additionalProperties": False,
+    },
+}
+
+
+PLOW_START_EMAIL_MESSAGE_SCHEMA = {
+    "name": "plow_start_email_message",
+    "description": (
+        "Start a new Plow/Gmail email thread from this agent's public email line. "
+        "The Plow API only permits sends where the account owner is visible in To "
+        "or Cc. Defaults to dry-run; only send with explicit user approval using "
+        "dry_run=false and confirm=true. Read `adoption` and tell the user plainly "
+        "when it is anything other than `adopted`."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Email addresses for the To header, one per array entry.",
+            },
+            "cc": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Email addresses for the Cc header, one per array entry.",
+                "default": [],
+            },
+            "subject": {"type": "string", "description": "Email subject."},
+            "body": {"type": "string", "description": "Email body text."},
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return what would be sent without sending.",
+                "default": True,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+        },
+        "required": ["to", "subject", "body"],
         "additionalProperties": False,
     },
 }
@@ -1373,6 +1538,14 @@ def register(ctx):
         toolset="plow_chat",
         schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
         handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_CHAT_TOKEN")),
+        requires_env=["PLOW_CHAT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_start_email_message",
+        toolset="plow_chat",
+        schema=PLOW_START_EMAIL_MESSAGE_SCHEMA,
+        handler=_plow_start_email_message,
         check_fn=lambda: bool(os.getenv("PLOW_CHAT_TOKEN")),
         requires_env=["PLOW_CHAT_TOKEN"],
     )

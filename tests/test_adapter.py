@@ -810,7 +810,7 @@ def test_connect_always_opens_the_home_socket_and_starts_discovery(
 
 
 
-def _live_tool(monkeypatch, *, result=None, raises=None, record=None):
+def _live_tool(monkeypatch, *, result=None, raises=None, record=None, stub_email=True):
     """Publish a live adapter whose start_group_thread is stubbed.
 
     The tool now goes through the adapter's own seam, so there is no standalone
@@ -825,7 +825,16 @@ def _live_tool(monkeypatch, *, result=None, raises=None, record=None):
             raise raises
         return dict(result or {})
 
+    async def email_stub(to, cc, subject, body):
+        if record is not None:
+            record.append((to, cc, subject, body))
+        if raises is not None:
+            raise raises
+        return dict(result or {})
+
     a.start_group_thread = stub
+    if stub_email:
+        a.start_email_thread = email_stub
     loop = asyncio.new_event_loop()
     monkeypatch.setattr(adapter_mod, "_live", (a, loop))
     import threading
@@ -904,6 +913,70 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(monkeypatch, d
     assert len(sent) == 1
 
 
+def test_email_message_dry_run_does_not_send(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("dry run must not reach the API"))
+    out = json.loads(adapter_mod._plow_start_email_message({
+        "to": ["owner@example.com", "vendor@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+    }))
+    assert out["success"] is True and out["dry_run"] is True
+    assert out["would_send"]["to_count"] == 2
+    assert out["would_send"]["cc_count"] == 0
+
+
+def test_email_message_requires_confirm_to_send(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    _live_tool(monkeypatch, raises=AssertionError("must not send without confirm"))
+    out = json.loads(adapter_mod._plow_start_email_message({
+        "to": ["owner@example.com", "vendor@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+        "dry_run": False,
+    }))
+    assert out["success"] is False
+    assert "confirm" in out["error"] and "nothing was sent" in out["error"]
+
+
+def test_email_message_uses_home_line_uid(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    sent = []
+    adapter, _loop = _live_tool(monkeypatch, result={
+        "chat_id": "cht_email", "message_id": "msg_email", "adoption": "adopted",
+    }, record=sent)
+    adapter.line_uid = "line_elm"
+
+    out = json.loads(adapter_mod._plow_start_email_message({
+        "to": ["owner@example.com"],
+        "cc": ["vendor@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+        "dry_run": False,
+        "confirm": True,
+    }))
+
+    assert out["success"] is True
+    assert out["chat_id"] == "cht_email"
+    assert out["message_id"] == "msg_email"
+    assert sent == [(["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")]
+
+
+def test_email_message_requires_discovered_home_line(monkeypatch):
+    monkeypatch.setenv("PLOW_CHAT_TOKEN", "tok")
+    adapter, _loop = _live_tool(monkeypatch, result={"chat_id": "cht_email"}, stub_email=False)
+    adapter._http_session = PagingSession({"/v1/chats": [{"uid": "cht_test", "participants": []}]})
+    out = json.loads(adapter_mod._plow_start_email_message({
+        "to": ["owner@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+        "dry_run": False,
+        "confirm": True,
+    }))
+    assert out["success"] is False
+    assert "home line" in out["error"]
+
+
 class _TextResponse(FakeResponse):
     """A response whose body is read with .text(), like the thread-creation POST."""
 
@@ -957,6 +1030,34 @@ def test_start_group_thread_posts_the_documented_url_and_payload(monkeypatch):
     assert url == "https://api.plow.co/channels/linq/send"
     assert kwargs["json"] == {"thread_handle": "+15550001111", "text": "hi"}
     assert kwargs["headers"] == {"Authorization": "Bearer token_test"}
+    assert data["adoption"] == "adopted"
+
+
+def test_start_email_thread_posts_line_endpoint_and_payload(monkeypatch):
+    a = _adapter(monkeypatch)
+    a._websocket_loop = lambda uid: asyncio.sleep(0)
+    a.line_uid = "line_elm"
+    session = _PostRecordingSession(
+        {"/v1/chats": [_chat("cht_home", "line_elm", ["owner@example.com"]), _chat("cht_email", "line_elm", ["vendor@example.com"])]},
+        '{"chat_uid":"cht_email","uid":"msg_email"}',
+    )
+    a._http_session = session
+    monkeypatch.setattr(sys.modules["aiohttp"], "ClientSession",
+                        lambda *args, **kw: session, raising=False)
+
+    data = asyncio.run(a.start_email_thread(
+        ["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?"))
+    url, kwargs = session.posts[0]
+
+    assert url == "https://api.plow.co/v1/email-lines/line_elm/messages"
+    assert kwargs["json"] == {
+        "to": ["owner@example.com"],
+        "cc": ["vendor@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+    }
+    assert kwargs["headers"] == {"Authorization": "Bearer token_test"}
+    assert data["message_id"] == "msg_email"
     assert data["adoption"] == "adopted"
 
 
