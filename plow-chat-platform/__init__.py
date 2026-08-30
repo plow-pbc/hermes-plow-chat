@@ -98,10 +98,14 @@ def _agent_name(chat):
     of the listing readers: a pre-persona server omits `line`, and an unnamed
     line omits `display_name`.
     """
+    return _agent_line(chat).get("display_name") or None
+
+
+def _agent_line(chat):
     for participant in chat.get("participants") or []:
         if participant.get("type") == "agent" and participant.get("relationship") in (None, "self"):
-            return (participant.get("line") or {}).get("display_name") or None
-    return None
+            return participant.get("line") or {}
+    return {}
 
 
 def _represented_member(chat, agent):
@@ -918,31 +922,56 @@ class PlowChatAdapter(BasePlatformAdapter):
                     raise _PlowSendError(resp.status, text)
                 data = json.loads(text or "{}")
 
-            chat_id = data.get("chat_id")
-            if not chat_id:
-                data["adoption"] = "no-chat-id-in-response"
+            data = await self._finish_started_thread(http, data)
+        return data
+
+    async def start_email_thread(self, to, cc, subject, body):
+        """POST a new Plow/Gmail line thread, then refresh reach so we listen to it."""
+        line_uid = _agent_line(self._chats[self.home_chat_uid]).get("uid")
+        if not line_uid:
+            raise _PlowPreflightError("home line has not been discovered; nothing was sent")
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{BASE}/v1/email-lines/{line_uid}/messages",
+                json={"to": to, "cc": cc, "subject": subject, "body": body},
+                headers=self.auth,
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                data = json.loads(text or "{}")
+
+            data = await self._finish_started_thread(http, data, greet=False)
+        return data
+
+    async def _finish_started_thread(self, http, data, *, greet=True):
+        chat_id = data.get("chat_uid") or data.get("chat_id")
+        data["chat_id"] = chat_id
+        data["message_id"] = data.get("uid") or data.get("message_id")
+        if not chat_id:
+            data["adoption"] = "no-chat-id-in-response"
+            return data
+        if not greet and not self._anchored_chats.get(chat_id):
+            if not self._checkpoint("", chat_id):
+                data["adoption"] = "delivered-unanchored: checkpoint"
                 return data
-            try:
-                await self._refresh_reach(http)
-            except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
-                data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
-                return data
-            if chat_id not in self.chat_uids:
-                data["adoption"] = "not-on-this-agents-line"
-                return data
-            data["adoption"] = "adopted"
-            # The one deliberate exception to "only `_listen`'s per-connect
-            # loop calls this": that loop would eventually anchor this chat
-            # too, empty, on whatever reconnect comes next, but this call
-            # needs to know NOW, synchronously, whether the baseline
-            # actually landed -- `data["adoption"]` is this tool's honest
-            # answer to the caller. No `http` passed -- see `_ensure_anchor`
-            # for why empty, never the newest existing message, is always
-            # the right call here.
-            try:
-                await self._ensure_anchor(chat_id)
-            except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
-                data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
+        try:
+            await self._refresh_reach(http)
+        except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
+            data["adoption"] = f"failed: {type(exc).__name__}: {exc}"
+            return data
+        if chat_id not in self.chat_uids:
+            data["adoption"] = "not-on-this-agents-line"
+            return data
+        data["adoption"] = "adopted"
+        # The one deliberate exception to "only `_listen`'s per-connect loop
+        # calls this": that loop would eventually anchor this chat too, empty,
+        # on whatever reconnect comes next, but the start-message tool needs to
+        # know NOW, synchronously, whether the baseline actually landed.
+        try:
+            await self._ensure_anchor(chat_id, greet=greet)
+        except Exception as exc:  # noqa: BLE001 - adoption stands; say the baseline does not
+            data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
     async def _typing_until_reply(self, chat_uid):
@@ -973,7 +1002,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}
 
-    async def _ensure_anchor(self, chat_uid, http=None):
+    async def _ensure_anchor(self, chat_uid, http=None, *, greet=True):
         """Baseline a chat once, no matter who asks or how concurrently.
 
         `http` is given only by `_listen`'s first-install branch, for a
@@ -1026,7 +1055,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                 uid = page[0]["uid"] if page else ""
             if not self._checkpoint(uid, chat_uid):
                 raise OSError(f"could not persist the initial baseline at {self._checkpoint_path(chat_uid)}")
-            await self._greet_first_meeting(chat_uid, first_meeting)
+            if greet:
+                await self._greet_first_meeting(chat_uid, first_meeting)
 
     async def _greet_first_meeting(self, chat_uid, first_meeting):
         """The 👋 first-meeting disclosure, sent once ever: the checkpoint
@@ -1344,6 +1374,10 @@ class _PlowSendError(Exception):
         self.detail = detail
 
 
+class _PlowPreflightError(Exception):
+    """A definitive local refusal before any outbound message POST is attempted."""
+
+
 def _flag(value, *, default, safe):
     """A tool argument read as a boolean, tolerating the strings models emit.
 
@@ -1385,6 +1419,15 @@ def _normalize_thread_handle(recipients):
     if len(cleaned) != len(set(cleaned)):
         raise ValueError("Recipients include duplicates")
     return ",".join(cleaned)
+
+
+def _normalize_email_addresses(addresses, *, field, required):
+    cleaned = [str(address).strip() for address in (addresses or []) if str(address).strip()]
+    if required and not cleaned:
+        raise ValueError(f"{field} must include at least one email address")
+    if any("," in address for address in cleaned):
+        raise ValueError(f"{field} entries may not contain commas; pass one email address per entry")
+    return cleaned
 
 
 def _plow_start_group_message(args, **_kwargs):
@@ -1475,6 +1518,80 @@ def _plow_start_group_message(args, **_kwargs):
     })
 
 
+def _plow_start_email_message(args, **_kwargs):
+    """Start a Plow/Gmail line thread by sending the first message."""
+    body = (args.get("body") or "").strip()
+    subject = (args.get("subject") or "").strip()
+    dry_run = _flag(args.get("dry_run"), default=True, safe=True)
+    confirm = _flag(args.get("confirm"), default=False, safe=False)
+    try:
+        to = _normalize_email_addresses(args.get("to"), field="to", required=True)
+        cc = _normalize_email_addresses(args.get("cc"), field="cc", required=False)
+    except ValueError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    if not subject:
+        return json.dumps({"success": False, "error": "subject is required"})
+    if not body:
+        return json.dumps({"success": False, "error": "body is required"})
+    if not dry_run and not confirm:
+        return json.dumps({"success": False,
+                           "error": "confirm=true is required to send; nothing was sent"})
+    if dry_run:
+        return json.dumps({
+            "success": True,
+            "dry_run": True,
+            "would_send": {
+                "to_count": len(to),
+                "cc_count": len(cc),
+                "subject": subject,
+                "body": body,
+            },
+            "next_step": "Call again with dry_run=false and confirm=true only after "
+                         "explicit user approval.",
+        })
+
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn["owner"]:
+        chat = adapter._chats.get(turn["chat_uid"], {})
+        if not chat.get("trusted"):
+            return json.dumps({
+                "success": False,
+                "error": "email sends from a member turn require a trusted Plow Chat conversation; nothing was sent",
+            })
+    try:
+        data = asyncio.run_coroutine_threadsafe(
+            adapter.start_email_thread(to, cc, subject, body), loop).result(timeout=45)
+    except _PlowPreflightError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    except _PlowSendError as exc:
+        if exc.status >= 500:
+            return json.dumps({
+                "success": False,
+                "status": exc.status,
+                "delivery_unknown": True,
+                "error": f"{exc.detail} — a {exc.status} can arrive after the message "
+                         f"was accepted. Do NOT retry; check the thread.",
+            })
+        return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except Exception as exc:
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"{exc} — the request failed without a response, so the message "
+                     f"may or may not have been sent. Do NOT retry; check the thread.",
+        })
+    return json.dumps({
+        "success": True,
+        "message_id": data.get("message_id"),
+        "chat_id": data.get("chat_id") or data.get("chat_uid"),
+        "adoption": data.get("adoption"),
+    })
+
+
 PLOW_START_GROUP_MESSAGE_SCHEMA = {
     "name": "plow_start_group_message",
     "description": (
@@ -1508,6 +1625,48 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             },
         },
         "required": ["recipients", "body"],
+        "additionalProperties": False,
+    },
+}
+
+
+PLOW_START_EMAIL_MESSAGE_SCHEMA = {
+    "name": "plow_start_email_message",
+    "description": (
+        "Start a new Plow/Gmail email thread from this agent's public email line. "
+        "The Plow API only permits sends where the account owner is visible in To "
+        "or Cc. Defaults to dry-run; only send with explicit user approval using "
+        "dry_run=false and confirm=true. Read `adoption` and tell the user plainly "
+        "when it is anything other than `adopted`."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Email addresses for the To header, one per array entry.",
+            },
+            "cc": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Email addresses for the Cc header, one per array entry.",
+                "default": [],
+            },
+            "subject": {"type": "string", "description": "Email subject."},
+            "body": {"type": "string", "description": "Email body text."},
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, return what would be sent without sending.",
+                "default": True,
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+        },
+        "required": ["to", "subject", "body"],
         "additionalProperties": False,
     },
 }
@@ -1715,6 +1874,14 @@ def register(ctx):
         handler=_plow_start_group_message,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_start_email_message",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_START_EMAIL_MESSAGE_SCHEMA,
+        handler=_plow_start_email_message,
+        check_fn=check_requirements,
+        requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
     )
     ctx.register_tool(
         name="plow_set_conversation_trusted",

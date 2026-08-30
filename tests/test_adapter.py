@@ -1123,9 +1123,9 @@ async def test_unknown_chat_frame_adoption_cases(
     monkeypatch.setattr(adapter, "_refresh_reach", fake_refresh)
     real_ensure_anchor = adapter._ensure_anchor
 
-    async def spying_ensure_anchor(chat_uid: str, http: Any = None) -> None:
+    async def spying_ensure_anchor(chat_uid: str, http: Any = None, *, greet: bool = True) -> None:
         assert http is None, "must not anchor at newest from this path"
-        await real_ensure_anchor(chat_uid, http)
+        await real_ensure_anchor(chat_uid, http, greet=greet)
 
     monkeypatch.setattr(adapter, "_ensure_anchor", spying_ensure_anchor)
     handled = _capture_events(monkeypatch, adapter)
@@ -1706,6 +1706,7 @@ def test_tools_register_with_optional_deferred_questions(
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
+        "plow_start_email_message",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
     ]
@@ -1714,11 +1715,16 @@ def test_tools_register_with_optional_deferred_questions(
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    trust_tool = ctx.tools[1]
+    email_tool = ctx.tools[1]
+    assert email_tool["schema"]["name"] == "plow_start_email_message"
+    assert email_tool["requires_env"] == ["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"]
+    assert email_tool["check_fn"]()
+
+    trust_tool = ctx.tools[2]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[2]
+    invite_tool = ctx.tools[3]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -2333,6 +2339,146 @@ def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     assert len(sent) == 1
 
 
+@pytest.mark.parametrize(
+    ("args", "result", "raises", "expected", "expected_sent"),
+    [
+        pytest.param(
+            {
+                "to": ["owner@example.com", "vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+            },
+            None,
+            AssertionError("dry run must not reach the API"),
+            {"success": True, "dry_run": True, "to_count": 2, "cc_count": 0},
+            [],
+            id="dry-run",
+        ),
+        pytest.param(
+            {
+                "to": ["owner@example.com", "vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+                "dry_run": False,
+            },
+            None,
+            AssertionError("must not send without confirm"),
+            {"success": False, "error_contains": "confirm"},
+            [],
+            id="missing-confirm",
+        ),
+        pytest.param(
+            {
+                "to": ["owner@example.com"],
+                "cc": ["vendor@example.com"],
+                "subject": "Quote",
+                "body": "Can you send the quote?",
+                "dry_run": False,
+                "confirm": True,
+            },
+            {"chat_id": "cht_email", "message_id": "msg_email", "adoption": "adopted"},
+            None,
+            {"success": True, "chat_id": "cht_email", "message_id": "msg_email"},
+            [(["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")],
+            id="confirmed-send",
+        ),
+    ],
+)
+def test_email_message_start_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    args: dict[str, Any],
+    result: dict[str, Any] | None,
+    raises: Exception | None,
+    expected: dict[str, Any],
+    expected_sent: list[tuple[Any, ...]],
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    sent: list[tuple[Any, ...]] = []
+    _live_tool(
+        module,
+        monkeypatch,
+        "start_email_thread",
+        result=result,
+        raises=raises,
+        record=sent,
+    )
+    out = json.loads(module._plow_start_email_message(args))
+
+    assert out["success"] is expected["success"]
+    if expected.get("dry_run"):
+        assert out["dry_run"] is True
+        assert out["would_send"]["to_count"] == expected["to_count"]
+        assert out["would_send"]["cc_count"] == expected["cc_count"]
+    if expected.get("error_contains"):
+        assert expected["error_contains"] in out["error"] and "nothing was sent" in out["error"]
+    if expected.get("chat_id"):
+        assert out["chat_id"] == expected["chat_id"]
+        assert out["message_id"] == expected["message_id"]
+    assert sent == expected_sent
+
+
+@pytest.mark.parametrize(
+    ("trusted", "success"),
+    [
+        pytest.param(False, False, id="untrusted-member-refused"),
+        pytest.param(True, True, id="trusted-member-allowed"),
+    ],
+)
+def test_email_message_member_turn_requires_trusted_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    trusted: bool,
+    success: bool,
+) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    sent: list[tuple[Any, ...]] = []
+    adapter = _live_tool(
+        module,
+        monkeypatch,
+        "start_email_thread",
+        result={"chat_id": "cht_email", "message_id": "msg_email", "adoption": "adopted"},
+        record=sent,
+    )
+    adapter._set_reach([_chat("cht_a", group=True, trusted=trusted)])
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
+
+    out = json.loads(module._plow_start_email_message({
+        "to": ["owner@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+        "dry_run": False,
+        "confirm": True,
+    }))
+
+    assert out["success"] is success
+    assert sent == ([(["owner@example.com"], [], "Quote", "Can you send the quote?")] if success else [])
+    if not success:
+        assert "trusted" in out["error"]
+        assert "nothing was sent" in out["error"]
+
+
+def test_email_message_requires_discovered_home_line(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    import json
+
+    module = _load(monkeypatch, tmp_path)
+    adapter = _live_tool(module, monkeypatch, "start_group_thread")
+    out = json.loads(module._plow_start_email_message({
+        "to": ["owner@example.com"],
+        "subject": "Quote",
+        "body": "Can you send the quote?",
+        "dry_run": False,
+        "confirm": True,
+    }))
+    assert module._agent_line(adapter._chats[adapter.home_chat_uid]) == {}
+    assert out["success"] is False
+    assert "home line" in out["error"]
+
+
 @pytest.mark.parametrize("junk", ["tru", "maybe"])
 def test_unparseable_dry_run_stays_a_dry_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, junk: str
@@ -2510,6 +2656,85 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     # written in `_deliver` becomes the first durable one.
     assert adapter._anchored_chats.get("cht_new") is True
     assert adapter._load_checkpoint("cht_new") is None
+
+
+def _email_thread_http(
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]],
+    *,
+    refresh_error: Exception | None = None,
+) -> Any:
+    import json as jsonlib
+
+    class _TextResp(_Resp):
+        async def text(self) -> str:
+            return jsonlib.dumps(self._payload)
+
+    class _SendHTTP(_HTTP):
+        def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+            posts.append((url, json, headers))
+            return _TextResp({"chat_uid": "cht_email", "uid": "msg_email"})
+
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            if refresh_error is not None:
+                raise refresh_error
+            return _Resp({
+                "object": "list",
+                "data": [_chat("cht_a", agent_name="Elm"), _chat("cht_email", agent_name="Elm")],
+                "has_more": False,
+            })
+
+    return _SendHTTP()
+
+
+@pytest.mark.parametrize(
+    ("refresh_error", "expected_adoption", "expected_chats"),
+    [
+        pytest.param(None, "adopted", frozenset({"cht_a", "cht_email"}), id="refresh-success"),
+        pytest.param(RuntimeError("reach failed"), "failed: RuntimeError: reach failed", frozenset({"cht_a"}), id="refresh-failure"),
+    ],
+)
+async def test_start_email_thread_posts_line_endpoint_and_records_no_greeting_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    refresh_error: Exception | None,
+    expected_adoption: str,
+    expected_chats: frozenset[str],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", agent_name="Elm")])
+
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _email_thread_http(posts, refresh_error=refresh_error))
+    data = await adapter.start_email_thread(
+        ["owner@example.com"], ["vendor@example.com"], "Quote", "Can you send the quote?")
+
+    assert posts == [(
+        f"{module.BASE}/v1/email-lines/ln_x/messages",
+        {
+            "to": ["owner@example.com"],
+            "cc": ["vendor@example.com"],
+            "subject": "Quote",
+            "body": "Can you send the quote?",
+        },
+        adapter.auth,
+    )]
+    assert data["message_id"] == "msg_email"
+    assert data["adoption"] == expected_adoption
+    assert adapter.chat_uids == expected_chats
+    assert adapter._anchored_chats.get("cht_email") is True
+    assert adapter._load_checkpoint("cht_email") is None
+
+    restarted = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    greetings: list[str] = []
+
+    async def send(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
+        greetings.append(content)
+        return _SendResult(success=True)
+
+    monkeypatch.setattr(restarted, "send", send)
+    await restarted._ensure_anchor("cht_email")
+    assert greetings == []
 
 
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(
