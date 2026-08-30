@@ -2307,8 +2307,6 @@ async def test_home_line_uid_raises_when_the_home_chat_has_no_agent_line(
 
 
 def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("dry run must not reach the API"))
@@ -2328,8 +2326,6 @@ def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tm
 def test_group_message_rejects_bad_recipients(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, recipients: list[str], message: str
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     out = json.loads(module._plow_start_group_message(
         {"recipients": recipients, "body": "hi"}))
@@ -2342,8 +2338,6 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
 ) -> None:
     """bool("false") is True, and a model emits that string for a declared bool.
     This is the only guard on the tool's one irreversible effect."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
@@ -2356,8 +2350,6 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
 def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, dry_run: Any
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     sent: list[tuple[str, str]] = []
     _live_tool(
@@ -2379,8 +2371,6 @@ def test_unparseable_dry_run_stays_a_dry_run(
 ) -> None:
     """Unrecognised input must fall to the direction that does nothing, and for
     dry_run that is True — otherwise a typo becomes the irreversible branch."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
@@ -2393,8 +2383,6 @@ def test_group_message_reports_adoption_separately_from_delivery(
 ) -> None:
     """A thread nobody is listening to is the bug this tool shipped with, so
     delivery must not read as reachability."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(
         module,
@@ -2417,8 +2405,6 @@ def test_group_message_reports_adoption_separately_from_delivery(
 def test_dry_run_echoes_trusted(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """The dry run is what the owner approves, so it must show whether the new
     thread would be a trusted line."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("dry run must not reach the API"))
@@ -2431,8 +2417,6 @@ def test_dry_run_echoes_trusted(monkeypatch: pytest.MonkeyPatch, tmp_path: pathl
 def test_confirmed_send_passes_trusted_through(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
@@ -2452,8 +2436,6 @@ def test_no_falsy_or_unparseable_trusted_grants_access(
     """trusted hands out access to the agent, so absent and falsy values read
     as False and an unparseable one falls to the same side — the direction
     that grants nothing."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
@@ -2478,8 +2460,6 @@ def test_the_schema_carries_the_trusted_consent_question(
 
 
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     assert module._live is None
     out = json.loads(module._plow_start_group_message(
@@ -2566,9 +2546,7 @@ class _CreateTextResp(_Resp):
     """The thread-creation POST reads the body with .text()."""
 
     async def text(self) -> str:
-        import json as jsonlib
-
-        return jsonlib.dumps(self._payload)
+        return json.dumps(self._payload)
 
 
 def _create_http(posts: list[Any], *, resource: dict[str, Any] | None = None,
@@ -2683,8 +2661,6 @@ async def test_a_missing_home_line_is_a_definitive_preflight_failure(
 def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=module._PlowPreflightError("RuntimeError: home chat has no agent line"))
