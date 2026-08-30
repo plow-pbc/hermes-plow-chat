@@ -719,10 +719,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             chat_type=home["type"],
             role_authorized=True,
         )
+        source_data = dict(source) if isinstance(source, dict) else source.to_dict()
         session_key = build_session_key(
             source,
             group_sessions_per_user=False,
-            profile=source.get("profile") if isinstance(source, dict) else getattr(source, "profile", None),
+            profile=source_data.get("profile"),
         )
         identity = turn["participant_identity"]
         question = (
@@ -733,9 +734,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         record = _deferred_questions.enqueue(
             platform=PLATFORM_NAME,
             session_key=session_key,
-            delivery_source=(
-                dict(source) if isinstance(source, dict) else source.to_dict()
-            ),
+            delivery_source=source_data,
             question=question,
             handler_name="invite-consent",
             context={
