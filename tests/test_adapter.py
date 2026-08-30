@@ -1817,8 +1817,13 @@ def test_invite_owner_notification_reports_delivery_failure(
     tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "notify_owner_about_invite", raises=RuntimeError("HTTP 503"))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_b", "owner": False})
+    _live_tool(
+        module,
+        monkeypatch,
+        "enqueue_invite_consent",
+        raises=RuntimeError("HTTP 503"),
+    )
+    module._ACTIVE_TURN.set(_invite_turn())
 
     out = json.loads(module._plow_notify_owner_about_invite({"kind": "consent_request"}))
 
