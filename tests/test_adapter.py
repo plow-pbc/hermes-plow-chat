@@ -612,6 +612,46 @@ async def test_a_burst_from_one_sender_is_one_turn(
     assert len(handled) == len(turns)
 
 
+async def test_burst_invite_operation_uses_oldest_uncheckpointed_uid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    chat = _chat("cht_b", group=True)
+    chat["participants"][-1]["display_name"] = "Taylor"
+    adapter._set_reach([_chat("cht_a"), chat])
+    _mark_anchored(adapter, "cht_b")
+    turns: list[tuple[str, str]] = []
+
+    async def handle(event: Any) -> None:
+        await adapter.on_processing_start(event)
+        try:
+            turns.append((event.message_id, adapter._active_turn.get()["source_message_id"]))
+        finally:
+            await adapter.on_processing_complete(event, None)
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    sender = {
+        "type": "member",
+        "uid": "mem_other_cht_b",
+        "role": "member",
+        "display_name": "Taylor",
+    }
+    burst = [
+        SimpleNamespace(uid="msg_first", sender=sender),
+        SimpleNamespace(uid="msg_tail", sender=sender),
+    ]
+
+    await adapter._deliver(
+        burst,
+        [([], [], "I love Plow"), ([], [], "so much")],
+        "cht_b",
+    )
+
+    assert turns == [("msg_tail", "msg_first")]
+    assert adapter._last_uids["cht_b"] == "msg_tail"
+
+
 async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -1730,31 +1770,6 @@ def test_member_turn_can_start_fixed_invite_workflow(
     assert calls == [(turn,)]
 
 
-def test_invite_workflow_is_attempted_once_per_turn(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    calls: list[tuple[str, dict[str, Any]]] = []
-    _live_tool(
-        module,
-        monkeypatch,
-        "offer_invite",
-        result={"question_id": "dq_notice"},
-        record=calls,
-    )
-    turn = _invite_turn()
-    module._ACTIVE_TURN.set(turn)
-
-    first = json.loads(module._plow_offer_invite({}))
-    second = json.loads(module._plow_offer_invite({}))
-
-    assert first["success"] is True
-    assert second["success"] is False
-    assert "already attempted" in second["error"]
-    assert len(calls) == 1
-
-
 @pytest.mark.parametrize(
     ("turn", "args", "error"),
     [
@@ -1797,8 +1812,9 @@ def test_invite_workflow_reports_delivery_failure(
     out = json.loads(module._plow_offer_invite({}))
 
     assert out["success"] is False
+    assert out["delivery_unknown"] is True
     assert "may or may not" in out["error"]
-    assert "do not retry" in out["error"].lower()
+    assert "do not retry" not in out["error"].lower()
 
 
 @pytest.mark.parametrize(
@@ -1980,7 +1996,6 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "source_chat_uid": "cht_b",
             "participant_uid": "cp_taylor",
             "participant_identity": "Taylor",
-            "source_message_id": "msg_delight_1",
             "triggered_at": "2026-08-29T12:00:00+00:00",
         },
         "dedupe_key": "agent-invites-opt-in",

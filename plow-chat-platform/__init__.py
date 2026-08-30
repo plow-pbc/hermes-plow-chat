@@ -612,7 +612,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
-            "source_message_id": str(event.message_id) if event.message_id else None,
+            "source_message_id": str(
+                getattr(event, "invite_operation_message_id", event.message_id)
+            ) if event.message_id else None,
         }
         if not turn["owner"]:
             participant = next(
@@ -746,7 +748,6 @@ class PlowChatAdapter(BasePlatformAdapter):
                 "source_chat_uid": turn["chat_uid"],
                 "participant_uid": turn["participant_uid"],
                 "participant_identity": identity,
-                "source_message_id": turn["source_message_id"],
                 "triggered_at": turn["triggered_at"],
             },
             dedupe_key="agent-invites-opt-in",
@@ -1280,7 +1281,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn_context = _collaboration_turn_context(roster, sender)
         if turn_context:
             text = f"{turn_context}\n\n{text}"
-        await self.handle_message(MessageEvent(
+        event = MessageEvent(
             text=text,
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id=_sender_key(sender),
@@ -1299,7 +1300,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                 else OWNER_CHANNEL_PROMPT,
                 roster,
             ),
-        ))
+        )
+        event.invite_operation_message_id = burst[0].uid
+        await self.handle_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.
@@ -1620,10 +1623,6 @@ def _plow_offer_invite(args, **_kwargs):
     if _live is None:
         return json.dumps({"success": False,
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
-    if turn.get("_invite_offer_attempted"):
-        return json.dumps({"success": False,
-                           "error": "the invite workflow was already attempted this turn"})
-    turn["_invite_offer_attempted"] = True
     adapter, loop = _live
     try:
         operation = adapter.offer_invite(turn)
@@ -1633,7 +1632,7 @@ def _plow_offer_invite(args, **_kwargs):
             "success": False,
             "delivery_unknown": True,
             "error": f"could not confirm the invite workflow ({type(exc).__name__}); it may or may not "
-                     "have been sent. Do not retry this turn",
+                     "have completed; retrying is safe",
         })
     return json.dumps({"success": True, **result})
 
