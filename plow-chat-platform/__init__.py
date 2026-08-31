@@ -11,6 +11,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import uuid
 from datetime import datetime, timezone
 
 import aiohttp
@@ -913,8 +914,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         async with aiohttp.ClientSession() as http:
             async with http.post(
                 f"{BASE}/v1/chats",
+                # The key is required by the API and names this one confirmed
+                # send; the server refuses reuse with different request data.
                 json={"line_uid": line_uid, "members": members,
-                      "body": body, "trusted": trusted},
+                      "body": body, "trusted": trusted,
+                      "idempotency_key": uuid.uuid4().hex},
                 headers=self.auth,
             ) as resp:
                 text = await resp.text()

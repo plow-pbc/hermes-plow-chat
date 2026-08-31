@@ -2596,12 +2596,16 @@ async def test_start_group_thread_posts_the_v1_chats_contract_and_reports_adopti
     # The create, then the first-meeting 👋 the empty-baseline anchor
     # fires -- the greeting rides it, so a tool-created chat is disclosed
     # even though the socket is already up.
-    assert posts == [(
+    create_url, create_payload, create_headers = posts[0]
+    key = create_payload.pop("idempotency_key")
+    assert key and len(key) == 32, "every create names itself with a fresh idempotency key"
+    assert (create_url, create_payload, create_headers) == (
         f"{module.BASE}/v1/chats",
         {"line_uid": "ln_x", "members": ["+15550001111", "sam@example.com"],
          "body": "hello", "trusted": True},
         adapter.auth,
-    ), (
+    )
+    assert posts[1:] == [(
         f"{module.BASE}/v1/chats/cht_new/messages",
         {"body": "👋"},
         adapter.auth,
