@@ -11,6 +11,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import uuid
 from datetime import datetime, timezone
 
 import aiohttp
@@ -87,6 +88,14 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _self_agent_line(chat):
+    """The self agent participant's line dict, {} when the roster lacks one."""
+    agent = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "agent"
+                  and p.get("relationship") in (None, "self")), {})
+    return agent.get("line") or {}
+
+
 def _agent_name(chat):
     """The line's persona name ("Elm"), or None for an unnamed line.
 
@@ -98,10 +107,7 @@ def _agent_name(chat):
     of the listing readers: a pre-persona server omits `line`, and an unnamed
     line omits `display_name`.
     """
-    for participant in chat.get("participants") or []:
-        if participant.get("type") == "agent" and participant.get("relationship") in (None, "self"):
-            return (participant.get("line") or {}).get("display_name") or None
-    return None
+    return _self_agent_line(chat).get("display_name") or None
 
 
 def _represented_member(chat, agent):
@@ -892,36 +898,40 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, **_kwargs):
         return await self._send_attachment(chat_id, file_path, caption=caption, filename=file_name)
 
-    async def start_group_thread(self, thread_handle, body):
-        """POST a new Plow/Linq thread, then refresh reach so we listen to it.
+    async def start_group_thread(self, members, body, trusted=False):
+        """POST /v1/chats to create (or resume) a thread, then refresh reach so
+        we listen to it.
 
         On the adapter, and on its loop, so it uses the same base URL and token
         as every other call. Reach is refreshed rather than adopting the
         returned id directly: the grant is the authority, so a response naming
         a sibling agent's thread cannot make this gateway listen there.
-
-        The endpoint is unversioned on purpose. Every *documented* Plow
-        endpoint is under /v1 and the docs describe no thread-creation call at
-        all — but this one exists and routes: a live call reached it and came
-        back 422 with a semantic complaint about the phone number, which a
-        wrong path answers 404. Do not "correct" it to /v1 without a 2xx from
-        the versioned path.
         """
+        try:
+            line_uid = await self._home_line_uid()
+        except Exception as exc:
+            raise _PlowPreflightError(f"{type(exc).__name__}: {exc}") from exc
         async with aiohttp.ClientSession() as http:
             async with http.post(
-                f"{BASE}/channels/linq/send",
-                json={"thread_handle": thread_handle, "text": body},
+                f"{BASE}/v1/chats",
+                # The key is required by the API and names this one confirmed
+                # send; the server refuses reuse with different request data.
+                json={"line_uid": line_uid, "members": members,
+                      "body": body, "trusted": trusted,
+                      "idempotency_key": uuid.uuid4().hex},
                 headers=self.auth,
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
-                data = json.loads(text or "{}")
+                resource = json.loads(text)
 
-            chat_id = data.get("chat_id")
-            if not chat_id:
-                data["adoption"] = "no-chat-id-in-response"
-                return data
+            # Required response fields, read strictly: a malformed 2xx raises
+            # here and reports as delivery-unknown rather than a null-valued
+            # "success" nobody can act on.
+            chat_id = resource["uid"]
+            data = {"chat_id": chat_id, "created": resource["created"],
+                    "trusted": resource["trusted"]}
             try:
                 await self._refresh_reach(http)
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
@@ -972,6 +982,26 @@ class PlowChatAdapter(BasePlatformAdapter):
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}
+
+    async def _home_line_uid(self):
+        """The uid of the line this agent sends from, off the home chat's roster.
+
+        The cached resource usually carries it; the pre-connect seed does not,
+        so one refresh through the same per-chat GET the trust reads use fills
+        it in. No fallback chain past that — a home chat with no agent line has
+        nothing to create a chat on, and guessing one would send from a
+        sibling agent's.
+        """
+        def _line_uid():
+            return _self_agent_line(self._chats.get(self.home_chat_uid, {})).get("uid")
+
+        line = _line_uid()
+        if not line:
+            await self._refresh_current_chat(self.home_chat_uid)
+            line = _line_uid()
+        if not line:
+            raise RuntimeError("home chat has no agent line")
+        return line
 
     async def _ensure_anchor(self, chat_uid, http=None):
         """Baseline a chat once, no matter who asks or how concurrently.
@@ -1344,6 +1374,16 @@ class _PlowSendError(Exception):
         self.detail = detail
 
 
+class _PlowPreflightError(Exception):
+    """A failure before the create POST was ever issued.
+
+    Distinct from the generic post-POST bucket because it is definitive:
+    nothing was sent, there is no thread to check, and retrying after the
+    underlying problem is fixed is safe — the opposite of what the
+    delivery-unknown message tells the model.
+    """
+
+
 def _flag(value, *, default, safe):
     """A tool argument read as a boolean, tolerating the strings models emit.
 
@@ -1366,25 +1406,21 @@ def _flag(value, *, default, safe):
     return safe
 
 
-def _normalize_thread_handle(recipients):
-    """Build the Plow/Linq recipient handle.
+def _normalize_members(recipients):
+    """The cleaned member list for POST /v1/chats. Kept out of logs — phones are PII.
 
-    For a new iMessage group the handle is the comma-separated list of participant
-    addresses. The value is kept out of logs because phone numbers are PII.
+    Members stay a list end-to-end now, so the comma check is a malformed-entry
+    guard rather than a delimiter rule: one array element carrying two addresses
+    would be approved as one recipient and delivered to two.
     """
     cleaned = [str(r).strip() for r in (recipients or []) if str(r).strip()]
     if not cleaned:
         raise ValueError("Provide at least one recipient")
-    # The comma is the delimiter, so a recipient containing one is not a recipient
-    # — it is two, smuggled through as a single array element. The dry run would
-    # count it as one and report one, and the confirmed send would then reach an
-    # address the operator never approved. Reject rather than split: an element
-    # with a comma in it is malformed either way.
     if any("," in r for r in cleaned):
         raise ValueError("A recipient may not contain a comma — pass one address per entry")
     if len(cleaned) != len(set(cleaned)):
         raise ValueError("Recipients include duplicates")
-    return ",".join(cleaned)
+    return cleaned
 
 
 def _plow_start_group_message(args, **_kwargs):
@@ -1403,12 +1439,24 @@ def _plow_start_group_message(args, **_kwargs):
     # This is the only guard on the tool's one irreversible effect.
     dry_run = _flag(args.get("dry_run"), default=True, safe=True)
     confirm = _flag(args.get("confirm"), default=False, safe=False)
+    # safe=False: trusted hands the new participants access to the agent, so an
+    # unrecognised value must resolve to the direction that grants nothing.
+    trusted = _flag(args.get("trusted"), default=False, safe=False)
     try:
-        thread_handle = _normalize_thread_handle(recipients)
+        members = _normalize_members(recipients)
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
     if not body:
         return json.dumps({"success": False, "error": "body is required"})
+    if trusted:
+        # Trust hands the new participants the owner's agent — only the owner
+        # grants it, same rule as plow_set_conversation_trusted. Checked before
+        # the dry-run branch so a non-owner never even previews a trusted send.
+        turn = _ACTIVE_TURN.get()
+        if turn is None or not turn["owner"]:
+            return json.dumps({"success": False,
+                               "error": "only the agent owner can start a trusted "
+                                        "thread; nothing was sent"})
     # A caller that asked to send and forgot confirm sent nothing, and must not
     # read back as a dry run it did not request: "success": true on an unasked dry
     # run is how the agent comes to report an undelivered message as sent.
@@ -1420,10 +1468,11 @@ def _plow_start_group_message(args, **_kwargs):
             "success": True,
             "dry_run": True,
             "would_send": {
-                # From the validated handle, so the reported count can never
+                # From the validated list, so the reported count can never
                 # desync from the recipient set a confirmed send would use.
-                "recipient_count": len(thread_handle.split(",")),
+                "recipient_count": len(members),
                 "body": body,
+                "trusted": trusted,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "
                          "explicit user approval.",
@@ -1437,7 +1486,7 @@ def _plow_start_group_message(args, **_kwargs):
     adapter, loop = _live
     try:
         data = asyncio.run_coroutine_threadsafe(
-            adapter.start_group_thread(thread_handle, body), loop).result(timeout=45)
+            adapter.start_group_thread(members, body, trusted), loop).result(timeout=45)
     except _PlowSendError as exc:
         if exc.status >= 500:
             # A 5xx is usually a proxy or gateway speaking, not Plow — it can
@@ -1452,6 +1501,13 @@ def _plow_start_group_message(args, **_kwargs):
                          f"was accepted. Do NOT retry; check the thread.",
             })
         return json.dumps({"success": False, "status": exc.status, "error": exc.detail})
+    except _PlowPreflightError as exc:
+        # Failed before the POST was issued: definitive, and safe to retry once
+        # the underlying problem is fixed — the delivery-unknown message below
+        # would wrongly forbid that.
+        return json.dumps({"success": False,
+                           "error": f"could not resolve this agent's line ({exc}); "
+                                    "nothing was sent"})
     except Exception as exc:
         # No answer. A timeout or dropped connection says nothing about whether
         # Plow committed the POST, so reporting an ordinary failure invites a
@@ -1467,10 +1523,9 @@ def _plow_start_group_message(args, **_kwargs):
     # tool shipped with, so delivery must not read as reachability.
     return json.dumps({
         "success": True,
-        "thread_handle": data.get("thread_handle"),
-        "message_id": data.get("message_id"),
         "chat_id": data.get("chat_id"),
-        "delivery_status": data.get("delivery_status"),
+        "created": data.get("created"),
+        "trusted": data.get("trusted"),
         "adoption": data.get("adoption"),
     })
 
@@ -1485,7 +1540,12 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "does not. Read `adoption` and tell the user plainly when it is anything "
         "other than `adopted` — replies in that thread will not reach Hermes until "
         "the next discovery poll, if ever. Defaults to dry-run; only send with "
-        "explicit user approval using dry_run=false and confirm=true."
+        "explicit user approval using dry_run=false and confirm=true. Before "
+        "confirming, ask the owner whether the new participants should have "
+        "access to the assistant ('Do you want them to be able to talk to me "
+        "and use my tools? If so I'll make this a trusted line.') and set "
+        "trusted accordingly; when trusted is false the thread is created "
+        "untrusted and can be upgraded later with plow_set_conversation_trusted."
     ),
     "parameters": {
         "type": "object",
@@ -1504,6 +1564,12 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             "confirm": {
                 "type": "boolean",
                 "description": "Must be true, with dry_run=false, after explicit approval.",
+                "default": False,
+            },
+            "trusted": {
+                "type": "boolean",
+                "description": "Whether the new participants get access to the "
+                               "assistant — only after the owner explicitly says so.",
                 "default": False,
             },
         },

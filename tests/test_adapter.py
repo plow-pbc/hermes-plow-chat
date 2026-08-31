@@ -233,6 +233,9 @@ class _Resp:
     async def json(self, content_type: Any = None) -> Any:
         return self._payload
 
+    async def text(self) -> str:
+        return json.dumps(self._payload)
+
     def raise_for_status(self) -> None:
         if self.status >= 400:
             raise RuntimeError(f"HTTP {self.status}")
@@ -2266,16 +2269,58 @@ async def test_direct_chat_trust_write_is_refused_before_http(
     assert adapter._chats["cht_a"]["trusted"] is False
 
 
-def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
+async def test_home_line_uid_reads_the_home_chats_agent_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_a"] = _chat("cht_a", agent_name="Elm")
+    assert await adapter._home_line_uid() == "ln_x"
 
+
+async def test_home_line_uid_fetches_fresh_when_the_cached_roster_lacks_the_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The pre-connect cache seeds the home chat with an empty roster, so a tool
+    call that lands early still has to resolve the line — through the same
+    per-chat GET the trust reads use."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    refreshed: list[str] = []
+
+    async def refresh(chat_uid: str) -> None:
+        refreshed.append(chat_uid)
+        adapter._chats[chat_uid] = _chat(chat_uid, agent_name="Elm")
+
+    adapter._refresh_current_chat = refresh
+    assert await adapter._home_line_uid() == "ln_x"
+    assert refreshed == ["cht_a"]
+
+
+async def test_home_line_uid_raises_when_the_home_chat_has_no_agent_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Fail loud, no fallback chain: without the agent line there is nothing to
+    create a chat on, and guessing one would send from a sibling agent's."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_a"] = _chat("cht_a")  # an agent participant, but no line
+    with pytest.raises(RuntimeError, match="home chat has no agent line"):
+        await adapter._home_line_uid()
+
+
+def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The dry run is what the owner approves, so it must show whether the new
+    thread would be a trusted line."""
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread",
                raises=AssertionError("dry run must not reach the API"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi"}))
+        {"recipients": ["+15550001111"], "body": "hi", "trusted": True}))
     assert out["success"] is True and out["dry_run"] is True
     assert out["would_send"]["recipient_count"] == 1
+    assert out["would_send"]["trusted"] is True
 
 
 @pytest.mark.parametrize("recipients,message", [
@@ -2288,8 +2333,6 @@ def test_group_message_dry_run_does_not_send(monkeypatch: pytest.MonkeyPatch, tm
 def test_group_message_rejects_bad_recipients(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, recipients: list[str], message: str
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     out = json.loads(module._plow_start_group_message(
         {"recipients": recipients, "body": "hi"}))
@@ -2302,8 +2345,6 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
 ) -> None:
     """bool("false") is True, and a model emits that string for a declared bool.
     This is the only guard on the tool's one irreversible effect."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
@@ -2316,8 +2357,6 @@ def test_no_falsy_or_unparseable_confirm_value_can_authorize_a_send(
 def test_string_falsy_dry_run_is_a_real_send_not_a_silent_dry_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, dry_run: Any
 ) -> None:
-    import json
-
     module = _load(monkeypatch, tmp_path)
     sent: list[tuple[str, str]] = []
     _live_tool(
@@ -2339,8 +2378,6 @@ def test_unparseable_dry_run_stays_a_dry_run(
 ) -> None:
     """Unrecognised input must fall to the direction that does nothing, and for
     dry_run that is True — otherwise a typo becomes the irreversible branch."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
     out = json.loads(module._plow_start_group_message(
@@ -2353,31 +2390,85 @@ def test_group_message_reports_adoption_separately_from_delivery(
 ) -> None:
     """A thread nobody is listening to is the bug this tool shipped with, so
     delivery must not read as reachability."""
-    import json
-
     module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
     _live_tool(
         module,
         monkeypatch,
         "start_group_thread",
         result={
             "chat_id": "cht_new",
-            "message_id": "m1",
-            "delivery_status": "sent",
-            "thread_handle": "+15550001111",
+            "created": True,
+            "trusted": True,
             "adoption": "not-on-this-agents-line",
         },
+        record=sent,
     )
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": True}))
     assert out["success"] is True
-    assert out["delivery_status"] == "sent"
+    assert out["chat_id"] == "cht_new" and out["created"] is True
+    assert sent == [(["+15550001111"], "hi", True)]
+    assert out["trusted"] is True
     assert out["adoption"] == "not-on-this-agents-line"
 
 
-def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    import json
+@pytest.mark.parametrize(
+    "turn",
+    [
+        pytest.param(None, id="outside-turn"),
+        pytest.param({"chat_uid": "cht_a", "owner": False}, id="member-turn"),
+    ],
+)
+def test_only_an_owner_turn_can_start_a_trusted_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None
+) -> None:
+    """Trust hands the new participants the owner's agent — a member of a
+    trusted group must not be able to mint themselves a fresh trusted line."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=AssertionError("must not send"))
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": True}))
+    assert out["success"] is False
+    assert "owner" in out["error"] and "nothing was sent" in out["error"]
 
+
+@pytest.mark.parametrize("trusted", ["tru", "maybe", None, "false"])
+def test_no_falsy_or_unparseable_trusted_grants_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any
+) -> None:
+    """trusted hands out access to the agent, so absent and falsy values read
+    as False and an unparseable one falls to the same side — the direction
+    that grants nothing."""
+    module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
+    _live_tool(module, monkeypatch, "start_group_thread",
+               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
+    json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True, "trusted": trusted}))
+    assert sent == [(["+15550001111"], "hi", False)]
+
+
+def test_the_schema_carries_the_trusted_consent_question(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The tool description is where the model learns to ask the owner before
+    granting the new participants access to the assistant."""
+    module = _load(monkeypatch, tmp_path)
+    schema = module.PLOW_START_GROUP_MESSAGE_SCHEMA
+    assert schema["parameters"]["properties"]["trusted"]["default"] is False
+    desc = schema["description"]
+    assert "access" in desc
+    assert "plow_set_conversation_trusted" in desc
+
+
+def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     module = _load(monkeypatch, tmp_path)
     assert module._live is None
     out = json.loads(module._plow_start_group_message(
@@ -2460,47 +2551,67 @@ async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_conn
         "the gate must lift once the first anchor pass actually finishes"
 
 
-async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoption(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The thread-creation POST goes to the unversioned /channels/linq/send with
-    the agent bearer, and adoption is judged by the refreshed grant — a response
-    naming a sibling agent's thread must not make this gateway claim it."""
-    import json as jsonlib
-
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-
-    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
-
-    class _TextResp(_Resp):
-        async def text(self) -> str:
-            return jsonlib.dumps(self._payload)
+def _create_http(posts: list[Any], *, resource: dict[str, Any] | None = None,
+                 status: int = 200, granted: list[dict[str, Any]] | None = None) -> Any:
+    """An HTTP stub for start_group_thread: the create POST (and the anchor
+    greeting that can follow it) plus the reach-refresh listing."""
 
     class _SendHTTP(_HTTP):
         def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
             posts.append((url, json, headers))
-            return _TextResp({"chat_id": "cht_new", "message_id": "m1"})
+            return _Resp(
+                resource or {"uid": "cht_new", "created": True, "trusted": False}, status)
 
         def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            return _Resp({"object": "list", "data": [_chat("cht_a"), _chat("cht_new")], "has_more": False})
+            if granted is None:
+                raise RuntimeError("reach refresh is down")
+            return _Resp({"object": "list", "data": granted, "has_more": False})
 
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _SendHTTP())
-    data = await adapter.start_group_thread("+15550001111", "hello")
+    return _SendHTTP()
 
-    # The linq send, then the first-meeting 👋 the empty-baseline anchor
+
+def _adapter_with_home_line(module: Any) -> Any:
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_a"] = _chat("cht_a", agent_name="Elm")  # line uid ln_x
+    return adapter
+
+
+async def test_start_group_thread_posts_the_v1_chats_contract_and_reports_adoption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The thread-creation POST goes to POST /v1/chats with the agent bearer —
+    line_uid derived from the home chat, members as a list end-to-end, the
+    trusted bool — and adoption is judged by the refreshed grant, exactly as
+    before the retarget."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+
+    posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+    http = _create_http(posts, resource={"uid": "cht_new", "created": True, "trusted": True},
+                        granted=[_chat("cht_a"), _chat("cht_new")])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    data = await adapter.start_group_thread(
+        ["+15550001111", "sam@example.com"], "hello", trusted=True)
+
+    # The create, then the first-meeting 👋 the empty-baseline anchor
     # fires -- the greeting rides it, so a tool-created chat is disclosed
     # even though the socket is already up.
-    assert posts == [(
-        f"{module.BASE}/channels/linq/send",
-        {"thread_handle": "+15550001111", "text": "hello"},
+    create_url, create_payload, create_headers = posts[0]
+    key = create_payload.pop("idempotency_key")
+    assert key and len(key) == 32, "every create names itself with a fresh idempotency key"
+    assert (create_url, create_payload, create_headers) == (
+        f"{module.BASE}/v1/chats",
+        {"line_uid": "ln_x", "members": ["+15550001111", "sam@example.com"],
+         "body": "hello", "trusted": True},
         adapter.auth,
-    ), (
+    )
+    assert posts[1:] == [(
         f"{module.BASE}/v1/chats/cht_new/messages",
         {"body": "👋"},
         adapter.auth,
     )]
-    assert data["adoption"] == "adopted"
+    assert data == {"chat_id": "cht_new", "created": True, "trusted": True,
+                    "adoption": "adopted"}
     assert adapter.chat_uids == frozenset({"cht_a", "cht_new"})
     # Adoption must BASELINE the new chat immediately, empty rather than at
     # its newest existing message: a reply that beats this call is already
@@ -2510,6 +2621,102 @@ async def test_start_group_thread_posts_the_unversioned_send_and_reports_adoptio
     # written in `_deliver` becomes the first durable one.
     assert adapter._anchored_chats.get("cht_new") is True
     assert adapter._load_checkpoint("cht_new") is None
+
+
+async def test_a_malformed_create_response_raises_instead_of_degrading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A 2xx missing a required field must raise (the tool reports it as
+    delivery-unknown), never degrade into a null-valued success."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"created": True, "trusted": False})  # no uid
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    with pytest.raises(KeyError):
+        await adapter.start_group_thread(["+15550001111"], "hello", trusted=False)
+
+
+def test_a_malformed_create_response_surfaces_as_delivery_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The strict-read KeyError reaches the tool's generic handler: the POST
+    may have been committed, so the answer is delivery-unknown, not retry."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread", raises=KeyError("uid"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi",
+         "dry_run": False, "confirm": True}))
+    assert out["success"] is False and out["delivery_unknown"] is True
+    assert "Do NOT retry" in out["error"]
+
+
+async def test_a_created_thread_off_the_grant_is_not_adopted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A response naming a thread the refreshed grant does not cover must not
+    make this gateway claim it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"uid": "cht_sib", "created": False, "trusted": False},
+                        granted=[_chat("cht_a")])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    data = await adapter.start_group_thread(["+15550001111"], "hello")
+    assert data["adoption"] == "not-on-this-agents-line"
+    assert "cht_sib" not in adapter.chat_uids
+
+
+async def test_a_failed_reach_refresh_after_create_reports_adoption_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The chat exists server-side even when the refresh dies, so the result
+    still carries the chat id and says adoption failed rather than raising."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: _create_http([]))
+
+    data = await adapter.start_group_thread(["+15550001111"], "hello")
+    assert data["chat_id"] == "cht_new"
+    assert data["adoption"].startswith("failed:")
+
+
+async def test_a_missing_home_line_is_a_definitive_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A failure before the create POST means nothing was sent, so it must not
+    surface through the post-POST delivery-unknown path."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))  # empty home roster
+    with pytest.raises(module._PlowPreflightError):
+        await adapter.start_group_thread(["+15550001111"], "hello")
+
+
+def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               raises=module._PlowPreflightError("RuntimeError: home chat has no agent line"))
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hi", "dry_run": False, "confirm": True}))
+    assert out["success"] is False
+    assert "nothing was sent" in out["error"]
+    assert "delivery_unknown" not in out
+
+
+async def test_start_group_thread_raises_plow_send_error_on_4xx(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """4xx stays a definitive decline, carried as _PlowSendError exactly as
+    before the retarget."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"error": {"code": "line_not_found"}}, status=404)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+
+    with pytest.raises(module._PlowSendError) as err:
+        await adapter.start_group_thread(["+15550001111"], "hello")
+    assert err.value.status == 404
 
 
 async def test_a_lagging_disconnect_on_a_replaced_instance_keeps_the_live_one_published(

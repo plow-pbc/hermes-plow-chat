@@ -22,8 +22,11 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
 > This plugin also requires a Plow API that serves agent-invite consent,
-> `/v1/auth/agent-invites/opportunities`, and
-> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`. Hermes hosts
+> `/v1/auth/agent-invites/opportunities`,
+> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`, and
+> `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
+> 404s against an older API, so that API change deploys before any
+> `agent-mgr` SHA advance). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
 > then land the `agent-mgr` support above, and only then bump
