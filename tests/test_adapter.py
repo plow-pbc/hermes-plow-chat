@@ -2870,32 +2870,59 @@ def test_an_unwritable_registry_does_not_cost_the_subscription(
     assert adapter.chat_uids == frozenset({"cht_a"})
 
 
-async def test_status_frames_are_dropped_unless_the_deployment_opts_into_delivery(
+class _PreferenceHTTP(_HTTP):
+    """_HTTP plus the one GET these gates make: the preferences read."""
+
+    def __init__(self, preferences: Any) -> None:
+        super().__init__()
+        self.gets: list[str] = []
+        self._preferences = preferences
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+        self.gets.append(url)
+        if isinstance(self._preferences, Exception):
+            raise self._preferences
+        return _Resp(self._preferences)
+
+
+def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    return adapter
+
+
+async def test_status_frames_dropped_when_quiet(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
     """Hermes routes agent status callbacks (compaction notices, retry
     chatter) through send_or_update_status when an adapter provides it;
     without the hook they fall back to plain send() and land in the owner's
-    iMessage thread as real messages (#30). The contract: dropped by default
-    -- the typing indicator already covers "working" -- reported as success
-    so the gateway never retries, and delivered only when the deployment
-    sets PLOW_STATUS_MESSAGES=deliver."""
+    iMessage thread as real messages (#30). Quiet is the default: dropped --
+    the typing indicator already covers "working" -- and reported as success
+    so the gateway never retries."""
     module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a")])
-    http = _HTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
-    status = "✓ Context compaction complete — continuing turn..."
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
 
-    dropped = await adapter.send_or_update_status("cht_a", "compacted", status)
+    dropped = await adapter.send_or_update_status("cht_a", "compacted", "✓ Compaction done")
     assert dropped.success and http.posts == []
 
+
+async def test_status_frames_delivered_when_verbose(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": True})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    status = "✓ Context compaction complete — continuing turn..."
+
     # Delivery must not eat the typing indicator: a status arrives mid-turn,
-    # and the opted-in deployment gets both signals, not one or the other.
+    # and a verbose assistant gets both signals, not one or the other.
     typing = asyncio.get_running_loop().create_future()
     adapter._typing["cht_a"] = typing
-    monkeypatch.setenv("PLOW_STATUS_MESSAGES", "deliver")
     delivered = await adapter.send_or_update_status("cht_a", "compacted", status)
     assert delivered.success
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
@@ -2905,36 +2932,69 @@ async def test_status_frames_are_dropped_unless_the_deployment_opts_into_deliver
 @pytest.mark.parametrize(
     ("enabled", "expected_posts"),
     [(False, 0), (True, 1)],
-    ids=["disabled", "enabled"],
+    ids=["quiet", "verbose"],
 )
-async def test_background_review_delivery_follows_the_current_session_preference(
+@pytest.mark.parametrize(
+    "diagnostic",
+    ["💾 Self-improvement review: memory updated",
+     "⚠️ No reply: empty content after 3 attempts"],
+    ids=["review", "no_reply"],
+)
+async def test_diagnostic_sends_follow_the_verbose_output_preference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     enabled: bool,
     expected_posts: int,
+    diagnostic: str,
 ) -> None:
     """The dashboard setting belongs to this assistant credential. Ordinary
-    replies must not pay for a preference lookup; only Hermes's named
-    background-review message consults it before crossing into iMessage."""
+    replies must not pay for a preference lookup; only Hermes's marked
+    diagnostic bodies consult it before crossing into iMessage -- and the
+    answer is cached, so two diagnostics cost one read."""
     module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a")])
-
-    class _PreferenceHTTP(_HTTP):
-        def __init__(self) -> None:
-            super().__init__()
-            self.gets: list[str] = []
-
-        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
-            self.gets.append(url)
-            return _Resp({"memory_notifications_enabled": enabled})
-
-    http = _PreferenceHTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    http = _PreferenceHTTP({"verbose_output_enabled": enabled})
+    adapter = _verbose_adapter(module, http, monkeypatch)
 
     ordinary = await adapter.send("cht_a", "You're welcome")
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    first = await adapter.send("cht_a", diagnostic)
+    second = await adapter.send("cht_a", diagnostic)
 
-    assert ordinary.success and review.success
+    assert ordinary.success and first.success and second.success
     assert http.gets == [f"{module.BASE}/v1/api-keys/current/preferences"]
-    assert len(http.posts) == 1 + expected_posts
+    assert len(http.posts) == 1 + 2 * expected_posts
+
+
+async def test_missing_field_means_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """An API that predates the preference serves no field; that must read as
+    quiet, not raise -- it is the deploy-window state while plow rolls out."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"some_other_preference": True})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+    assert review.success and status.success and http.posts == []
+
+
+async def test_preference_fetch_failure_drops_diagnostic_not_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A preferences outage silences diagnostics -- the safe direction -- and
+    must never surface as a failed send or touch ordinary prose."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP(RuntimeError("preferences unreachable"))
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    warning = await adapter.send("cht_a", "⚠️ No reply: empty content")
+    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+    prose = await adapter.send("cht_a", "Dinner is at 7.")
+
+    assert review.success and warning.success and status.success
+    assert prose.success
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
+                           {"body": "Dinner is at 7."})]
