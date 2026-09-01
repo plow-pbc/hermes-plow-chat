@@ -2892,40 +2892,29 @@ def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) ->
     return adapter
 
 
-async def test_status_frames_dropped_when_quiet(
+@pytest.mark.parametrize("enabled", [False, True], ids=["quiet", "verbose"])
+async def test_status_frames_follow_verbose_preference(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    enabled: bool,
 ) -> None:
     """Hermes routes agent status callbacks (compaction notices, retry
     chatter) through send_or_update_status when an adapter provides it;
     without the hook they fall back to plain send() and land in the owner's
     iMessage thread as real messages (#30). Quiet is the default: dropped --
     the typing indicator already covers "working" -- and reported as success
-    so the gateway never retries."""
+    so the gateway never retries. Verbose delivers, and must not eat the
+    typing indicator: both signals, not one or the other."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
-    adapter = _verbose_adapter(module, http, monkeypatch)
-
-    dropped = await adapter.send_or_update_status("cht_a", "compacted", "✓ Compaction done")
-    assert dropped.success and http.posts == []
-
-
-async def test_status_frames_delivered_when_verbose(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": True})
+    http = _PreferenceHTTP({"verbose_output_enabled": enabled})
     adapter = _verbose_adapter(module, http, monkeypatch)
     status = "✓ Context compaction complete — continuing turn..."
 
-    # Delivery must not eat the typing indicator: a status arrives mid-turn,
-    # and a verbose assistant gets both signals, not one or the other.
     typing = asyncio.get_running_loop().create_future()
     adapter._typing["cht_a"] = typing
-    delivered = await adapter.send_or_update_status("cht_a", "compacted", status)
-    assert delivered.success
-    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})]
+    result = await adapter.send_or_update_status("cht_a", "compacted", status)
+    expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})] if enabled else []
+    assert result.success and http.posts == expected
     assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
 
 
@@ -2949,8 +2938,8 @@ async def test_diagnostic_sends_follow_the_verbose_output_preference(
 ) -> None:
     """The dashboard setting belongs to this assistant credential. Ordinary
     replies must not pay for a preference lookup; only Hermes's marked
-    diagnostic bodies consult it before crossing into iMessage -- and the
-    answer is cached, so two diagnostics cost one read."""
+    diagnostic bodies consult it before crossing into iMessage, one read
+    per diagnostic, so a toggle flip takes effect immediately."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": enabled})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -2960,7 +2949,7 @@ async def test_diagnostic_sends_follow_the_verbose_output_preference(
     second = await adapter.send("cht_a", diagnostic)
 
     assert ordinary.success and first.success and second.success
-    assert http.gets == [f"{module.BASE}/v1/api-keys/current/preferences"]
+    assert http.gets == [f"{module.BASE}/v1/api-keys/current/preferences"] * 2
     assert len(http.posts) == 1 + 2 * expected_posts
 
 
@@ -2979,22 +2968,20 @@ async def test_missing_field_means_quiet(
     assert review.success and status.success and http.posts == []
 
 
-async def test_preference_fetch_failure_drops_diagnostic_not_message(
+async def test_preference_outage_never_touches_ordinary_prose(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """A preferences outage silences diagnostics -- the safe direction -- and
-    must never surface as a failed send or touch ordinary prose."""
+    """Only marked diagnostics pay for the preference read, so an outage
+    fails loudly there and cannot reach a normal reply at all."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP(RuntimeError("preferences unreachable"))
     adapter = _verbose_adapter(module, http, monkeypatch)
 
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    warning = await adapter.send("cht_a", "⚠️ No reply: empty content")
-    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
     prose = await adapter.send("cht_a", "Dinner is at 7.")
-
-    assert review.success and warning.success and status.success
     assert prose.success
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
                            {"body": "Dinner is at 7."})]
+
+    with pytest.raises(RuntimeError):
+        await adapter.send("cht_a", "⚠️ No reply: empty content")

@@ -11,7 +11,6 @@ import logging
 import mimetypes
 import os
 import pathlib
-import time
 import uuid
 from datetime import datetime, timezone
 
@@ -35,10 +34,6 @@ from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
-# How long one preference answer stands in for the API's. Long enough that a
-# chatty turn costs one read, short enough that the dashboard toggle lands
-# within a minute.
-_VERBOSE_TTL_S = 60
 # TODO(remove): once the fleet image pin includes srosro/hermes-agent's
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
@@ -451,7 +446,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
         self._active_turn = _ACTIVE_TURN
-        self._verbose_cache = None           # (enabled, monotonic seconds)
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -684,16 +678,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         async with aiohttp.ClientSession() as http:
             body = content.strip()
             if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
-                # The consult may only ever cost the diagnostic itself: a
-                # preferences outage drops it -- the safe direction -- and
-                # never raises into what is otherwise an ordinary send path.
-                try:
-                    verbose = await self._verbose_enabled(http)
-                except Exception as exc:
-                    log.info("[plow_chat] preference fetch failed; dropped "
-                             "diagnostic for %s: %s", chat_id, exc)
-                    return SendResult(success=True)
-                if not verbose:
+                if not await self._verbose_enabled(http):
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
             return await self._post_message(http, chat_id, {"body": body})
@@ -705,17 +690,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         posts, turn-stop warnings. Anything but an explicit true reads as
         quiet, which is also what an API that predates the field serves.
         """
-        now = time.monotonic()
-        if self._verbose_cache and now - self._verbose_cache[1] < _VERBOSE_TTL_S:
-            return self._verbose_cache[0]
         async with http.get(
             f"{BASE}/v1/api-keys/current/preferences", headers=self.auth
         ) as resp:
             _auth_raise_for_status(resp)
             prefs = await resp.json(content_type=None)
-        enabled = prefs.get("verbose_output_enabled") is True
-        self._verbose_cache = (enabled, now)
-        return enabled
+        return prefs.get("verbose_output_enabled") is True
 
     async def _invite_api(self, method, path, *, body=None):
         async with aiohttp.ClientSession() as http:
@@ -856,16 +836,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         and reported as success so the gateway treats the frame as handled.
         The verbose_output_enabled credential preference (the dashboard's
         "Verbose agent output" toggle) opts an assistant into receiving them
-        as messages; a preference outage reads as quiet.
+        as messages.
         """
         async with aiohttp.ClientSession() as http:
-            try:
-                verbose = await self._verbose_enabled(http)
-            except Exception as exc:
-                log.info("[plow_chat] preference fetch failed; dropped status "
-                         "frame %r for %s: %s", status_key, chat_id, exc)
-                return SendResult(success=True)
-            if verbose:
+            if await self._verbose_enabled(http):
                 refused = self._send_guard(chat_id)
                 if refused is not None:
                     return refused
