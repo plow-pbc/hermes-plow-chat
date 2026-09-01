@@ -2985,3 +2985,5 @@ async def test_preference_outage_never_touches_ordinary_prose(
 
     with pytest.raises(RuntimeError):
         await adapter.send("cht_a", "⚠️ No reply: empty content")
+    with pytest.raises(RuntimeError):
+        await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
