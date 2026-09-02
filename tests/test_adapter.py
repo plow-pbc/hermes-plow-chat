@@ -1526,7 +1526,7 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
     http = _SocketHTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     greetings: list[str] = []
 
     async def greet(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
@@ -1616,7 +1616,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
     _mark_anchored(adapter, "cht_a", "cht_b")
     http = _HTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     results: dict[str, _SendResult] = {}
 
@@ -2587,7 +2587,7 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}
     )
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     async def listen_once() -> None:
         # Stands in for a real first anchor pass completing.
@@ -2685,7 +2685,7 @@ async def test_start_group_thread_posts_the_v1_chats_contract_and_reports_adopti
     posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
     http = _create_http(posts, resource={"uid": "cht_new", "created": True, "trusted": True},
                         granted=[_chat("cht_a"), _chat("cht_new")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     data = await adapter.start_group_thread(
         ["+15550001111", "sam@example.com"], "hello", trusted=True)
 
@@ -2727,7 +2727,7 @@ async def test_a_malformed_create_response_raises_instead_of_degrading(
     module = _load(monkeypatch, tmp_path)
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"created": True, "trusted": False})  # no uid
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     with pytest.raises(KeyError):
         await adapter.start_group_thread(["+15550001111"], "hello", trusted=False)
 
@@ -2755,7 +2755,7 @@ async def test_a_created_thread_off_the_grant_is_not_adopted(
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"uid": "cht_sib", "created": False, "trusted": False},
                         granted=[_chat("cht_a")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     data = await adapter.start_group_thread(["+15550001111"], "hello")
     assert data["adoption"] == "not-on-this-agents-line"
@@ -2808,7 +2808,7 @@ async def test_start_group_thread_raises_plow_send_error_on_4xx(
     module = _load(monkeypatch, tmp_path)
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"error": {"code": "line_not_found"}}, status=404)
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     with pytest.raises(module._PlowSendError) as err:
         await adapter.start_group_thread(["+15550001111"], "hello")
@@ -2984,7 +2984,7 @@ class _PreferenceHTTP(_HTTP):
 def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     return adapter
 
 
@@ -3050,6 +3050,31 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 
     outside_turn = await adapter.send("cht_a", "cron delivery")
     assert outside_turn.success and "cht_a" not in adapter._typing
+
+
+async def test_a_kicked_loop_resumes_posting_after_the_grace_delay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The re-arm is only real if the restarted loop actually posts a fresh
+    `start` once the grace delay elapses -- task identity alone could hide a
+    loop that never fires."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    real_sleep = asyncio.sleep
+
+    async def instant(_delay: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(module.asyncio, "sleep", instant)
+    adapter._typing["cht_a"] = asyncio.get_running_loop().create_future()
+    await adapter.send("cht_a", "interim update")
+    for _ in range(10):                      # let the kicked task run its loop
+        await real_sleep(0)
+    adapter._cancel_typing("cht_a")
+    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
 
 
 @pytest.mark.parametrize(

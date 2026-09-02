@@ -704,7 +704,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # after the turn, so clear it. Only kicked turns pay the call.
             self._kicked.discard(chat_uid)
             try:
-                async with aiohttp.ClientSession() as http:
+                # Short timeout: this rides the gateway's turn-completion
+                # path, and a hung provider must not stall it for minutes.
+                async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=5)) as http:
                     await http.post(f"{BASE}/v1/chats/{chat_uid}/typing",
                                     json={"action": "stop"}, headers=self.auth)
             except Exception as exc:            # noqa: BLE001 - best effort
@@ -735,10 +738,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
-        # The post cleared the provider indicator; a mid-turn send re-arms it
-        # so the owner keeps seeing "working". For the turn's final reply,
-        # on_processing_complete cancels the restart and stops the indicator.
-        self._kick_typing(chat_id)
+        # A successful post cleared the provider indicator; a mid-turn send
+        # re-arms it so the owner keeps seeing "working" (a failed post
+        # cleared nothing — the running loop stays). For the turn's final
+        # reply, on_processing_complete cancels the restart and stops it.
+        if result.success:
+            self._kick_typing(chat_id)
         return result
 
     async def _verbose_enabled(self, http):
@@ -905,7 +910,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # alongside — the post clears the provider indicator, so
                 # re-arm it: a verbose assistant gets both, not one or the other.
                 result = await self._post_message(http, chat_id, {"body": content.strip()})
-                self._kick_typing(chat_id)
+                if result.success:
+                    self._kick_typing(chat_id)
                 return result
         # Key and chat only, never the content: status payloads carry upstream
         # provider detail with no non-secret guarantee, and this frame exists
@@ -953,7 +959,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             result = await self._post_message(
                 http, chat_id,
                 {"body": (caption or "").strip(), "attachment_uids": [declared["uid"]]})
-        self._kick_typing(chat_id)           # same re-arm as send()
+        if result.success:
+            self._kick_typing(chat_id)       # same re-arm as send()
         return result
 
     async def send_image_file(self, chat_id, image_path, caption=None, **_kwargs):
