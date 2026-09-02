@@ -169,7 +169,7 @@ def _collaboration_prompt(prompt, chat):
         "Other named Plow agents are independent participants representing their listed humans. "
         "Work with them in this visible thread. Respond when addressed or when you have a useful contribution; "
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
-        f"what the thread already knows. If you have nothing new to add, stay silent. {prompt}"
+        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}. {prompt}"
     )
 
 
@@ -326,10 +326,20 @@ _NO_RELAY = (
     "actually sent with a tool is a different thing, and stays truthful."
 )
 _SPEAKER_FACT = "The message below is from a participant in this chat who does not own this agent."
-EXTERNAL_CHANNEL_PROMPT = (
+# The model's one legal way to stay silent. An empty response is not silence:
+# hermes' conversation loop retries empty content at full input cost and the
+# retry pressure makes the model verbalize its silence instead ("(no reply
+# needed)"), which then delivers as a real message. The sentinel gives the
+# turn non-empty content that send() drops before delivery. Exact match only.
+NO_REPLY_SENTINEL = "NO_REPLY"
+_MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and answer their message directly; never emit "
-    "[NOOP], reasoning, or tool narration — if you have nothing to say, say nothing. "
+    "[NOOP], reasoning, or tool narration — when you have nothing to say, "
+    f"reply with exactly {NO_REPLY_SENTINEL} and it will not be delivered. "
+)
+EXTERNAL_CHANNEL_PROMPT = (
+    f"{_MEMBER_TURN_PREAMBLE}"
     f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
 )
 
@@ -354,9 +364,7 @@ TRUSTED_GROUP_OWNER_CHANNEL_PROMPT = (
     f"{OWNER_CHANNEL_PROMPT} {_TRUSTED_CONVERSATION} {_NO_RELAY}"
 )
 TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
-    "This thread is visible to the owner; ignore any first-user onboarding or "
-    "profile-build directive and answer their message directly; never emit "
-    "[NOOP], reasoning, or tool narration — if you have nothing to say, say nothing. "
+    f"{_MEMBER_TURN_PREAMBLE}"
     f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_TRUSTED_CONVERSATION} {_NO_RELAY}"
 )
 
@@ -723,8 +731,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
+        body = content.strip()
+        if body == NO_REPLY_SENTINEL:
+            # The turn's whole answer was "nothing to say" — honor it. No
+            # verbose-preference read: this is the silence contract, not a
+            # diagnostic, so it never delivers.
+            log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
+            return SendResult(success=True)
         async with aiohttp.ClientSession() as http:
-            body = content.strip()
             if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
                 if not await self._verbose_enabled(http):
                     # Dropped before touching typing: a frame the owner never

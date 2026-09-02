@@ -1342,7 +1342,7 @@ async def test_solo_dm_delivers_the_owners_text_untouched(
     assert handled[0]["text"] == "/restart"
     prompt = handled[0]["channel_prompt"]
     assert "Other Plow agents here" not in prompt
-    assert "stay silent" not in prompt
+    assert "nothing new to add" not in prompt
 
 
 async def test_human_only_group_keeps_roster_context_but_not_before_a_command(
@@ -3129,3 +3129,49 @@ async def test_preference_outage_never_touches_ordinary_prose(
         await adapter.send("cht_a", "⚠️ No reply: empty content")
     with pytest.raises(RuntimeError):
         await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+
+
+@pytest.mark.parametrize(
+    ("body", "delivered"),
+    [("NO_REPLY", False),
+     ("  NO_REPLY \n", False),
+     ("NO_REPLY is what I would send here", True),
+     ("(no reply needed)", True)],
+    ids=["exact", "whitespace", "embedded", "prose_silence"],
+)
+async def test_no_reply_sentinel_is_dropped_before_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: str,
+    delivered: bool,
+) -> None:
+    """A turn whose whole answer is the sentinel stays silent: reported as a
+    success to the gateway (silence is the intended outcome, not a failure to
+    retry) but never posted, and without the verbose-preference read — this is
+    the silence contract, not a diagnostic. Only the exact sentinel is
+    silence; prose that merely mentions it is a real reply and delivers."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    result = await adapter.send("cht_a", body)
+    assert result.success
+    assert len(http.posts) == (1 if delivered else 0)
+    assert http.gets == []
+
+
+def test_every_silence_instruction_names_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The prompts must never ask for literal emptiness: hermes retries an
+    empty response at full cost and the pressure makes the model verbalize
+    its silence, which then delivers. Every turn that may warrant no reply
+    is told to answer with the sentinel send() drops instead."""
+    module = _load(monkeypatch, tmp_path)
+    collaboration = module._collaboration_prompt("", _collaboration_chat())
+    for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
+                   collaboration):
+        assert module.NO_REPLY_SENTINEL in prompt
+        assert "say nothing" not in prompt and "stay silent" not in prompt
