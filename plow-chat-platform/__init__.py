@@ -38,6 +38,9 @@ BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
 _NO_REPLY_PREFIX = "⚠️ No reply: "
+# Upstream's long-running heartbeat rides plain send(), not
+# send_or_update_status, so the one verbose preference has to gate it here.
+_WORKING_PREFIX = "⏳ Working —"
 PLATFORM_NAME = "plow_chat"
 def _invite_message_template(owner_name):
     return (
@@ -751,7 +754,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
         async with aiohttp.ClientSession() as http:
-            if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
+            if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX, _WORKING_PREFIX)):
                 if not await self._verbose_enabled(http):
                     # Dropped before touching typing: a frame the owner never
                     # sees must not eat the "working" signal either.
