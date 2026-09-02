@@ -131,20 +131,27 @@ def _speaker_name(sender, chat):
 
 
 def _collaboration_prompt(prompt, chat):
-    """System-authority context contains ops-seeded agent names only."""
-    participants = chat.get("participants") or []
-    self_agent = next((p for p in participants
-                       if p.get("type") == "agent" and p.get("relationship") == "self"), None)
-    if self_agent is None:
-        return _with_identity(prompt, _agent_name(chat))
+    """System-authority context contains ops-seeded agent names only.
 
-    self_name = (self_agent.get("line") or {}).get("display_name") or "this Plow agent"
+    Gated on a PEER agent, not on ourselves: the server lists this agent in
+    every chat it can see, so a self-gate fired in 1:1 DMs too and told the
+    model its collaborators were "none" -- and to stay silent -- on every turn
+    the owner took alone with it.
+    """
+    participants = chat.get("participants") or []
     peers = [
         (peer.get("line") or {}).get("display_name") or "an unnamed peer agent"
         for peer in participants
         if peer.get("type") == "agent" and peer.get("relationship") == "peer"
     ]
-    peer_fact = ", ".join(peers) if peers else "none"
+    if not peers:
+        return _with_identity(prompt, _agent_name(chat))
+
+    self_agent = next((p for p in participants
+                       if p.get("type") == "agent" and p.get("relationship") == "self"), None)
+    self_name = (self_agent.get("line") or {}).get("display_name") if self_agent else None
+    self_name = self_name or "this Plow agent"
+    peer_fact = ", ".join(peers)
     return (
         f"Collaboration context: You are {self_name}. Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
@@ -155,9 +162,15 @@ def _collaboration_prompt(prompt, chat):
 
 
 def _collaboration_turn_context(chat, sender):
-    """Roster labels are user-role data, never channel/system instructions."""
+    """Roster labels are user-role data, never channel/system instructions.
+
+    Only a chat with a PEER agent needs them. Gating on ourselves instead
+    prefixed the owner's own words in every DM, and the gateway reads a slash
+    command off the start of the delivered text -- so "/restart" arrived as
+    prose behind the roster paragraph and never ran.
+    """
     participants = chat.get("participants") or []
-    if not any(p.get("type") == "agent" and p.get("relationship") == "self" for p in participants):
+    if not any(p.get("type") == "agent" and p.get("relationship") == "peer" for p in participants):
         return ""
     humans = [p.get("display_name") or p.get("uid") for p in participants if p.get("type") == "member"]
     mappings = []

@@ -349,6 +349,22 @@ def _collaboration_chat() -> dict[str, Any]:
     }
 
 
+def _dm_chat() -> dict[str, Any]:
+    """A 1:1 DM as the server actually lists it: the owner and us, no peer."""
+    return {
+        "uid": "cht_a",
+        "participants": [
+            {
+                "type": "agent",
+                "relationship": "self",
+                "represents_participant_uid": "mem_sam_cht_a",
+                "line": {"uid": "ln_elm", "display_name": "Elm"},
+            },
+            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner"},
+        ],
+    }
+
+
 class _BytesResp(_Resp):
     def __init__(self, data: bytes, status: int = 200) -> None:
         super().__init__(None, status)
@@ -1280,6 +1296,42 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     assert "Elm represents Sam" in handled[0]["text"]
     assert "Ash represents Daniel" in handled[0]["text"]
     assert "Current speaker: Daniel" in handled[0]["text"]
+
+
+async def test_dm_without_peers_delivers_the_owners_text_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_dm_chat()])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    frame = _envelope("evt_dm", "cht_a", "msg_dm", body="/restart")
+    frame["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(frame, object())
+    await _settle(adapter)
+
+    # The gateway reads a slash command off the front of the text: anything
+    # prepended here and the command arrives as prose instead of running.
+    assert handled[0]["text"] == "/restart"
+    prompt = handled[0]["channel_prompt"]
+    assert "Other Plow agents here" not in prompt
+    assert "stay silent" not in prompt
+
+
+def test_dm_roster_context_and_collaboration_prompt_are_both_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    chat = _dm_chat()
+    sender = chat["participants"][-1]
+
+    assert module._collaboration_turn_context(chat, sender) == ""
+    prompt = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, chat)
+    assert "Collaboration context" not in prompt
 
 
 async def test_peer_agent_turn_is_delivered_with_peer_identity(
