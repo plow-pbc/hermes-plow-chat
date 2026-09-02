@@ -739,11 +739,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
-        if body == NO_REPLY_SENTINEL and turn is not None and turn.get("no_reply_ok"):
+        if (body == NO_REPLY_SENTINEL and turn is not None
+                and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn's whole answer was "nothing to say" — honor it. Gated
-            # on the turn's own prompt having advertised the sentinel: on a
-            # solo owner DM (or a cron delivery) NO_REPLY is ordinary text —
-            # an owner asking for that literal string must get it back. No
+            # on the turn's own prompt having advertised the sentinel AND on
+            # the turn's own chat: on a solo owner DM, a cron delivery, or an
+            # explicit send to another granted chat, NO_REPLY is ordinary
+            # text — whoever asked for that literal string must get it. No
             # verbose-preference read: this is the silence contract, not a
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)

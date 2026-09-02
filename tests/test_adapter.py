@@ -3140,30 +3140,34 @@ async def test_preference_outage_never_touches_ordinary_prose(
      ("NO_REPLY is what I would send here", True, True),
      ("(no reply needed)", True, True),
      ("NO_REPLY", False, True),
-     ("NO_REPLY", None, True)],
+     ("NO_REPLY", None, True),
+     ("NO_REPLY", "cross_chat", True)],
     ids=["exact", "whitespace", "embedded", "prose_silence",
-         "solo_dm_turn", "no_turn"],
+         "solo_dm_turn", "no_turn", "cross_chat_send"],
 )
 async def test_no_reply_sentinel_is_dropped_before_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     body: str,
-    sentinel_turn: bool | None,
+    sentinel_turn: bool | str | None,
     delivered: bool,
 ) -> None:
     """A turn whose whole answer is the sentinel stays silent: reported as a
     success to the gateway (silence is the intended outcome, not a failure to
     retry) but never posted, and without the verbose-preference read — this is
     the silence contract, not a diagnostic. Only the exact sentinel is
-    silence, and only on a turn whose prompt established it: prose that
-    merely mentions it, a solo-DM turn whose prompt never advertised it, and
-    a turn-less (cron) delivery are all real content and deliver."""
+    silence, and only on and for the turn whose prompt established it: prose
+    that merely mentions it, a solo-DM turn whose prompt never advertised it,
+    a turn-less (cron) delivery, and an owner turn's explicit send to a
+    *different* granted chat are all real content and deliver."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
     if sentinel_turn is not None:
+        turn_chat = "cht_b" if sentinel_turn == "cross_chat" else "cht_a"
         adapter._active_turn.set(
-            {"chat_uid": "cht_a", "owner": True, "no_reply_ok": sentinel_turn})
+            {"chat_uid": turn_chat, "owner": True,
+             "no_reply_ok": bool(sentinel_turn)})
 
     result = await adapter.send("cht_a", body)
     assert result.success
