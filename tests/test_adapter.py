@@ -1649,8 +1649,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     assert not results["outside_grant"].success
     assert http.posts == [
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
-        # The in-turn send re-armed the typing loop, so turn completion
-        # clears the indicator it may have re-raised after the reply.
+        # Every turn completion clears the typing indicator the in-turn
+        # send's re-arm (or the loop's own refresh) may have left raised.
+        (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
@@ -3028,37 +3029,9 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 ) -> None:
     """In quiet mode the typing indicator is the only "working" signal, so it
     must survive the whole turn: a delivered mid-turn send re-arms the refresh
-    loop (the message post cleared the provider-side bubble), a quiet-dropped
-    diagnostic never touches it, and a send outside any turn starts none."""
-    module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
-    adapter = _verbose_adapter(module, http, monkeypatch)
-
-    typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_a"] = typing
-
-    dropped = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    assert dropped.success
-    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
-
-    sent = await adapter.send("cht_a", "interim update")
-    assert sent.success
-    replacement = adapter._typing.get("cht_a")
-    assert replacement is not typing and typing.cancelled()
-    assert isinstance(replacement, asyncio.Task)
-    adapter._cancel_typing("cht_a")
-
-    outside_turn = await adapter.send("cht_a", "cron delivery")
-    assert outside_turn.success and "cht_a" not in adapter._typing
-
-
-async def test_a_kicked_loop_resumes_posting_after_the_grace_delay(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """The re-arm is only real if the restarted loop actually posts a fresh
-    `start` once the grace delay elapses -- task identity alone could hide a
-    loop that never fires."""
+    loop, which posts a fresh `start` once the grace delay elapses (the
+    message post cleared the provider-side bubble); a quiet-dropped diagnostic
+    never touches it; and a send outside any turn starts none."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3069,12 +3042,22 @@ async def test_a_kicked_loop_resumes_posting_after_the_grace_delay(
         await real_sleep(0)
 
     monkeypatch.setattr(module.asyncio, "sleep", instant)
-    adapter._typing["cht_a"] = asyncio.get_running_loop().create_future()
-    await adapter.send("cht_a", "interim update")
-    for _ in range(10):                      # let the kicked task run its loop
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
+
+    dropped = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    assert dropped.success
+    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+    sent = await adapter.send("cht_a", "interim update")
+    assert sent.success and typing.cancelled()
+    for _ in range(10):                      # let the re-armed loop run
         await real_sleep(0)
     adapter._cancel_typing("cht_a")
     assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
+
+    outside_turn = await adapter.send("cht_a", "cron delivery")
+    assert outside_turn.success and "cht_a" not in adapter._typing
 
 
 @pytest.mark.parametrize(
