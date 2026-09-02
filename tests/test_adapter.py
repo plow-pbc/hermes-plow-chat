@@ -1350,6 +1350,46 @@ async def test_display_name_override_replaces_self_name_everywhere(
     assert "Ash" in prompt
 
 
+async def test_blank_display_name_override_falls_back_to_server_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "")
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    chat = _collaboration_chat()
+    adapter._set_reach([chat])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    frame = _envelope("evt_1", "cht_a", "msg_1", role="member", body="Hey Ash")
+    frame["data"]["message"]["sender"].update(uid="mem_daniel_cht_a", display_name="Daniel")
+    await adapter._on_frame(frame, object())
+    await _settle(adapter)
+
+    assert "You are Elm" in handled[0]["channel_prompt"]
+    assert "Elm represents Sam" in handled[0]["text"]
+
+
+async def test_display_name_override_applies_in_a_solo_dm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "Jessie")
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_dm_chat()])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    frame = _envelope("evt_dm", "cht_a", "msg_dm", body="hi")
+    frame["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(frame, object())
+    await _settle(adapter)
+
+    assert "You are Jessie" in handled[0]["channel_prompt"]
+
+
 async def test_solo_dm_delivers_the_owners_text_untouched(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
