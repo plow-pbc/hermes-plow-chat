@@ -1322,6 +1322,34 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     assert handled[1]["text"] == "/restart"
 
 
+async def test_display_name_override_replaces_self_name_everywhere(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    monkeypatch.setenv("PLOW_CHAT_AGENT_NAME", "Jessie")
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    chat = _collaboration_chat()
+    adapter._set_reach([chat])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    frame = _envelope("evt_1", "cht_a", "msg_1", role="member", body="Hey Ash")
+    frame["data"]["message"]["sender"].update(uid="mem_daniel_cht_a", display_name="Daniel")
+    await adapter._on_frame(frame, object())
+    await _settle(adapter)
+
+    prompt = handled[0]["channel_prompt"]
+    text = handled[0]["text"]
+    assert "You are Jessie" in prompt
+    assert "Jessie represents Sam" in text
+    assert "Elm" not in prompt
+    assert "Elm" not in text
+    # The peer's real name must survive the override untouched.
+    assert "Ash represents Daniel" in text
+    assert "Ash" in prompt
+
+
 async def test_solo_dm_delivers_the_owners_text_untouched(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

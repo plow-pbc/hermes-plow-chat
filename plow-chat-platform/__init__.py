@@ -110,7 +110,18 @@ def _agent_name(chat):
     worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
     of the listing readers: a pre-persona server omits `line`, and an unnamed
     line omits `display_name`.
+
+    `PLOW_CHAT_AGENT_NAME`, if set to a non-empty value, overrides the
+    server's name in every text surface this function feeds — the
+    collaboration prompt and (via the mapping loop in
+    `_collaboration_turn_context`) the roster line. It does not change
+    `line.display_name` itself, and it does not reach the iMessage contact
+    card, which the server delivers directly to the phone before this
+    plugin's gateway ever connects.
     """
+    override = os.environ.get("PLOW_CHAT_AGENT_NAME")
+    if override:
+        return override
     return _self_agent_line(chat).get("display_name") or None
 
 
@@ -189,7 +200,11 @@ def _collaboration_turn_context(chat, sender):
     for agent in (p for p in participants if p.get("type") == "agent"):
         human = _represented_member(chat, agent)
         if human is not None:
-            agent_name = (agent.get("line") or {}).get("display_name") or "unnamed agent"
+            is_self = agent.get("relationship") in (None, "self")
+            agent_name = (
+                _agent_name(chat) if is_self
+                else (agent.get("line") or {}).get("display_name") or "unnamed agent"
+            )
             mappings.append(f"{agent_name} represents {human.get('display_name') or human['uid']}")
     speaker_name, speaker_kind = _speaker_name(sender, chat)
     return (

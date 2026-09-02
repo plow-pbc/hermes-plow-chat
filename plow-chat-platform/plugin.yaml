@@ -27,3 +27,8 @@ optional_env:
     prompt: "Plow API base URL"
     secret: false
     password: false
+  - name: PLOW_CHAT_AGENT_NAME
+    description: "Override this line's persona name in text the model sees (roster mappings, collaboration prompt). Does not change the server-assigned line name or the iMessage contact card."
+    prompt: "Agent display name override"
+    secret: false
+    password: false
