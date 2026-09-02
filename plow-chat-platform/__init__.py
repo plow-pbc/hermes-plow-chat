@@ -518,6 +518,18 @@ class PlowChatAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
 
+    def _kick_typing(self, chat_uid):
+        """A message post just cleared the provider-side indicator, so if a
+        turn's typing loop is live, restart it — otherwise the indicator stays
+        dark until the loop's next 60s tick, or forever once cancelled. The
+        grace delay debounces multi-part sends and gives on_processing_complete
+        time to cancel a final-reply restart before it ever posts."""
+        if chat_uid not in self._typing:
+            return
+        self._cancel_typing(chat_uid)
+        self._typing[chat_uid] = asyncio.create_task(
+            self._typing_until_reply(chat_uid, initial_delay=2.0))
+
     def _set_reach(self, chats):
         next_chats = {chat["uid"]: chat for chat in chats}
         if not next_chats:
@@ -680,8 +692,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._active_turn.set(turn)
 
     async def on_processing_complete(self, event, outcome):
-        self._cancel_typing(event.source.chat_id)
+        chat_uid = event.source.chat_id
+        self._cancel_typing(chat_uid)
         self._active_turn.set(None)
+        # The final reply's kick may have re-raised the indicator after the
+        # reply cleared it; a start left alone lingers up to ~90s, so clear
+        # it. Short timeout: this rides the gateway's turn-completion path,
+        # and a hung provider must not stall it for minutes.
+        try:
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=5)) as http:
+                await http.post(f"{BASE}/v1/chats/{chat_uid}/typing",
+                                json={"action": "stop"}, headers=self.auth)
+        except Exception as exc:                # noqa: BLE001 - best effort
+            log.debug("[plow_chat] typing stop: %s", exc)
 
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within
@@ -699,11 +723,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
-        self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
             body = content.strip()
             if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
                 if not await self._verbose_enabled(http):
+                    # Dropped before touching typing: a frame the owner never
+                    # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
             return await self._post_message(http, chat_id, {"body": body})
@@ -868,9 +893,9 @@ class PlowChatAdapter(BasePlatformAdapter):
                 refused = self._send_guard(chat_id)
                 if refused is not None:
                     return refused
-                # Not send(): that cancels the typing indicator, and a mid-turn
-                # status must not eat the "working" signal it rides alongside —
-                # a verbose assistant gets both, not one or the other.
+                # A mid-turn status must not eat the "working" signal it rides
+                # alongside — _post_message re-arms the indicator its delivery
+                # clears: a verbose assistant gets both, not one or the other.
                 return await self._post_message(http, chat_id, {"body": content.strip()})
         # Key and chat only, never the content: status payloads carry upstream
         # provider detail with no non-secret guarantee, and this frame exists
@@ -884,7 +909,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             data = await resp.json(content_type=None)
             if resp.status >= 400:
                 return SendResult(success=False, error=f"Plow Chat {resp.status}: {data}")
-            return SendResult(success=True, message_id=data.get("uid"))
+        # A delivered message cleared the provider-side typing indicator, so
+        # re-arm the turn's loop (if one is live) to keep "working" visible;
+        # a failed post cleared nothing and the running loop stays. For the
+        # final reply, on_processing_complete cancels the restart and stops it.
+        self._kick_typing(chat_id)
+        return SendResult(success=True, message_id=data.get("uid"))
 
     async def _send_attachment(self, chat_id, path, *, caption=None, filename=None):
         """Declare, upload, send — the Plow media contract, in that order.
@@ -903,7 +933,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         with open(path, "rb") as fh:
             data = fh.read()
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        self._cancel_typing(chat_id)
         async with aiohttp.ClientSession() as http:
             async with http.post(f"{BASE}/v1/chats/{chat_id}/attachments",
                                  json={"filename": filename, "content_type": content_type,
@@ -989,15 +1018,19 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
-    async def _typing_until_reply(self, chat_uid):
+    async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
 
         The indicator auto-clears server-side around 85-90s, so it is
-        refreshed inside that window; the reply message clears it, and so does
-        cancellation. A 424 is a generic provider rejection, not a turn error,
-        and is never allowed to break a turn.
+        refreshed inside that window; cancellation ends the loop, and every
+        message post restarts it via _kick_typing (with the grace
+        `initial_delay`), so the indicator survives mid-turn sends. A 424 is
+        a generic provider rejection, not a turn error, and is never allowed
+        to break a turn.
         """
         try:
+            if initial_delay:
+                await asyncio.sleep(initial_delay)
             async with aiohttp.ClientSession() as http:
                 while True:
                     try:

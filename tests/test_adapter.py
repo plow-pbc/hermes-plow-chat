@@ -1526,7 +1526,7 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
     http = _SocketHTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     greetings: list[str] = []
 
     async def greet(chat_id: str, content: str, **kwargs: Any) -> _SendResult:
@@ -1616,7 +1616,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
     _mark_anchored(adapter, "cht_a", "cht_b")
     http = _HTTP()
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     results: dict[str, _SendResult] = {}
 
@@ -1649,6 +1649,10 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     assert not results["outside_grant"].success
     assert http.posts == [
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
+        # Every turn completion clears the typing indicator the in-turn
+        # send's re-arm (or the loop's own refresh) may have left raised.
+        (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
+        (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
 
@@ -2584,7 +2588,7 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     http.get = lambda url, headers: _Resp(  # type: ignore[attr-defined,method-assign]
         {"object": "list", "data": [_chat("cht_a")], "has_more": False}
     )
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     async def listen_once() -> None:
         # Stands in for a real first anchor pass completing.
@@ -2682,7 +2686,7 @@ async def test_start_group_thread_posts_the_v1_chats_contract_and_reports_adopti
     posts: list[tuple[str, dict[str, Any], dict[str, str]]] = []
     http = _create_http(posts, resource={"uid": "cht_new", "created": True, "trusted": True},
                         granted=[_chat("cht_a"), _chat("cht_new")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     data = await adapter.start_group_thread(
         ["+15550001111", "sam@example.com"], "hello", trusted=True)
 
@@ -2724,7 +2728,7 @@ async def test_a_malformed_create_response_raises_instead_of_degrading(
     module = _load(monkeypatch, tmp_path)
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"created": True, "trusted": False})  # no uid
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     with pytest.raises(KeyError):
         await adapter.start_group_thread(["+15550001111"], "hello", trusted=False)
 
@@ -2752,7 +2756,7 @@ async def test_a_created_thread_off_the_grant_is_not_adopted(
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"uid": "cht_sib", "created": False, "trusted": False},
                         granted=[_chat("cht_a")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     data = await adapter.start_group_thread(["+15550001111"], "hello")
     assert data["adoption"] == "not-on-this-agents-line"
@@ -2805,7 +2809,7 @@ async def test_start_group_thread_raises_plow_send_error_on_4xx(
     module = _load(monkeypatch, tmp_path)
     adapter = _adapter_with_home_line(module)
     http = _create_http([], resource={"error": {"code": "line_not_found"}}, status=404)
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     with pytest.raises(module._PlowSendError) as err:
         await adapter.start_group_thread(["+15550001111"], "hello")
@@ -2981,7 +2985,7 @@ class _PreferenceHTTP(_HTTP):
 def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a")])
-    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda: http)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     return adapter
 
 
@@ -2997,7 +3001,9 @@ async def test_status_frames_follow_verbose_preference(
     iMessage thread as real messages (#30). Quiet is the default: dropped --
     the typing indicator already covers "working" -- and reported as success
     so the gateway never retries. Verbose delivers, and must not eat the
-    typing indicator: both signals, not one or the other."""
+    typing indicator: the message post clears the provider-side bubble, so
+    delivery re-arms the loop -- both signals, not one or the other. Quiet
+    leaves the running loop entirely untouched."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": enabled})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3008,7 +3014,50 @@ async def test_status_frames_follow_verbose_preference(
     result = await adapter.send_or_update_status("cht_a", "compacted", status)
     expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})] if enabled else []
     assert result.success and http.posts == expected
+    if enabled:
+        replacement = adapter._typing.get("cht_a")
+        assert replacement is not typing and typing.cancelled()
+        assert isinstance(replacement, asyncio.Task)
+        adapter._cancel_typing("cht_a")
+    else:
+        assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+
+async def test_mid_turn_sends_keep_the_typing_indicator_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """In quiet mode the typing indicator is the only "working" signal, so it
+    must survive the whole turn: a delivered mid-turn send re-arms the refresh
+    loop, which posts a fresh `start` once the grace delay elapses (the
+    message post cleared the provider-side bubble); a quiet-dropped diagnostic
+    never touches it; and a send outside any turn starts none."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    real_sleep = asyncio.sleep
+
+    async def instant(_delay: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(module.asyncio, "sleep", instant)
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
+
+    dropped = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    assert dropped.success
     assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+    sent = await adapter.send("cht_a", "interim update")
+    assert sent.success and typing.cancelled()
+    for _ in range(10):                      # let the re-armed loop run
+        await real_sleep(0)
+    adapter._cancel_typing("cht_a")
+    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
+
+    outside_turn = await adapter.send("cht_a", "cron delivery")
+    assert outside_turn.success and "cht_a" not in adapter._typing
 
 
 @pytest.mark.parametrize(
