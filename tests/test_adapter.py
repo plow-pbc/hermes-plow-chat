@@ -1312,6 +1312,15 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     assert "Ash represents Daniel" in handled[0]["text"]
     assert "Current speaker: Daniel" in handled[0]["text"]
 
+    # Even here, a command is addressed to the gateway rather than the
+    # thread, so nothing goes in front of the "/".
+    command = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
+    command["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(command, object())
+    await _settle(adapter)
+
+    assert handled[1]["text"] == "/restart"
+
 
 async def test_solo_dm_delivers_the_owners_text_untouched(
     monkeypatch: pytest.MonkeyPatch,
@@ -1334,24 +1343,6 @@ async def test_solo_dm_delivers_the_owners_text_untouched(
     prompt = handled[0]["channel_prompt"]
     assert "Other Plow agents here" not in prompt
     assert "stay silent" not in prompt
-
-
-async def test_command_in_a_multi_agent_group_is_delivered_bare(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_collaboration_chat()])
-    _mark_anchored(adapter, "cht_a")
-    handled = _capture_events(monkeypatch, adapter)
-
-    frame = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
-    frame["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
-    await adapter._on_frame(frame, object())
-    await _settle(adapter)
-
-    assert handled[0]["text"] == "/restart"
 
 
 async def test_human_only_group_keeps_roster_context_but_not_before_a_command(
