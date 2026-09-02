@@ -1342,7 +1342,7 @@ async def test_solo_dm_delivers_the_owners_text_untouched(
     assert handled[0]["text"] == "/restart"
     prompt = handled[0]["channel_prompt"]
     assert "Other Plow agents here" not in prompt
-    assert "stay silent" not in prompt
+    assert "nothing new to add" not in prompt
 
 
 async def test_human_only_group_keeps_roster_context_but_not_before_a_command(
@@ -1861,6 +1861,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
     return {
         "chat_uid": "cht_b",
         "owner": False,
+        "no_reply_ok": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
         "source_message_id": "msg_delight_1",
@@ -1958,7 +1959,8 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "source_message_id": "msg_delight_1"},
+            {"chat_uid": "cht_b", "owner": False, "no_reply_ok": False,
+             "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
         pytest.param(
@@ -3129,3 +3131,88 @@ async def test_preference_outage_never_touches_ordinary_prose(
         await adapter.send("cht_a", "⚠️ No reply: empty content")
     with pytest.raises(RuntimeError):
         await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+
+
+@pytest.mark.parametrize(
+    ("body", "sentinel_turn", "delivered"),
+    [("NO_REPLY", True, False),
+     ("  NO_REPLY \n", True, False),
+     ("NO_REPLY is what I would send here", True, True),
+     ("(no reply needed)", True, True),
+     ("NO_REPLY", False, True),
+     ("NO_REPLY", None, True),
+     ("NO_REPLY", "cross_chat", True)],
+    ids=["exact", "whitespace", "embedded", "prose_silence",
+         "solo_dm_turn", "no_turn", "cross_chat_send"],
+)
+async def test_no_reply_sentinel_is_dropped_before_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: str,
+    sentinel_turn: bool | str | None,
+    delivered: bool,
+) -> None:
+    """A turn whose whole answer is the sentinel stays silent: reported as a
+    success to the gateway (silence is the intended outcome, not a failure to
+    retry) but never posted, and without the verbose-preference read — this is
+    the silence contract, not a diagnostic. Only the exact sentinel is
+    silence, and only on and for the turn whose prompt established it: prose
+    that merely mentions it, a solo-DM turn whose prompt never advertised it,
+    a turn-less (cron) delivery, and an owner turn's explicit send to a
+    *different* granted chat are all real content and deliver."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    if sentinel_turn is not None:
+        turn_chat = "cht_b" if sentinel_turn == "cross_chat" else "cht_a"
+        adapter._active_turn.set(
+            {"chat_uid": turn_chat, "owner": True,
+             "no_reply_ok": bool(sentinel_turn)})
+
+    result = await adapter.send("cht_a", body)
+    assert result.success
+    assert len(http.posts) == (1 if delivered else 0)
+    assert http.gets == []
+
+
+async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """on_processing_start derives no_reply_ok from the event's own channel
+    prompt — the same string the model was given — so the gate can't drift
+    from the instruction."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    for prompt, expected in ((module.EXTERNAL_CHANNEL_PROMPT, True),
+                             (module.OWNER_CHANNEL_PROMPT, False)):
+        event = SimpleNamespace(
+            source=SimpleNamespace(chat_id="cht_a", user_id="u", role_authorized=True),
+            message_id="msg_1", channel_prompt=prompt)
+        await adapter.on_processing_start(event)
+        turn = adapter._active_turn.get()
+        assert turn["no_reply_ok"] is expected
+        await adapter.on_processing_complete(event, None)
+
+
+def test_every_silence_instruction_names_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The prompts must never ask for literal emptiness: hermes retries an
+    empty response at full cost and the pressure makes the model verbalize
+    its silence, which then delivers. Every turn that may warrant no reply
+    is told to answer with the sentinel send() drops instead."""
+    module = _load(monkeypatch, tmp_path)
+    collaboration = module._collaboration_prompt("", _collaboration_chat())
+    for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
+                   module.GROUP_OWNER_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT,
+                   collaboration):
+        assert module.NO_REPLY_SENTINEL in prompt
+        assert "say nothing" not in prompt and "stay silent" not in prompt
+    # A solo owner DM never warrants unprompted silence, so its prompt does
+    # not reserve the token — send()'s gate keys off exactly this absence.
+    assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
