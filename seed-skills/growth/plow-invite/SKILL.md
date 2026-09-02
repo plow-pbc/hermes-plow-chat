@@ -39,7 +39,7 @@ you have already invited (check your memory first).
      fixed owner notice derived from the recorded turn. Record the pending ask
      only when that succeeds. Never leave the praising person with an empty
      response while you wait for the owner.
-   - `ready`: draft and send the invite as described below.
+   - `ready`: send the invite as described below.
 3. When the owner answers the consent request, run
    `python3 <this skill's dir>/scripts/mint_invite.py --consent granted` or
    `--consent declined`. On a grant, call `plow_prepare_invite` with no
