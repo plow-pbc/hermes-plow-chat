@@ -168,6 +168,12 @@ def _capture_events(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> list[Any]:
     return events
 
 
+def _turn_body(text: str) -> str:
+    """The speaker's own words, with any roster prefix a group turn carries
+    dropped -- for tests about burst boundaries rather than roster content."""
+    return text.split("]\n\n", 1)[-1]
+
+
 async def _settle(adapter: Any) -> None:
     """Let every chat's server hand off what it holds."""
     await asyncio.gather(*(queue.join() for queue, _server in adapter._inbound.values()))
@@ -363,6 +369,15 @@ def _dm_chat() -> dict[str, Any]:
             {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner"},
         ],
     }
+
+
+def _human_group_chat() -> dict[str, Any]:
+    """A group of humans with one agent in it: no peer, but a real roster."""
+    chat = _dm_chat()
+    chat["participants"].append(
+        {"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member"}
+    )
+    return chat
 
 
 class _BytesResp(_Resp):
@@ -637,7 +652,7 @@ async def test_inbound_burst_boundaries(
     )
     await _settle(adapter)
 
-    assert [(event["message_id"], event["text"]) for event in handled] == turns
+    assert [(event["message_id"], _turn_body(event["text"])) for event in handled] == turns
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
     # A late duplicate of a handed-off message is dropped, not a new turn.
     await adapter._on_frame(_envelope("evt_1_late", "cht_a", "msg_1"))
@@ -671,8 +686,8 @@ async def test_burst_invite_operation_uses_oldest_uncheckpointed_uid(
         "display_name": "Taylor",
     }
     burst = [
-        SimpleNamespace(uid="msg_first", sender=sender),
-        SimpleNamespace(uid="msg_tail", sender=sender),
+        SimpleNamespace(uid="msg_first", sender=sender, starts_slash_command=False),
+        SimpleNamespace(uid="msg_tail", sender=sender, starts_slash_command=False),
     ]
 
     await adapter._deliver(
@@ -700,10 +715,10 @@ async def test_a_change_of_speaker_closes_the_burst_and_order_holds(
     order: list[str] = []
 
     async def turn(event: Any) -> None:
-        if event.text == "A1":
+        if _turn_body(event.text) == "A1":
             a1_entered.set()
             await release_a1.wait()
-        order.append(event.text)
+        order.append(_turn_body(event.text))
 
     monkeypatch.setattr(adapter, "handle_message", turn)
     await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", body="A1"))
@@ -1298,7 +1313,7 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     assert "Current speaker: Daniel" in handled[0]["text"]
 
 
-async def test_dm_without_peers_delivers_the_owners_text_untouched(
+async def test_solo_dm_delivers_the_owners_text_untouched(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1321,17 +1336,52 @@ async def test_dm_without_peers_delivers_the_owners_text_untouched(
     assert "stay silent" not in prompt
 
 
-def test_dm_roster_context_and_collaboration_prompt_are_both_empty(
+async def test_command_in_a_multi_agent_group_is_delivered_bare(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    chat = _dm_chat()
-    sender = chat["participants"][-1]
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_collaboration_chat()])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
 
-    assert module._collaboration_turn_context(chat, sender) == ""
-    prompt = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, chat)
-    assert "Collaboration context" not in prompt
+    frame = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
+    frame["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(frame, object())
+    await _settle(adapter)
+
+    assert handled[0]["text"] == "/restart"
+
+
+async def test_human_only_group_keeps_roster_context_but_not_before_a_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_human_group_chat()])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    prose = _envelope("evt_prose", "cht_a", "msg_prose", body="who is here?")
+    prose["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(prose, object())
+    await _settle(adapter)
+
+    # Several humans can speak here, so the model still needs to know who did.
+    assert "untrusted chat roster labels" in handled[0]["text"].lower()
+    assert "Current speaker: Sam" in handled[0]["text"]
+    # No peer to collaborate with, so no collaboration paragraph -- the
+    # named-line identity prefix stays in front of the group prompt.
+    assert "Other Plow agents here" not in handled[0]["channel_prompt"]
+
+    command = _envelope("evt_cmd", "cht_a", "msg_cmd", body="/restart")
+    command["data"]["message"]["sender"].update(uid="mem_sam_cht_a", display_name="Sam")
+    await adapter._on_frame(command, object())
+    await _settle(adapter)
+
+    assert handled[1]["text"] == "/restart"
 
 
 async def test_peer_agent_turn_is_delivered_with_peer_identity(
@@ -1385,7 +1435,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     handled = _capture_events(monkeypatch, adapter)
 
     await adapter._deliver(
-        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"})],
+        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"}, starts_slash_command=False)],
         [([], [], "what is on the calendar?")],
         "cht_a",
     )
@@ -1411,7 +1461,7 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
 
     with pytest.raises(RuntimeError, match="HTTP 503"):
         await adapter._deliver(
-            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"})],
+            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"}, starts_slash_command=False)],
             [([], [], "calendar")],
             "cht_a",
         )

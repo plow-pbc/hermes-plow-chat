@@ -130,13 +130,28 @@ def _speaker_name(sender, chat):
     return sender.get("display_name") or sender.get("uid") or "a member", "human participant"
 
 
+def _is_solo_dm(chat):
+    """A 1:1 thread: one human, and no peer agent to collaborate with.
+
+    The gate for the roster prefix. NOT "has no peer" on its own -- a
+    human-only group has several people who can speak and a current speaker
+    the model needs to tell apart, even with no other agent in the room.
+    """
+    participants = chat.get("participants") or []
+    if any(p.get("type") == "agent" and p.get("relationship") == "peer" for p in participants):
+        return False
+    return sum(1 for p in participants if p.get("type") == "member") <= 1
+
+
 def _collaboration_prompt(prompt, chat):
     """System-authority context contains ops-seeded agent names only.
 
-    Gated on a PEER agent, not on ourselves: the server lists this agent in
-    every chat it can see, so a self-gate fired in 1:1 DMs too and told the
-    model its collaborators were "none" -- and to stay silent -- on every turn
-    the owner took alone with it.
+    Gated on a PEER, which is narrower than the roster prefix's gate: this
+    paragraph is about working alongside another agent, so with nobody to
+    work alongside it has nothing to say. The server lists this agent in
+    every chat it can see, so gating on our own presence added it everywhere
+    -- telling the model its collaborators were "none", and to stay silent,
+    in threads where it had just been addressed directly.
     """
     participants = chat.get("participants") or []
     peers = [
@@ -147,11 +162,8 @@ def _collaboration_prompt(prompt, chat):
     if not peers:
         return _with_identity(prompt, _agent_name(chat))
 
-    self_agent = next((p for p in participants
-                       if p.get("type") == "agent" and p.get("relationship") == "self"), None)
-    self_name = (self_agent.get("line") or {}).get("display_name") if self_agent else None
-    self_name = self_name or "this Plow agent"
     peer_fact = ", ".join(peers)
+    self_name = _agent_name(chat) or "this Plow agent"
     return (
         f"Collaboration context: You are {self_name}. Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
@@ -164,13 +176,13 @@ def _collaboration_prompt(prompt, chat):
 def _collaboration_turn_context(chat, sender):
     """Roster labels are user-role data, never channel/system instructions.
 
-    Only a chat with a PEER agent needs them. Gating on ourselves instead
-    prefixed the owner's own words in every DM, and the gateway reads a slash
-    command off the start of the delivered text -- so "/restart" arrived as
-    prose behind the roster paragraph and never ran.
+    A 1:1 DM has no roster to disambiguate. Gating on our own presence
+    instead prefixed the owner's own words there too, and the gateway reads a
+    slash command off the start of the delivered text -- so "/restart"
+    arrived as prose behind the roster paragraph and never ran.
     """
     participants = chat.get("participants") or []
-    if not any(p.get("type") == "agent" and p.get("relationship") == "peer" for p in participants):
+    if _is_solo_dm(chat):
         return ""
     humans = [p.get("display_name") or p.get("uid") for p in participants if p.get("type") == "member"]
     mappings = []
@@ -1356,7 +1368,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat = await self.get_chat_info(chat_uid)
         roster = self._chats[chat_uid]
         text = "\n\n".join(text for _urls, _kinds, text in resolved if text) or "(attachment)"
-        turn_context = _collaboration_turn_context(roster, sender)
+        # A command is addressed to the gateway, not to the thread: it needs
+        # no roster to run, and anything in front of the "/" stops it being
+        # read as one at all. Authorization is unchanged -- the gateway still
+        # decides who may run what from the source we build below. The burst
+        # boundary already puts a command first and alone, so burst[0] is it.
+        turn_context = ("" if burst[0].starts_slash_command
+                        else _collaboration_turn_context(roster, sender))
         if turn_context:
             text = f"{turn_context}\n\n{text}"
         event = MessageEvent(
