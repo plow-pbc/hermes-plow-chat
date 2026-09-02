@@ -332,11 +332,14 @@ _SPEAKER_FACT = "The message below is from a participant in this chat who does n
 # needed)"), which then delivers as a real message. The sentinel gives the
 # turn non-empty content that send() drops before delivery. Exact match only.
 NO_REPLY_SENTINEL = "NO_REPLY"
+_SILENCE_OPTION = (
+    f"When you have nothing to say, reply with exactly {NO_REPLY_SENTINEL} "
+    "and it will not be delivered. "
+)
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and answer their message directly; never emit "
-    "[NOOP], reasoning, or tool narration — when you have nothing to say, "
-    f"reply with exactly {NO_REPLY_SENTINEL} and it will not be delivered. "
+    f"[NOOP], reasoning, or tool narration. {_SILENCE_OPTION}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
     f"{_MEMBER_TURN_PREAMBLE}"
@@ -348,7 +351,7 @@ EXTERNAL_CHANNEL_PROMPT = (
 # member — not of who is speaking. Scoped to member turns it was missing from
 # exactly the turns most likely to request private material (the same bug this
 # rule's first port fixed, resurfacing at the prompt-selection seam).
-GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_DISCLOSURE} {_NO_RELAY}"
+GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_SILENCE_OPTION}{_DISCLOSURE} {_NO_RELAY}"
 
 _TRUSTED_CONVERSATION = (
     "The owner intentionally marked this group conversation as trusted. Every "
@@ -361,7 +364,7 @@ _TRUSTED_CONVERSATION = (
     "secrets, raw tokens, or payment-card secrets."
 )
 TRUSTED_GROUP_OWNER_CHANNEL_PROMPT = (
-    f"{OWNER_CHANNEL_PROMPT} {_TRUSTED_CONVERSATION} {_NO_RELAY}"
+    f"{OWNER_CHANNEL_PROMPT} {_SILENCE_OPTION}{_TRUSTED_CONVERSATION} {_NO_RELAY}"
 )
 TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
     f"{_MEMBER_TURN_PREAMBLE}"
@@ -677,6 +680,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
+            # The sentinel is only a control value on turns whose prompt
+            # established it; read the prompt itself so the gate can't drift.
+            "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
             "source_message_id": str(
                 getattr(event, "invite_operation_message_id", event.message_id)
             ) if event.message_id else None,
@@ -732,8 +738,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
-        if body == NO_REPLY_SENTINEL:
-            # The turn's whole answer was "nothing to say" — honor it. No
+        turn = self._active_turn.get()
+        if body == NO_REPLY_SENTINEL and turn is not None and turn.get("no_reply_ok"):
+            # The turn's whole answer was "nothing to say" — honor it. Gated
+            # on the turn's own prompt having advertised the sentinel: on a
+            # solo owner DM (or a cron delivery) NO_REPLY is ordinary text —
+            # an owner asking for that literal string must get it back. No
             # verbose-preference read: this is the silence contract, not a
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
