@@ -1870,18 +1870,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def _invite_send_call(owner_name: str = "Sam") -> tuple[str, str, dict[str, Any]]:
-    return (
-        "POST",
-        "/v1/auth/agent-invites/opportunities/agi_1/send",
-        {
-            "message_template": (
-                f"Love that you love Plow! {owner_name} gave me permission to share an invite. "
-                "Text Plow Activate: {{activation_code}} to {{destination}} to get early access! "
-                "You both will get $100 in cloud credits."
-            )
-        },
-    )
+INVITE_SEND_CALL = ("POST", "/v1/auth/agent-invites/opportunities/agi_1/send", None)
 
 
 def test_member_turn_can_start_fixed_invite_workflow(
@@ -2057,7 +2046,6 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
         question="Can I invite Taylor?",
         context={
             "opportunity_id": "agi_1",
-            "owner_name": "Alex",
             "participant_identity": "Taylor",
             "triggered_at": "2026-08-29T12:00:00+00:00",
         },
@@ -2159,7 +2147,6 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
         "handler_name": "invite-consent",
         "context": {
             "opportunity_id": "agi_1",
-            "owner_name": "Alex",
             "participant_identity": "Taylor",
             "triggered_at": turn["triggered_at"],
         },
@@ -2211,7 +2198,7 @@ async def test_resolved_consent_sends_once_or_stays_declined(
     )
     if enabled:
         assert result == {"invite_status": "sent"}
-        assert calls[1] == _invite_send_call("Alex")
+        assert calls[1] == INVITE_SEND_CALL
     else:
         assert result == {"skipped": "consent_declined"}
         assert len(calls) == 1
@@ -2237,7 +2224,6 @@ async def test_only_fresh_approval_resumes_original_thread(
     monkeypatch.setattr(adapter, "_invite_api", api)
     context = {
         "opportunity_id": "agi_1",
-        "owner_name": "Alex",
         "participant_identity": "Taylor",
         "triggered_at": (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat(),
     }
@@ -2246,7 +2232,7 @@ async def test_only_fresh_approval_resumes_original_thread(
 
     if hours_old == 23:
         assert resumed == "sent"
-        assert api_calls == [_invite_send_call("Alex")]
+        assert api_calls == [INVITE_SEND_CALL]
     else:
         assert resumed is False
         assert api_calls == []

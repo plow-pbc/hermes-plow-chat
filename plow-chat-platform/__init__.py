@@ -42,12 +42,6 @@ _NO_REPLY_PREFIX = "⚠️ No reply: "
 # send_or_update_status, so the one verbose preference has to gate it here.
 _WORKING_PREFIX = "⏳ Working —"
 PLATFORM_NAME = "plow_chat"
-def _invite_message_template(owner_name):
-    return (
-        f"Love that you love Plow! {owner_name} gave me permission to share an invite. "
-        "Text Plow Activate: {{activation_code}} to {{destination}} to get early access! "
-        "You both will get $100 in cloud credits."
-    )
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -810,7 +804,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             invite_status = await self.resume_invite(
                 {
                     "opportunity_id": opportunity.get("opportunity_id"),
-                    "owner_name": opportunity.get("owner_name") or "your owner",
                     "triggered_at": turn["triggered_at"],
                 }
             )
@@ -853,7 +846,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             handler_name="invite-consent",
             context={
                 "opportunity_id": opportunity.get("opportunity_id"),
-                "owner_name": opportunity.get("owner_name") or "your owner",
                 "participant_identity": identity,
                 "triggered_at": turn["triggered_at"],
             },
@@ -877,11 +869,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         opportunity_id = context.get("opportunity_id")
         if not opportunity_id:
             raise RuntimeError("agent invite opportunity is missing")
-        result = await self._invite_api(
-            "POST",
-            f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send",
-            body={"message_template": _invite_message_template(context.get("owner_name") or "your owner")},
-        )
+        result = await self._invite_api("POST", f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send")
         status = result.get("status")
         if status != "sent":
             raise RuntimeError("agent invite response has an invalid shape")
