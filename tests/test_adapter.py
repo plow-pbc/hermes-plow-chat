@@ -1649,6 +1649,9 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     assert not results["outside_grant"].success
     assert http.posts == [
         (f"{module.BASE}/v1/chats/cht_b/messages", {"body": "reply in B"}),
+        # The in-turn send re-armed the typing loop, so turn completion
+        # clears the indicator it may have re-raised after the reply.
+        (f"{module.BASE}/v1/chats/cht_b/typing", {"action": "stop"}),
         (f"{module.BASE}/v1/chats/cht_a/messages", {"body": "allowed after B"}),
     ]
 
@@ -2997,7 +3000,9 @@ async def test_status_frames_follow_verbose_preference(
     iMessage thread as real messages (#30). Quiet is the default: dropped --
     the typing indicator already covers "working" -- and reported as success
     so the gateway never retries. Verbose delivers, and must not eat the
-    typing indicator: both signals, not one or the other."""
+    typing indicator: the message post clears the provider-side bubble, so
+    delivery re-arms the loop -- both signals, not one or the other. Quiet
+    leaves the running loop entirely untouched."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": enabled})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3008,7 +3013,43 @@ async def test_status_frames_follow_verbose_preference(
     result = await adapter.send_or_update_status("cht_a", "compacted", status)
     expected = [(f"{module.BASE}/v1/chats/cht_a/messages", {"body": status})] if enabled else []
     assert result.success and http.posts == expected
+    if enabled:
+        replacement = adapter._typing.get("cht_a")
+        assert replacement is not typing and typing.cancelled()
+        assert isinstance(replacement, asyncio.Task)
+        adapter._cancel_typing("cht_a")
+    else:
+        assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+
+async def test_mid_turn_sends_keep_the_typing_indicator_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """In quiet mode the typing indicator is the only "working" signal, so it
+    must survive the whole turn: a delivered mid-turn send re-arms the refresh
+    loop (the message post cleared the provider-side bubble), a quiet-dropped
+    diagnostic never touches it, and a send outside any turn starts none."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    typing = asyncio.get_running_loop().create_future()
+    adapter._typing["cht_a"] = typing
+
+    dropped = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    assert dropped.success
     assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+
+    sent = await adapter.send("cht_a", "interim update")
+    assert sent.success
+    replacement = adapter._typing.get("cht_a")
+    assert replacement is not typing and typing.cancelled()
+    assert isinstance(replacement, asyncio.Task)
+    adapter._cancel_typing("cht_a")
+
+    outside_turn = await adapter.send("cht_a", "cron delivery")
+    assert outside_turn.success and "cht_a" not in adapter._typing
 
 
 @pytest.mark.parametrize(

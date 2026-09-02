@@ -470,6 +470,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
+        self._kicked = set()
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -517,6 +518,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         task = self._typing.pop(chat_uid, None)
         if task:
             task.cancel()
+
+    def _kick_typing(self, chat_uid):
+        """A message post just cleared the provider-side indicator, so if a
+        turn's typing loop is live, restart it — otherwise the indicator stays
+        dark until the loop's next 60s tick, or forever once cancelled. The
+        grace delay debounces multi-part sends and gives on_processing_complete
+        time to cancel a final-reply restart before it ever posts."""
+        if chat_uid not in self._typing:
+            return
+        self._cancel_typing(chat_uid)
+        self._kicked.add(chat_uid)
+        self._typing[chat_uid] = asyncio.create_task(
+            self._typing_until_reply(chat_uid, initial_delay=2.0))
 
     def _set_reach(self, chats):
         next_chats = {chat["uid"]: chat for chat in chats}
@@ -653,6 +667,7 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event):
         chat_uid = event.source.chat_id
         self._cancel_typing(chat_uid)
+        self._kicked.discard(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
         turn = {
             "chat_uid": chat_uid,
@@ -680,8 +695,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._active_turn.set(turn)
 
     async def on_processing_complete(self, event, outcome):
-        self._cancel_typing(event.source.chat_id)
+        chat_uid = event.source.chat_id
+        self._cancel_typing(chat_uid)
         self._active_turn.set(None)
+        if chat_uid in self._kicked:
+            # A kicked loop may have re-raised the indicator after the final
+            # reply cleared it; a start left alone would linger up to ~90s
+            # after the turn, so clear it. Only kicked turns pay the call.
+            self._kicked.discard(chat_uid)
+            try:
+                async with aiohttp.ClientSession() as http:
+                    await http.post(f"{BASE}/v1/chats/{chat_uid}/typing",
+                                    json={"action": "stop"}, headers=self.auth)
+            except Exception as exc:            # noqa: BLE001 - best effort
+                log.debug("[plow_chat] typing stop: %s", exc)
 
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within
@@ -699,14 +726,20 @@ class PlowChatAdapter(BasePlatformAdapter):
             return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
-        self._cancel_typing(chat_id)          # the reply itself clears it
         async with aiohttp.ClientSession() as http:
             body = content.strip()
             if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
                 if not await self._verbose_enabled(http):
+                    # Dropped before touching typing: a frame the owner never
+                    # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
-            return await self._post_message(http, chat_id, {"body": body})
+            result = await self._post_message(http, chat_id, {"body": body})
+        # The post cleared the provider indicator; a mid-turn send re-arms it
+        # so the owner keeps seeing "working". For the turn's final reply,
+        # on_processing_complete cancels the restart and stops the indicator.
+        self._kick_typing(chat_id)
+        return result
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.
@@ -868,10 +901,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                 refused = self._send_guard(chat_id)
                 if refused is not None:
                     return refused
-                # Not send(): that cancels the typing indicator, and a mid-turn
-                # status must not eat the "working" signal it rides alongside —
-                # a verbose assistant gets both, not one or the other.
-                return await self._post_message(http, chat_id, {"body": content.strip()})
+                # A mid-turn status must not eat the "working" signal it rides
+                # alongside — the post clears the provider indicator, so
+                # re-arm it: a verbose assistant gets both, not one or the other.
+                result = await self._post_message(http, chat_id, {"body": content.strip()})
+                self._kick_typing(chat_id)
+                return result
         # Key and chat only, never the content: status payloads carry upstream
         # provider detail with no non-secret guarantee, and this frame exists
         # to be dropped, not persisted into the journal.
@@ -903,7 +938,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         with open(path, "rb") as fh:
             data = fh.read()
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        self._cancel_typing(chat_id)
         async with aiohttp.ClientSession() as http:
             async with http.post(f"{BASE}/v1/chats/{chat_id}/attachments",
                                  json={"filename": filename, "content_type": content_type,
@@ -916,9 +950,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                                 headers=declared["upload_headers"]) as resp:
                 if resp.status >= 400:
                     return SendResult(success=False, error=f"attachment upload {resp.status}")
-            return await self._post_message(
+            result = await self._post_message(
                 http, chat_id,
                 {"body": (caption or "").strip(), "attachment_uids": [declared["uid"]]})
+        self._kick_typing(chat_id)           # same re-arm as send()
+        return result
 
     async def send_image_file(self, chat_id, image_path, caption=None, **_kwargs):
         return await self._send_attachment(chat_id, image_path, caption=caption)
@@ -989,15 +1025,19 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
-    async def _typing_until_reply(self, chat_uid):
+    async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
 
         The indicator auto-clears server-side around 85-90s, so it is
-        refreshed inside that window; the reply message clears it, and so does
-        cancellation. A 424 is a generic provider rejection, not a turn error,
-        and is never allowed to break a turn.
+        refreshed inside that window; cancellation ends the loop, and every
+        message post restarts it via _kick_typing (with the grace
+        `initial_delay`), so the indicator survives mid-turn sends. A 424 is
+        a generic provider rejection, not a turn error, and is never allowed
+        to break a turn.
         """
         try:
+            if initial_delay:
+                await asyncio.sleep(initial_delay)
             async with aiohttp.ClientSession() as http:
                 while True:
                     try:
