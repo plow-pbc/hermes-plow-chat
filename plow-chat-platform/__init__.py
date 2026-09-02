@@ -38,6 +38,10 @@ BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
 _NO_REPLY_PREFIX = "⚠️ No reply: "
+# The gateway's long-running heartbeat takes plain send() (after an
+# edit_message fallback), never send_or_update_status, so it is gated here.
+_WORKING_PREFIX = "⏳ Working — "
+_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX, _WORKING_PREFIX)
 PLATFORM_NAME = "plow_chat"
 def _invite_message_template(owner_name):
     return (
@@ -725,7 +729,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         async with aiohttp.ClientSession() as http:
             body = content.strip()
-            if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX)):
+            if body.startswith(_DIAGNOSTIC_PREFIXES):
                 if not await self._verbose_enabled(http):
                     # Dropped before touching typing: a frame the owner never
                     # sees must not eat the "working" signal either.
@@ -737,8 +741,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         """Whether this assistant's owner asked for diagnostic output in chat.
 
         One preference gates all of it -- status frames, background-review
-        posts, turn-stop warnings. Anything but an explicit true reads as
-        quiet, which is also what an API that predates the field serves.
+        posts, turn-stop warnings, the ⏳ Working heartbeat. Anything but an
+        explicit true reads as quiet, which is also what an API that predates
+        the field serves.
         """
         async with http.get(
             f"{BASE}/v1/api-keys/current/preferences", headers=self.auth

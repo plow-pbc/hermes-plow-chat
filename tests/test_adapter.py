@@ -3068,8 +3068,9 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 @pytest.mark.parametrize(
     "diagnostic",
     ["💾 Self-improvement review: memory updated",
-     "⚠️ No reply: empty content after 3 attempts"],
-    ids=["review", "no_reply"],
+     "⚠️ No reply: empty content after 3 attempts",
+     "⏳ Working — 3 min — iteration 18/60, receiving stream response"],
+    ids=["review", "no_reply", "heartbeat"],
 )
 async def test_diagnostic_sends_follow_the_verbose_output_preference(
     monkeypatch: pytest.MonkeyPatch,

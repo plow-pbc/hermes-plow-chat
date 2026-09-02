@@ -67,7 +67,7 @@ URL in git.
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 
 Diagnostic chatter — agent status frames, 💾 background-review posts, ⚠️
-turn-stop warnings — is dropped unless the credential's
+turn-stop warnings, ⏳ Working heartbeats — is dropped unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
 toggle) is true; the typing indicator already shows the turn is running.
 
