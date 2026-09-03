@@ -21,9 +21,18 @@ Mac-managed instances):
    only source for the command and its arguments — do not carry a
    spelling from memory or from this file. The Mac mints its own
    short-lived Google token; you never see or need one.
-2. A command may show the owner an approval card on their Mac. If a
-   command hangs, tell the owner it is waiting on an approval there;
-   if it comes back refused, report it as denied on the Mac.
+2. Sending an email, or booking over a busy slot with
+   `--confirm-conflict`, is stopped first in the owner's direct chat
+   with you: the gateway posts the command and waits for the owner to
+   reply `/approve`. Compose the whole message — recipients, subject,
+   body — in the one `gmail send` command; that command is all the
+   owner sees. A draft sent by id is refused, because the owner would
+   see only the id. A refusal there means the owner declined; nothing
+   was sent. From any other chat those two commands are blocked
+   outright and nothing is sent — ask the owner to repeat the request
+   in their direct chat. Any other command may show the owner an
+   approval card on their Mac; if it hangs, it is waiting there, and
+   a refusal there is a denial on the Mac.
 3. If no MCP server with `plow_*` tools is connected, or it lists no
    `google-workspace` skill, Google is not available to this agent.
    Say exactly that — do not fall back to local OAuth.

@@ -19,3 +19,8 @@ these copies are the reason it now needs saying out loud. The hosted-agent
 image still bakes from `plow-pbc/plow`. Change a skill there first, copy the
 result here, then bump the SHA in `agent-mgr`'s `runtime/stack.json`. Editing
 only this copy silently splits the two runtimes.
+
+One deliberate split: `productivity/google-workspace` step 2 names the
+in-chat `/approve` gate for outbound mail and conflict overrides, which
+exists only in this plugin's `pre_tool_call` hook; plow's copy stays on the
+Mac-card wording until the hook is ported there.

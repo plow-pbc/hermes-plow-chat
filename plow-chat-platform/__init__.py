@@ -6,6 +6,7 @@ See HERMES_INTEGRATION.md for deployment and protocol constraints.
 import asyncio
 import contextvars
 import dataclasses
+import hashlib
 import json
 import logging
 import mimetypes
@@ -677,6 +678,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
+            "dm": event.source.chat_type == "dm",
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
@@ -1620,6 +1622,109 @@ def _plow_start_group_message(args, **_kwargs):
     })
 
 
+_GOOGLE_CLIS = frozenset({"plow-gog", "gog"})
+_GMAIL_GROUPS = frozenset({"gmail", "mail", "email"})
+_CALENDAR_GROUPS = frozenset({"calendar", "cal"})
+# gog v0.36.0 "Write" verbs that transmit mail. `import` and `autoreply` do
+# not, and `drafts create|reply|forward` only save a draft.
+_MAIL_SEND_VERBS = frozenset({"send", "reply", "reply-all", "replyall", "forward", "fwd"})
+_DRAFT_GROUPS = frozenset({"drafts", "draft"})
+_DRAFT_SEND_VERBS = frozenset({"send", "post"})
+# latch honours --confirm-conflict on create only; on update it is inert.
+_CALENDAR_CREATE_VERBS = frozenset({"create", "add", "new"})
+
+
+def _argv_flag(argv, name):
+    """`--name v` or `--name=v`, last wins — gog's own flag resolution."""
+    value = None
+    for i, arg in enumerate(argv):
+        if arg == f"--{name}":
+            value = argv[i + 1] if i + 1 < len(argv) else None
+        elif arg.startswith(f"--{name}="):
+            value = arg[len(name) + 3:]
+    return value
+
+
+def _google_send_summary(argv):
+    """What `argv` would send, as the owner reads it in the approval prompt —
+    or None when it sends nothing. latch requires the command path first
+    (`plow-gog gmail send …`), so group and verb are positional."""
+    if len(argv) < 3 or argv[0] not in _GOOGLE_CLIS:
+        return None
+    group, verb = argv[1], argv[2]
+    if group in _GMAIL_GROUPS:
+        if verb in _MAIL_SEND_VERBS:
+            lines = [f"Send email ({verb})"]
+            if verb != "send" and len(argv) > 3 and not argv[3].startswith("-"):
+                lines.append(f"on message {argv[3]}")
+            for flag in ("to", "cc", "bcc", "subject"):
+                value = _argv_flag(argv, flag)
+                if value:
+                    lines.append(f"{flag}: {value}")
+            body = _argv_flag(argv, "body")
+            if body:
+                lines += ["", body]
+            return "\n".join(lines)
+        return None
+    if group in _CALENDAR_GROUPS and verb in _CALENDAR_CREATE_VERBS and "--confirm-conflict" in argv:
+        return (
+            f"Book over a conflict: {_argv_flag(argv, 'summary') or '(untitled)'} "
+            f"{_argv_flag(argv, 'from')} to {_argv_flag(argv, 'to')}"
+        )
+    return None
+
+
+def _is_draft_send(argv):
+    """`gmail drafts send <id>`: the owner would see only the id, never the mail."""
+    return (
+        len(argv) > 3
+        and argv[0] in _GOOGLE_CLIS
+        and argv[1] in _GMAIL_GROUPS
+        and argv[2] in _DRAFT_GROUPS
+        and argv[3] in _DRAFT_SEND_VERBS
+    )
+
+
+def _pre_tool_call(tool_name, args, **_kwargs):
+    """Escalate an outbound send to the owner, whatever the latch MCP server
+    is named. Hermes's `approve` directive is a gate the model cannot flip
+    itself: the gateway posts the request into this chat and waits for the
+    owner's /approve. latch's conflict check and plow_start_group_message's
+    dry_run/confirm are re-sendable by the model, so this hook is what makes
+    their override a human decision. Returns None for every call that sends
+    nothing."""
+    if not str(tool_name).endswith("plow_run_command"):
+        return None
+    argv = (args or {}).get("argv") if isinstance(args, dict) else None
+    if not isinstance(argv, list):
+        return None
+    argv = [str(arg) for arg in argv]
+    # Mirror latch's own isHelpInvocation: help is a trailing --help/-h with
+    # no -- terminator anywhere; it mints no token and reaches nothing.
+    if argv and argv[-1] in ("--help", "-h") and "--" not in argv:
+        return None
+    if _is_draft_send(argv):
+        return {"action": "block",
+                "message": "a draft sent by id shows the owner nothing; send it as one "
+                           "gmail send command with recipients, subject and body"}
+    summary = _google_send_summary(argv)
+    if summary is None:
+        return None
+    turn = _ACTIVE_TURN.get() or {}
+    if not (turn.get("owner") and turn.get("dm")):
+        # The prompt must land where only the owner can read and answer it;
+        # a group room would publish the email and let any member approve it.
+        return {"action": "block",
+                "message": "email sends and conflict overrides are approved "
+                           "only in the owner's own chat; nothing was sent — "
+                           "ask the owner to repeat the request in their "
+                           "direct chat with you"}
+    # Keyed on the exact argv: "/approve always" may only ever cover a
+    # byte-identical re-send, never the next email.
+    digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
+    return {"action": "approve", "message": summary, "rule_key": f"google-send:{digest}"}
+
+
 PLOW_START_GROUP_MESSAGE_SCHEMA = {
     "name": "plow_start_group_message",
     "description": (
@@ -1888,3 +1993,4 @@ def register(ctx):
         check_fn=check_requirements,
         requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
     )
+    ctx.register_hook("pre_tool_call", _pre_tool_call)

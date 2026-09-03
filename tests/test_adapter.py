@@ -795,10 +795,13 @@ async def test_a_failed_hand_off_is_retried_at_the_head(
     assert (tmp_path / "plow_chat_last_uid").read_text() == "msg_2"
 
 
-def test_guest_turn_does_not_register_a_tool_block(
+def test_guest_turn_is_not_tool_blocked(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
+    """The send gate is the only pre_tool_call hook, and a guest's reads go
+    through it untouched — trust is disclosed in the prompt, not enforced by
+    vetoing tools (ad959fb)."""
     module = _load(monkeypatch, tmp_path)
     hooks: dict[str, Any] = {}
 
@@ -816,7 +819,11 @@ def test_guest_turn_does_not_register_a_tool_block(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
-        assert "pre_tool_call" not in hooks
+        assert set(hooks) == {"pre_tool_call"}
+        assert hooks["pre_tool_call"](
+            tool_name="mcp__latch__plow_run_command",
+            args={"argv": ["plow-gog", "gmail", "search", "newer_than:7d"]},
+        ) is None
     finally:
         adapter._active_turn.reset(turn)
 
@@ -1861,6 +1868,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
     return {
         "chat_uid": "cht_b",
         "owner": False,
+        "dm": False,
         "no_reply_ok": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -1948,7 +1956,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "no_reply_ok": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -1998,6 +2006,7 @@ async def test_active_turn_retains_only_server_invite_identity(
         message_id="msg_delight_1",
         source=SimpleNamespace(
             chat_id="cht_b",
+            chat_type="group",
             role_authorized=False,
             user_id=source_uid,
             user_name="attacker-controlled identity",
@@ -2468,6 +2477,136 @@ def test_unparseable_dry_run_stays_a_dry_run(
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
     assert out["success"] is True and out["dry_run"] is True
+
+
+_SEND_ARGV = [
+    "plow-gog", "gmail", "send", "--to", "andrew@example.com", "--subject",
+    "Catching up", "--body", "Menlo Park or a video call?", "--account", "so@plow.co",
+]
+
+
+@pytest.mark.parametrize("argv,expect", [
+    (_SEND_ARGV, ("andrew@example.com", "Catching up", "Menlo Park or a video call?")),
+    (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
+    (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
+    (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
+    ([
+        "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
+        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
+        "--confirm-conflict", "--account", "so@plow.co",
+    ], ("Dentist",)),
+    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], ("a@b.co",)),
+    ([
+        "plow-gog", "calendar", "add", "primary", "--summary", "Standup",
+        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
+        "--confirm-conflict",
+    ], ("Standup",)),
+    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "s", "--", "--help"], ("a@b.co",)),
+])
+def test_send_summary_names_what_goes_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], expect: tuple[str, ...],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    summary = module._google_send_summary(argv)
+    assert all(value in summary for value in expect)
+
+
+@pytest.mark.parametrize("argv", [
+    ["plow-gog", "gmail", "search", "newer_than:7d"],
+    ["plow-gog", "gmail", "get", "18c9", "--format", "metadata"],
+    ["plow-gog", "gmail", "drafts", "create", "--to", "a@b.co", "--body", "x"],
+    ["plow-gog", "gmail", "drafts", "reply", "18c9", "--body", "x"],
+    ["plow-gog", "gmail", "drafts", "list"],
+    ["plow-gog", "calendar", "create", "primary", "--summary", "x",
+     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00"],
+    ["plow-gog", "calendar", "update", "primary", "evt1", "--confirm-conflict"],
+    ["plow-gog", "calendar", "events", "primary"],
+    ["plow-gog", "gmail", "import", "/Users/me/Plow/x.eml"],
+    ["python3", "-c", "print('gmail send')"],
+    ["plow-gog"],
+    [],
+])
+def test_send_summary_ignores_reads_drafts_and_unforced_bookings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._google_send_summary(argv) is None
+
+
+@pytest.mark.parametrize("argv", [
+    ["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"],
+    ["plow-gog", "gmail", "draft", "post", "r-123"],
+])
+@pytest.mark.parametrize("turn", [{"chat_uid": "cht_a", "owner": True, "dm": True}, None])
+def test_draft_by_id_send_is_blocked_everywhere(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], turn: Any,
+) -> None:
+    """The prompt would name only a draft id, so no turn may approve it."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out["action"] == "block"
+    assert "gmail send" in out["message"]
+
+
+def test_owner_send_escalates_to_the_human_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
+    assert out["action"] == "approve"
+    assert "andrew@example.com" in out["message"]
+    assert out["rule_key"].startswith("google-send:")
+
+
+def test_rule_key_is_per_message_so_always_never_generalises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    first = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
+    second = module._pre_tool_call(
+        "mcp__latch__plow_run_command", {"argv": _SEND_ARGV[:-4] + ["--body", "different"]},
+    )
+    assert first["rule_key"] != second["rule_key"]
+
+
+@pytest.mark.parametrize("turn", [
+    None,
+    {"chat_uid": "cht_b", "owner": False},
+    {"chat_uid": "cht_g", "owner": True, "dm": False},
+])
+def test_send_outside_the_owner_dm_is_blocked_not_escalated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
+) -> None:
+    """A group member must not be able to answer the approval prompt, and the
+    prompt itself would publish the email into the room; cron runs have no
+    turn at all."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
+    assert out["action"] == "block"
+    assert "nothing was sent" in out["message"]
+
+
+@pytest.mark.parametrize("tool_name,args", [
+    ("terminal", {"command": "plow-gog gmail send"}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "search", "x"]}),
+    ("mcp__latch__plow_run_command", {"argv": "plow-gog gmail send"}),
+    ("mcp__latch__plow_run_command", {}),
+    ("mcp__latch__plow_run_command", None),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "-h"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "drafts", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "draft", "post", "-h"]}),
+])
+def test_other_tools_and_non_sends_pass_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tool_name: str, args: Any,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    assert module._pre_tool_call(tool_name, args) is None
 
 
 def test_group_message_reports_adoption_separately_from_delivery(
@@ -3175,7 +3314,7 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
     for prompt, expected in ((module.EXTERNAL_CHANNEL_PROMPT, True),
                              (module.OWNER_CHANNEL_PROMPT, False)):
         event = SimpleNamespace(
-            source=SimpleNamespace(chat_id="cht_a", user_id="u", role_authorized=True),
+            source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u", role_authorized=True),
             message_id="msg_1", channel_prompt=prompt)
         await adapter.on_processing_start(event)
         turn = adapter._active_turn.get()
