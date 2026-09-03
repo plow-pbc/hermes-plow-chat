@@ -140,6 +140,9 @@ prompt asks agents to contribute when addressed or useful and to avoid empty
 acknowledgements, reciprocal delegation, impersonation, and repetition; it
 adds no hidden coordination channel or loop state.
 
+In a shared thread the prompt names the human this line represents and says to
+speak as the agent, never as them.
+
 ## Media
 
 Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`

@@ -1249,6 +1249,46 @@ async def test_named_line_identity_prefixes_every_turn_prompt(
 
 
 @pytest.mark.parametrize(
+    ("group", "rule"),
+    [
+        pytest.param(
+            True,
+            'You represent Samuel Odio. Speak as yourself, in your own voice; refer to Samuel Odio by name, never as "I" or "me". ',
+            id="group",
+        ),
+        pytest.param(False, "", id="solo_dm"),
+    ],
+)
+async def test_a_shared_thread_names_who_the_agent_speaks_for(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    group: bool,
+    rule: str,
+) -> None:
+    """The owner asked for "3 nights that work for me" and Elm answered "three
+    nights that work for me": the roster named the owner by phone number and
+    nothing said whose voice this is. A shared thread now says both; a solo DM
+    has nobody to confuse and keeps its prompt byte for byte."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    chat = _chat("cht_a", group=group, agent_name="Elm")
+    chat["participants"][0].update(relationship="self", represents_participant_uid="mem_owner_cht_a")
+    chat["participants"][1]["display_name"] = "Samuel Odio"
+    adapter._set_reach([chat])
+    _mark_anchored(adapter, "cht_a")
+
+    handled = _capture_events(monkeypatch, adapter)
+    await adapter._on_frame(_envelope("evt_1", "cht_a", "msg_1", role="owner"))
+    await _settle(adapter)
+
+    (event,) = handled
+    base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
+    assert event["channel_prompt"] == (
+        f"You are Elm, a Plow assistant; people here address you by that name. {rule}{base}"
+    )
+
+
+@pytest.mark.parametrize(
     ("group", "role", "trusted", "prompt_name"),
     [
         pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
