@@ -678,6 +678,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
+            "dm": event.source.chat_type == "dm",
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
@@ -1698,12 +1699,12 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     if summary is None:
         return None
     turn = _ACTIVE_TURN.get()
-    if turn is None or not turn["owner"]:
-        # The prompt would land in a chat whose members are not the owner, and
-        # whoever answers it is the approver. Nothing to escalate to.
+    if turn is None or not (turn["owner"] and turn["dm"]):
+        # The prompt must land where only the owner can read and answer it;
+        # a group room would publish the email and let any member approve it.
         return {"action": "block",
-                "message": "only the agent owner can approve sending email or "
-                           "booking over a conflict; nothing was sent"}
+                "message": "email sends and conflict overrides are approved "
+                           "only in the owner's own chat; nothing was sent"}
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()[:12]

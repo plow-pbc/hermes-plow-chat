@@ -1868,6 +1868,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
     return {
         "chat_uid": "cht_b",
         "owner": False,
+        "dm": False,
         "no_reply_ok": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -1955,7 +1956,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "no_reply_ok": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -2005,6 +2006,7 @@ async def test_active_turn_retains_only_server_invite_identity(
         message_id="msg_delight_1",
         source=SimpleNamespace(
             chat_id="cht_b",
+            chat_type="group",
             role_authorized=False,
             user_id=source_uid,
             user_name="attacker-controlled identity",
@@ -2484,31 +2486,31 @@ _SEND_ARGV = [
 
 
 @pytest.mark.parametrize("argv,expect", [
-    (_SEND_ARGV, "andrew@example.com"),
-    (_SEND_ARGV, "Catching up"),
-    (_SEND_ARGV, "Menlo Park or a video call?"),
-    (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], "18c9"),
-    (["gog", "email", "reply-all", "18c9", "--body=ok"], "reply-all"),
-    (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], "c@d.co"),
-    (["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"], "r-123"),
-    (["plow-gog", "gmail", "draft", "post", "r-123"], "r-123"),
+    (_SEND_ARGV, ("andrew@example.com", "Catching up", "Menlo Park or a video call?")),
+    (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
+    (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
+    (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
+    (["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"], ("r-123",)),
+    (["plow-gog", "gmail", "draft", "post", "r-123"], ("r-123",)),
     ([
         "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
         "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
         "--confirm-conflict", "--account", "so@plow.co",
-    ], "Dentist"),
-    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], "a@b.co"),
+    ], ("Dentist",)),
+    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], ("a@b.co",)),
     ([
         "plow-gog", "calendar", "add", "primary", "--summary", "Standup",
         "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
         "--confirm-conflict",
-    ], "Standup"),
+    ], ("Standup",)),
+    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "s", "--", "--help"], ("a@b.co",)),
 ])
 def test_send_summary_names_what_goes_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], expect: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], expect: tuple[str, ...],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    assert expect in module._google_send_summary(argv)
+    summary = module._google_send_summary(argv)
+    assert all(value in summary for value in expect)
 
 
 @pytest.mark.parametrize("argv", [
@@ -2539,7 +2541,7 @@ def test_owner_send_escalates_to_the_human_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
     assert out["action"] == "approve"
     assert "andrew@example.com" in out["message"]
@@ -2550,7 +2552,7 @@ def test_rule_key_is_per_message_so_always_never_generalises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
     first = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
     second = module._pre_tool_call(
         "mcp__latch__plow_run_command", {"argv": _SEND_ARGV[:-4] + ["--body", "different"]},
@@ -2558,12 +2560,17 @@ def test_rule_key_is_per_message_so_always_never_generalises(
     assert first["rule_key"] != second["rule_key"]
 
 
-@pytest.mark.parametrize("turn", [None, {"chat_uid": "cht_b", "owner": False}])
-def test_non_owner_send_is_blocked_not_escalated(
+@pytest.mark.parametrize("turn", [
+    None,
+    {"chat_uid": "cht_b", "owner": False},
+    {"chat_uid": "cht_g", "owner": True, "dm": False},
+])
+def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
 ) -> None:
-    """A group member must not be able to answer the approval prompt for an
-    email from the owner's account; cron runs have no turn at all."""
+    """A group member must not be able to answer the approval prompt, and the
+    prompt itself would publish the email into the room; cron runs have no
+    turn at all."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
@@ -2582,7 +2589,7 @@ def test_other_tools_and_non_sends_pass_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tool_name: str, args: Any,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
     assert module._pre_tool_call(tool_name, args) is None
 
 
@@ -3291,7 +3298,7 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
     for prompt, expected in ((module.EXTERNAL_CHANNEL_PROMPT, True),
                              (module.OWNER_CHANNEL_PROMPT, False)):
         event = SimpleNamespace(
-            source=SimpleNamespace(chat_id="cht_a", user_id="u", role_authorized=True),
+            source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u", role_authorized=True),
             message_id="msg_1", channel_prompt=prompt)
         await adapter.on_processing_start(event)
         turn = adapter._active_turn.get()
