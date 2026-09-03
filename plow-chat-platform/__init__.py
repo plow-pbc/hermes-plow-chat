@@ -1708,7 +1708,7 @@ def _pre_tool_call(tool_name, args, **_kwargs):
                            "direct chat with you"}
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
-    digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
     return {"action": "approve", "message": summary, "rule_key": f"google-send:{digest}"}
 
 

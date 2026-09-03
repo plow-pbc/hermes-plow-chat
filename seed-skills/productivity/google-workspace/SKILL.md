@@ -22,12 +22,14 @@ Mac-managed instances):
    spelling from memory or from this file. The Mac mints its own
    short-lived Google token; you never see or need one.
 2. Sending an email, or booking over a busy slot with
-   `--confirm-conflict`, is stopped in this chat first: the gateway
-   posts the command and waits for the owner to reply `/approve`. A
-   refusal there means the owner declined; nothing was sent. Any
-   other command may show the owner an approval card on their Mac;
-   if it hangs, it is waiting there, and a refusal there is a denial
-   on the Mac.
+   `--confirm-conflict`, is stopped first in the owner's direct chat
+   with you: the gateway posts the command and waits for the owner
+   to reply `/approve`. A refusal there means the owner declined;
+   nothing was sent. From any other chat those two commands are
+   blocked outright and nothing is sent — ask the owner to repeat
+   the request in their direct chat. Any other command may show the
+   owner an approval card on their Mac; if it hangs, it is waiting
+   there, and a refusal there is a denial on the Mac.
 3. If no MCP server with `plow_*` tools is connected, or it lists no
    `google-workspace` skill, Google is not available to this agent.
    Say exactly that — do not fall back to local OAuth.
