@@ -2490,8 +2490,6 @@ _SEND_ARGV = [
     (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
     (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
     (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
-    (["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"], ("r-123",)),
-    (["plow-gog", "gmail", "draft", "post", "r-123"], ("r-123",)),
     ([
         "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
         "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
@@ -2535,6 +2533,22 @@ def test_send_summary_ignores_reads_drafts_and_unforced_bookings(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     assert module._google_send_summary(argv) is None
+
+
+@pytest.mark.parametrize("argv", [
+    ["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"],
+    ["plow-gog", "gmail", "draft", "post", "r-123"],
+])
+@pytest.mark.parametrize("turn", [{"chat_uid": "cht_a", "owner": True, "dm": True}, None])
+def test_draft_by_id_send_is_blocked_everywhere(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], turn: Any,
+) -> None:
+    """The prompt would name only a draft id, so no turn may approve it."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out["action"] == "block"
+    assert "gmail send" in out["message"]
 
 
 def test_owner_send_escalates_to_the_human_gate(

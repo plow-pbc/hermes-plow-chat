@@ -1669,8 +1669,6 @@ def _google_send_summary(argv):
             if body:
                 lines += ["", body]
             return "\n".join(lines)
-        if verb in _DRAFT_GROUPS and len(argv) > 4 and argv[3] in _DRAFT_SEND_VERBS:
-            return f"Send Gmail draft {argv[4]}"
         return None
     if group in _CALENDAR_GROUPS and verb in _CALENDAR_CREATE_VERBS and "--confirm-conflict" in argv:
         return (
@@ -1678,6 +1676,17 @@ def _google_send_summary(argv):
             f"{_argv_flag(argv, 'from')} to {_argv_flag(argv, 'to')}"
         )
     return None
+
+
+def _is_draft_send(argv):
+    """`gmail drafts send <id>`: the owner would see only the id, never the mail."""
+    return (
+        len(argv) > 3
+        and argv[0] in _GOOGLE_CLIS
+        and argv[1] in _GMAIL_GROUPS
+        and argv[2] in _DRAFT_GROUPS
+        and argv[3] in _DRAFT_SEND_VERBS
+    )
 
 
 def _pre_tool_call(tool_name, args, **_kwargs):
@@ -1694,6 +1703,10 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     if not isinstance(argv, list):
         return None
     argv = [str(arg) for arg in argv]
+    if _is_draft_send(argv):
+        return {"action": "block",
+                "message": "a draft sent by id shows the owner nothing; send it as one "
+                           "gmail send command with recipients, subject and body"}
     summary = _google_send_summary(argv)
     if summary is None:
         return None

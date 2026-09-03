@@ -26,13 +26,13 @@ Mac-managed instances):
    with you: the gateway posts the command and waits for the owner to
    reply `/approve`. Compose the whole message — recipients, subject,
    body — in the one `gmail send` command; that command is all the
-   owner sees, so a draft created first and sent by id would show
-   them only a draft id. A refusal there means the owner declined;
-   nothing was sent. From any other chat those two commands are
-   blocked outright and nothing is sent — ask the owner to repeat the
-   request in their direct chat. Any other command may show the owner
-   an approval card on their Mac; if it hangs, it is waiting there,
-   and a refusal there is a denial on the Mac.
+   owner sees. A draft sent by id is refused, because the owner would
+   see only the id. A refusal there means the owner declined; nothing
+   was sent. From any other chat those two commands are blocked
+   outright and nothing is sent — ask the owner to repeat the request
+   in their direct chat. Any other command may show the owner an
+   approval card on their Mac; if it hangs, it is waiting there, and
+   a refusal there is a denial on the Mac.
 3. If no MCP server with `plow_*` tools is connected, or it lists no
    `google-workspace` skill, Google is not available to this agent.
    Say exactly that — do not fall back to local OAuth.
