@@ -1651,10 +1651,6 @@ def _google_send_summary(argv):
     (`plow-gog gmail send …`), so group and verb are positional."""
     if len(argv) < 3 or argv[0] not in _GOOGLE_CLIS:
         return None
-    # Mirror latch's own isHelpInvocation (gogGate.ts): help is only the last
-    # argument, with no `--` terminator — `--subject --help` is a value, not a flag.
-    if argv[-1] in ("--help", "-h") and "--" not in argv:
-        return None
     group, verb = argv[1], argv[2]
     if group in _GMAIL_GROUPS:
         if verb in _MAIL_SEND_VERBS:
@@ -1703,6 +1699,10 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     if not isinstance(argv, list):
         return None
     argv = [str(arg) for arg in argv]
+    # Mirror latch's own isHelpInvocation: help is a trailing --help/-h with
+    # no -- terminator anywhere; it mints no token and reaches nothing.
+    if argv and argv[-1] in ("--help", "-h") and "--" not in argv:
+        return None
     if _is_draft_send(argv):
         return {"action": "block",
                 "message": "a draft sent by id shows the owner nothing; send it as one "

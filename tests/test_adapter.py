@@ -2521,8 +2521,6 @@ def test_send_summary_names_what_goes_out(
      "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00"],
     ["plow-gog", "calendar", "update", "primary", "evt1", "--confirm-conflict"],
     ["plow-gog", "calendar", "events", "primary"],
-    ["plow-gog", "gmail", "send", "--help"],
-    ["plow-gog", "gmail", "send", "-h"],
     ["plow-gog", "gmail", "import", "/Users/me/Plow/x.eml"],
     ["python3", "-c", "print('gmail send')"],
     ["plow-gog"],
@@ -2598,6 +2596,10 @@ def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     ("mcp__latch__plow_run_command", {"argv": "plow-gog gmail send"}),
     ("mcp__latch__plow_run_command", {}),
     ("mcp__latch__plow_run_command", None),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "-h"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "drafts", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "draft", "post", "-h"]}),
 ])
 def test_other_tools_and_non_sends_pass_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tool_name: str, args: Any,
