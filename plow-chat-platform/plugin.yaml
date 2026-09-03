@@ -1,3 +1,5 @@
+# Copyright 2026 The Plow Collective, Inc
+# SPDX-License-Identifier: Apache-2.0
 name: plow-chat-platform
 label: Plow Chat
 kind: platform
