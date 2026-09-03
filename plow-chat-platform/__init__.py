@@ -89,16 +89,12 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
-def _self_agent(chat):
-    """The self agent's participant dict, {} when the roster lacks one."""
-    return next((p for p in chat.get("participants") or []
-                 if p.get("type") == "agent"
-                 and p.get("relationship") in (None, "self")), {})
-
-
 def _self_agent_line(chat):
     """The self agent participant's line dict, {} when the roster lacks one."""
-    return _self_agent(chat).get("line") or {}
+    agent = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "agent"
+                  and p.get("relationship") in (None, "self")), {})
+    return agent.get("line") or {}
 
 
 def _agent_name(chat):
@@ -121,23 +117,14 @@ def _represented_member(chat, agent):
                  if p.get("type") == "member" and p.get("uid") == uid), None)
 
 
-def _voice_rule(chat):
-    """Whose voice this is, said out loud in every shared thread.
-
-    The owner wrote "3 nights that work for me" and the agent answered "three
-    nights that work for me": the roster named the owner by phone number and
-    nothing said the agent is not them, so the model mirrored the phrasing.
-    Read from the same roster the prefix renders; gated like it -- a solo DM
-    has one human and nobody to confuse.
-    """
-    if _is_solo_dm(chat):
-        return ""
-    human = _represented_member(chat, _self_agent(chat))
-    if human is None:
-        return ""
-    name = human.get("display_name") or human["uid"]
-    return (f"You represent {name}. Speak as yourself, in your own voice; "
-            f"refer to {name} by name, never as \"I\" or \"me\". ")
+# The owner asked for "3 nights that work for me" and the agent answered in
+# the owner's own voice: nothing said whose voice this is. This names it --
+# the concrete mapping ("Elm represents Samuel Odio") already reaches the
+# model through the untrusted roster prefix (_collaboration_turn_context);
+# the name itself stays there, never in this system-authority prompt.
+_VOICE_RULE = ('You speak for the human the roster maps you to. Speak as '
+               'yourself, in your own voice; refer to them by name, never '
+               'as "I" or "me". ')
 
 
 def _speaker_name(sender, chat):
@@ -173,7 +160,8 @@ def _collaboration_prompt(prompt, chat):
     -- telling the model its collaborators were "none", and to stay silent,
     in threads where it had just been addressed directly.
     """
-    prompt = _voice_rule(chat) + prompt
+    if not _is_solo_dm(chat):
+        prompt = _VOICE_RULE + prompt
     participants = chat.get("participants") or []
     peers = [
         (peer.get("line") or {}).get("display_name") or "an unnamed peer agent"
