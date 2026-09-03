@@ -35,6 +35,12 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 
 ## Who consumes this
 
+[`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+the base image every hosted Plow agent boots, pins one commit of this repo as
+`PLOW_CHAT_PLUGIN_SHA` in its Dockerfile and fetches `plow-chat-platform/` at
+build time. That is the production consumer. The Docker fleet below is the
+deprecated one.
+
 [`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
 repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
 
