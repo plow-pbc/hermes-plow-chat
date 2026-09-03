@@ -2497,6 +2497,12 @@ _SEND_ARGV = [
         "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
         "--confirm-conflict", "--account", "so@plow.co",
     ], "Dentist"),
+    (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], "a@b.co"),
+    ([
+        "plow-gog", "calendar", "add", "primary", "--summary", "Standup",
+        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
+        "--confirm-conflict",
+    ], "Standup"),
 ])
 def test_send_summary_names_what_goes_out(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str], expect: str,
@@ -2516,6 +2522,8 @@ def test_send_summary_names_what_goes_out(
     ["plow-gog", "calendar", "update", "primary", "evt1", "--confirm-conflict"],
     ["plow-gog", "calendar", "events", "primary"],
     ["plow-gog", "gmail", "send", "--help"],
+    ["plow-gog", "gmail", "send", "-h"],
+    ["plow-gog", "gmail", "import", "/Users/me/Plow/x.eml"],
     ["python3", "-c", "print('gmail send')"],
     ["plow-gog"],
     [],

@@ -1621,15 +1621,6 @@ def _plow_start_group_message(args, **_kwargs):
     })
 
 
-# --- Outbound-send approval gate -------------------------------------------
-# Hermes's pre_tool_call `approve` directive is the one gate the model cannot
-# flip itself: the gateway posts the request into this chat, waits for the
-# owner's /approve, and fails closed. latch's own conflict check and the
-# dry_run/confirm pair on plow_start_group_message are speed bumps the model
-# self-confirms in the same turn (9 of 10 conflict refusals over ten days, and
-# an email sent the moment it was drafted). The gate does not replace those
-# checks; it makes their override a human's decision.
-
 _GOOGLE_CLIS = frozenset({"plow-gog", "gog"})
 _GMAIL_GROUPS = frozenset({"gmail", "mail", "email"})
 _CALENDAR_GROUPS = frozenset({"calendar", "cal"})
@@ -1657,7 +1648,11 @@ def _google_send_summary(argv):
     """What `argv` would send, as the owner reads it in the approval prompt —
     or None when it sends nothing. latch requires the command path first
     (`plow-gog gmail send …`), so group and verb are positional."""
-    if len(argv) < 3 or argv[0] not in _GOOGLE_CLIS or "--help" in argv:
+    if len(argv) < 3 or argv[0] not in _GOOGLE_CLIS:
+        return None
+    # Mirror latch's own isHelpInvocation (gogGate.ts): help is only the last
+    # argument, with no `--` terminator — `--subject --help` is a value, not a flag.
+    if argv[-1] in ("--help", "-h") and "--" not in argv:
         return None
     group, verb = argv[1], argv[2]
     account = _argv_flag(argv, "account") or "the default account"
@@ -1687,13 +1682,19 @@ def _google_send_summary(argv):
 
 def _pre_tool_call(tool_name, args, **_kwargs):
     """Escalate an outbound send to the owner, whatever the latch MCP server
-    is named. Returns None for every call that sends nothing."""
+    is named. Hermes's `approve` directive is a gate the model cannot flip
+    itself: the gateway posts the request into this chat and waits for the
+    owner's /approve. latch's conflict check and plow_start_group_message's
+    dry_run/confirm are re-sendable by the model, so this hook is what makes
+    their override a human decision. Returns None for every call that sends
+    nothing."""
     if not str(tool_name).endswith("plow_run_command"):
         return None
     argv = (args or {}).get("argv") if isinstance(args, dict) else None
     if not isinstance(argv, list):
         return None
-    summary = _google_send_summary([str(arg) for arg in argv])
+    argv = [str(arg) for arg in argv]
+    summary = _google_send_summary(argv)
     if summary is None:
         return None
     turn = _ACTIVE_TURN.get()
