@@ -39,7 +39,7 @@ you have already invited (check your memory first).
      fixed owner notice derived from the recorded turn. Record the pending ask
      only when that succeeds. Never leave the praising person with an empty
      response while you wait for the owner.
-   - `ready`: draft and send the invite as described below.
+   - `ready`: send the invite as described below.
 3. When the owner answers the consent request, run
    `python3 <this skill's dir>/scripts/mint_invite.py --consent granted` or
    `--consent declined`. On a grant, call `plow_prepare_invite` with no
@@ -47,19 +47,13 @@ you have already invited (check your memory first).
    decline ends it. The install root differs by runtime, so never assume an
    absolute path.
 
-## Draft and send a ready invite
+## Send a ready invite
 
-Write one brief message in your own voice. This is guidance, not a fixed
-template: respond warmly to what the person said, explain naturally that the
-owner has given you permission to share referral invites, tell them to text
-`Plow Activate: {{activation_code}}` to `{{destination}}` for early access,
-and say that both people will get $100 in cloud credits. Use each placeholder
-exactly once and never write a code or phone number yourself.
-
-Call `plow_send_invite` with the opportunity id and that message as
-`message_template`. The tool substitutes the trusted values after generation
-and posts the ordinary reply in the recorded original thread. Do not echo the
-message afterward. The tool also sends the owner FYI.
+Call `plow_send_invite` with the opportunity id. Plow writes the invite itself:
+it names the owner, tells the person to text the setup link for the same kind
+of agent you are to a Plow number, and mentions the $100 in starting cloud
+credits. Never write a setup link or phone number yourself, and do not echo
+the invite afterward. The tool also sends the owner FYI.
 
 Never use cron, a scheduled job, a generic cross-chat send, or the direct mint
 mode for an invite. The durable opportunity is the only continuation path.
