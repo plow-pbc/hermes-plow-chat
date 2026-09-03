@@ -1656,10 +1656,9 @@ def _google_send_summary(argv):
     if argv[-1] in ("--help", "-h") and "--" not in argv:
         return None
     group, verb = argv[1], argv[2]
-    account = _argv_flag(argv, "account") or "the default account"
     if group in _GMAIL_GROUPS:
         if verb in _MAIL_SEND_VERBS:
-            lines = [f"Send email ({verb}) from {account}"]
+            lines = [f"Send email ({verb})"]
             if verb != "send" and len(argv) > 3 and not argv[3].startswith("-"):
                 lines.append(f"on message {argv[3]}")
             for flag in ("to", "cc", "bcc", "subject"):
@@ -1671,11 +1670,11 @@ def _google_send_summary(argv):
                 lines += ["", body]
             return "\n".join(lines)
         if verb in _DRAFT_GROUPS and len(argv) > 4 and argv[3] in _DRAFT_SEND_VERBS:
-            return f"Send Gmail draft {argv[4]} from {account}"
+            return f"Send Gmail draft {argv[4]}"
         return None
     if group in _CALENDAR_GROUPS and verb in _CALENDAR_CREATE_VERBS and "--confirm-conflict" in argv:
         return (
-            f"Book over a conflict on {account}: {_argv_flag(argv, 'summary') or '(untitled)'} "
+            f"Book over a conflict: {_argv_flag(argv, 'summary') or '(untitled)'} "
             f"{_argv_flag(argv, 'from')} to {_argv_flag(argv, 'to')}"
         )
     return None
@@ -1698,13 +1697,15 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     summary = _google_send_summary(argv)
     if summary is None:
         return None
-    turn = _ACTIVE_TURN.get()
-    if turn is None or not (turn["owner"] and turn["dm"]):
+    turn = _ACTIVE_TURN.get() or {}
+    if not (turn.get("owner") and turn.get("dm")):
         # The prompt must land where only the owner can read and answer it;
         # a group room would publish the email and let any member approve it.
         return {"action": "block",
                 "message": "email sends and conflict overrides are approved "
-                           "only in the owner's own chat; nothing was sent"}
+                           "only in the owner's own chat; nothing was sent — "
+                           "ask the owner to repeat the request in their "
+                           "direct chat with you"}
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()[:12]
