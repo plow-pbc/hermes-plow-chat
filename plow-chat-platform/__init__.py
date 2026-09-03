@@ -1,3 +1,5 @@
+# Copyright 2026 The Plow Collective, Inc
+# SPDX-License-Identifier: Apache-2.0
 """Hermes platform adapter for Plow Chat.
 
 Receives granted-scope WSS events and sends replies through the chat REST API.
