@@ -269,6 +269,10 @@ class _ChatResourceHTTP:
         self.calls.append(("put", url, kwargs))
         return self.response
 
+    def patch(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("patch", url, kwargs))
+        return self.response
+
 
 def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
     """Simulate these chats having already been anchored -- by `_listen`'s
@@ -293,6 +297,13 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member"})
     return {"uid": uid, "display_name": name, "participants": participants,
             "trusted": trusted}
+
+
+def _voiced(module: Any, prompt: str) -> str:
+    """The exact non-solo-DM composition `_collaboration_prompt` applies, so
+    the prompt-matrix tests below don't hand-roll it out of sync with the
+    real code."""
+    return f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {prompt}"
 
 
 def _envelope(
@@ -1114,12 +1125,12 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     # boundary, not the asker.
     owner_prompt = handled[1]["channel_prompt"]
     assert owner_prompt == module._with_identity(
-        module._VOICE_RULE + module.GROUP_OWNER_CHANNEL_PROMPT, None, adapter._identity)
+        _voiced(module, module.GROUP_OWNER_CHANNEL_PROMPT), None, adapter._identity)
     for block in (module._DISCLOSURE, module._NO_RELAY):
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
     assert member_prompt == module._with_identity(
-        module._VOICE_RULE + module.EXTERNAL_CHANNEL_PROMPT, None, adapter._identity)
+        _voiced(module, module.EXTERNAL_CHANNEL_PROMPT), None, adapter._identity)
     for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
         assert block in member_prompt
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
@@ -1260,7 +1271,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     (event,) = handled
     expected = getattr(module, base)
     if group:
-        expected = module._VOICE_RULE + expected
+        expected = _voiced(module, expected)
     assert event["channel_prompt"] == module._with_identity(expected, agent_name, adapter._identity)
 
 
@@ -1347,12 +1358,14 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
 
     (event,) = handled
     base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
+    relationship_fact = f"{module._RELATIONSHIP_FACT} " if group else ""
     # Composed through _with_identity rather than re-spelling the prefix: the
     # identity-and-facts text is pinned once, by the prefix test above. What
-    # this test owns is the voice rule -- present in a shared thread, absent
-    # in a solo DM, with the base prompt unchanged either way.
+    # this test owns is the voice rule and relationship fact -- present in a
+    # shared thread, absent in a solo DM, with the base prompt unchanged
+    # either way.
     assert event["channel_prompt"] == module._with_identity(
-        f"{rule}{base}", "Elm", adapter._identity)
+        f"{rule}{relationship_fact}{base}", "Elm", adapter._identity)
 
 
 @pytest.mark.parametrize(
@@ -1384,7 +1397,7 @@ async def test_trust_selects_the_explicit_prompt_matrix(
 
     expected = getattr(module, prompt_name)
     if group:
-        expected = module._VOICE_RULE + expected
+        expected = _voiced(module, expected)
     assert handled[0]["channel_prompt"] == module._with_identity(expected, None, adapter._identity)
 
     if trusted:
@@ -1531,6 +1544,33 @@ def test_member_labels_never_gain_channel_prompt_authority(
     assert "untrusted" in turn_context.lower()
 
 
+def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_owners_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    chat = _collaboration_chat()
+    member = next(p for p in chat["participants"] if p.get("type") == "member" and p.get("role") != "owner")
+    # A relationship word not already inside _RELATIONSHIP_FACT's own "(wife)"
+    # example -- otherwise a leaked relationship would go uncaught below.
+    member["display_name"], member["relationship"] = "Abby", "landlord"
+    context = module._collaboration_turn_context(chat, member)
+    assert "Abby [mem_daniel_cht_a] (landlord)" in context
+    identity = {"signup": None, "number": None}
+    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
+    assert "Abby" not in prompt
+    assert "landlord" not in prompt
+    # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
+    # _VOICE_RULE), not baked into the base prompt constants -- assert the
+    # composed prompt a real turn actually gets.
+    for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
+                 module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
+        assert module._RELATIONSHIP_FACT in module._collaboration_prompt(base, chat, identity)
+    # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
+    # the composition a real turn produces -- not this group chat.
+    assert module._RELATIONSHIP_FACT not in module._collaboration_prompt(
+        module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity)
+
+
 async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -1554,7 +1594,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
     assert handled[0]["channel_prompt"] == module._with_identity(
-        module._VOICE_RULE + module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, None, adapter._identity)
+        _voiced(module, module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT), None, adapter._identity)
 
 
 async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
@@ -1969,6 +2009,7 @@ def test_tools_register_with_optional_deferred_questions(
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
+        "plow_chat_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
     ]
@@ -1977,11 +2018,16 @@ def test_tools_register_with_optional_deferred_questions(
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    trust_tool = ctx.tools[1]
+    name_contact_tool = ctx.tools[1]
+    assert name_contact_tool["schema"]["name"] == "plow_chat_name_contact"
+    assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert name_contact_tool["check_fn"]()
+
+    trust_tool = ctx.tools[2]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[2]
+    invite_tool = ctx.tools[3]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -2016,6 +2062,84 @@ def _live_tool(
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
     return adapter
+
+
+def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A member saying "I'm Sam's wife" cannot become a label: while their turn
+    is open the tool cannot write, and neither can a call outside any active
+    turn -- the gate fails closed, like plow_start_group_message's trusted
+    branch, not open. The owner saying it, on the owner's own turn, can."""
+    module = _load(monkeypatch, tmp_path)
+    record: list[Any] = []
+    _live_tool(
+        module, monkeypatch, "name_contact",
+        result=lambda chat_id, participant_id, body: {
+            "uid": participant_id, "display_name": body.get("display_name"),
+            "relationship": body.get("relationship"),
+        },
+        record=record,
+    )
+    args = {"participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+
+    outside = json.loads(module._plow_name_contact(dict(args)))
+    assert outside["success"] is False and "owner" in outside["error"]
+    assert record == []
+
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
+    refused = json.loads(module._plow_name_contact(dict(args)))
+    assert refused["success"] is False and "owner" in refused["error"]
+    assert record == []
+
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    out = json.loads(module._plow_name_contact(dict(args)))
+    assert out["success"] is True
+    assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        pytest.param(None, "could not confirm the write", id="timeout-unconfirmed"),
+        pytest.param(422, "Plow declined", id="4xx-declined"),
+        pytest.param(503, "could not confirm the write", id="5xx-unconfirmed"),
+    ],
+)
+def test_naming_reports_unconfirmed_write_on_network_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int | None, expected: str,
+) -> None:
+    """A timeout, a dropped connection, or a 5xx all say nothing about whether
+    the PATCH landed, so none reads back as an ordinary, retry-worthy failure --
+    only a 4xx is Plow itself definitively declining."""
+    module = _load(monkeypatch, tmp_path)
+    raises = TimeoutError("no response") if status is None else module._PlowSendError(status, "detail")
+    _live_tool(module, monkeypatch, "name_contact", raises=raises)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_name_contact(
+        {"participant_id": "cp_abby", "display_name": "Abby"}))
+
+    assert out["success"] is False
+    assert expected in out["error"]
+
+
+async def test_name_contact_percent_encodes_the_participant_id_path_segment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """participant_id is model-supplied and lands in a bearer-authenticated
+    URL path -- percent-encode it as one segment so a value like "../.." walks
+    nothing but its own segment."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    http = _ChatResourceHTTP(_Resp({"uid": "cp_x"}))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    await adapter.name_contact("cht_a", "cp_x/../../etc", {"display_name": "Abby"})
+
+    assert http.calls[0][0] == "patch"
+    assert http.calls[0][1] == f"{module.BASE}/v1/chats/cht_a/participants/cp_x%2F..%2F..%2Fetc/contact"
 
 
 def _invite_turn(**overrides: Any) -> dict[str, Any]:
