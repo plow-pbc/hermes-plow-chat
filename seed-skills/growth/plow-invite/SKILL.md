@@ -6,12 +6,12 @@ version: 1.4.0
 
 # Plow invite — delight-triggered referral
 
-<!-- Canonical copy: plow-pbc/hermes-plow-chat seed-skills/growth/plow-invite.
-     Mirror: plow-pbc/plow-hermes-agent image/seed/skills/growth/plow-invite.
-     Change the canonical copy first, then copy it verbatim; the two are meant
-     to be byte-identical. Configuration comes only from the environment
-     (PLOW_API_BASE / PLOW_AGENT_TOKEN) and every path is relative to this
-     skill's own directory — never an absolute home. -->
+<!-- The only hand-edited copy: plow-pbc/hermes-plow-chat
+     seed-skills/growth/plow-invite. The base image stages this file out of
+     this repo's tarball at the plugin SHA it pins, so there is nothing to copy
+     by hand. Configuration comes only from the environment (PLOW_API_BASE /
+     PLOW_AGENT_TOKEN) and every path is relative to this skill's own
+     directory — never an absolute home. -->
 
 ## When to act
 
@@ -55,5 +55,7 @@ The durable opportunity is the only continuation path.
 ## If the tool fails
 
 Drop the invite silently: do not mention the failure in either thread and do
-not retry in a loop. A rate cap is spent for the day. `delivery_unknown` is
-terminal for this turn and must never be retried.
+not retry in a loop. A rate cap is spent for the day. `delivery_unknown` means
+the server could not confirm the outcome. The workflow is replay-safe, so you
+may call `plow_offer_invite` again on a later user turn; never loop on it
+within this one.

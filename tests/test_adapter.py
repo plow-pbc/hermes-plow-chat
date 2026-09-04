@@ -1261,43 +1261,51 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     assert event["channel_prompt"] == module._with_identity(getattr(module, base), agent_name, adapter._identity)
 
 
+# The dashboard cards the prefix names, in the order it names them.
+_CARDS = ("credits and usage", "Plow lines", "trusted group chats", "delight invites",
+          "the daily payment limit", "verbose output", "the Latch connection")
+
+
+def _assert_in_order(text: str, *fragments: str) -> None:
+    """Every fragment is present, and each one after the one before it."""
+    at = -1
+    for fragment in fragments:
+        found = text.find(fragment, at + 1)
+        assert found > at, f"{fragment!r} is missing or out of order in {text!r}"
+        at = found
+
+
 @pytest.mark.parametrize(
-    ("name", "identity", "expected"),
+    ("name", "identity", "opening", "offer"),
     [
         pytest.param(
             "Elm", {"signup": SIGNUP, "number": NUMBER},
-            'You are Elm, a Plow Life Assistant; people here address you by that name. '
-            'Anyone can get their own by texting "Set this up for me: aiworthusing.com/agent-index/life" to +16505550100. '
-            'If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that. '
-            'Plow Latch (https://plow.co/latch) is the Mac app through which you reach your owner\'s accounts and browser; '
-            'if a task needs it and it is not connected, say so once with the link. '
-            'Your owner manages you at https://app.plow.co/dashboard: credits and usage, Plow lines, trusted group chats, '
-            'delight invites, the daily payment limit, verbose output, and the Latch connection. '
-            'When something fails for a reason the dashboard fixes, name the card and let them do it; '
-            'never ask them to send you a credential. PROMPT',
+            "You are Elm, a Plow assistant; people here address you by that name.",
+            f'Anyone can get their own Plow Life Assistant by texting "{SIGNUP["phrase"]}" to {NUMBER}.',
             id="named-with-signup",
         ),
         pytest.param(
             None, {"signup": None, "number": NUMBER},
-            'You are a Plow assistant. '
-            'If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that. '
-            'Plow Latch (https://plow.co/latch) is the Mac app through which you reach your owner\'s accounts and browser; '
-            'if a task needs it and it is not connected, say so once with the link. '
-            'Your owner manages you at https://app.plow.co/dashboard: credits and usage, Plow lines, trusted group chats, '
-            'delight invites, the daily payment limit, verbose output, and the Latch connection. '
-            'When something fails for a reason the dashboard fixes, name the card and let them do it; '
-            'never ask them to send you a credential. PROMPT',
-            id="unnamed-no-signup",
+            "You are a Plow assistant.", None, id="unnamed-no-signup",
         ),
     ],
 )
-def test_the_identity_prefix_is_this_text_and_no_other(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, name: str | None, identity: dict[str, Any], expected: str
+def test_the_identity_prefix_says_these_things_in_this_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    name: str | None, identity: dict[str, Any], opening: str, offer: str | None,
 ) -> None:
-    """The facts are prose the model acts on, so a reworded line is a
-    behaviour change with no other signal. Pinned verbatim."""
+    """The facts are prose the model acts on, so a dropped, reworded or
+    reordered fact is a behaviour change with no other signal. The agent is a
+    "Plow assistant" whatever variant it offers: the signup name says what
+    someone else can get, never what this agent is."""
     module = _load(monkeypatch, tmp_path)
-    assert module._with_identity("PROMPT", name, identity) == expected
+    prefix = module._with_identity("PROMPT", name, identity)
+
+    assert prefix.startswith(opening)
+    _assert_in_order(prefix, opening, *filter(None, (offer,)), "call plow_offer_invite",
+                     module.LATCH_URL, module.DASHBOARD_URL, *_CARDS, "PROMPT")
+    if offer is None:
+        assert "Anyone can get their own" not in prefix, "no phrase, no offer sentence"
 
 
 @pytest.mark.parametrize(
@@ -1356,13 +1364,14 @@ async def test_collaboration_context_names_self_peers_and_current_human_speaker(
     await _settle(adapter)
 
     prompt = handled[0]["channel_prompt"]
-    assert "You are Elm" in prompt
-    assert "Ash" in prompt
+    # A peer turn goes through the one identity seam like every other turn:
+    # identity sentence, then the facts, then the collaboration paragraph. The
+    # persona answers "what are you" from the prompt, not from memory.
+    _assert_in_order(prompt, "You are Elm, a Plow assistant",
+                     module._plow_facts(adapter._identity),
+                     "Collaboration context: Other Plow agents here: Ash.")
+    assert prompt.count("You are ") == 1, "one identity sentence, not two"
     assert "do not impersonate another agent" in prompt.lower()
-    # The peer paragraph is the one turn prompt that does not go through
-    # _with_identity, so pin that it still ends with the Plow facts.
-    assert prompt.split(f"{module.NO_REPLY_SENTINEL}. ")[1].startswith(
-        module._plow_facts(adapter._identity))
     assert "representing Sam" not in prompt and "Daniel" not in prompt
     assert "untrusted chat roster labels" in handled[0]["text"].lower()
     assert "Elm represents Sam" in handled[0]["text"]
@@ -1561,15 +1570,30 @@ async def test_a_grant_that_drops_the_configured_home_is_refused(
     assert persisted == []
 
 
-@pytest.mark.parametrize("me_status", [200, 404], ids=["identity-served", "older-api"])
-async def test_reach_refresh_reads_the_signup_facts_and_tolerates_their_absence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, me_status: int
+@pytest.mark.parametrize(
+    ("me_status", "held", "refreshes"),
+    [
+        pytest.param(200, {"signup": None, "number": None}, True, id="200-sets-it"),
+        pytest.param(404, {"signup": SIGNUP, "number": NUMBER}, True, id="404-keeps-what-we-hold"),
+        pytest.param(503, {"signup": SIGNUP, "number": NUMBER}, False, id="503-fails-the-refresh"),
+        # Below 400, so raise_for_status stays quiet -- a proxy bouncing us to a
+        # login page is still not an answer about identity, and must fail loudly.
+        pytest.param(302, {"signup": SIGNUP, "number": NUMBER}, False, id="302-fails-the-refresh"),
+    ],
+)
+async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    me_status: int, held: dict[str, Any], refreshes: bool
 ) -> None:
-    """The facts come from /me on the same refresh that reads the grant. An
-    API that does not serve them (or a token /me cannot identify) leaves the
-    prefix without a phrase and the phone line up."""
+    """The facts come from /me on the same refresh that reads the grant. Only a
+    200 sets them; a 404 (a token /me cannot identify as one agent) keeps what
+    we hold and the phone line up; anything else is not an answer about
+    identity and fails the refresh, so _listen retries rather than running on
+    silently. Refresh has no timer, so an overwrite on failure would strip the
+    offer for the life of a healthy socket."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._identity = dict(held)
 
     class _ReachAndMeHTTP:
         def get(self, url: str, **kwargs: Any) -> _Resp:
@@ -1578,13 +1602,14 @@ async def test_reach_refresh_reads_the_signup_facts_and_tolerates_their_absence(
                               "signup": SIGNUP}, status=me_status)
             return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
 
-    await adapter._refresh_reach(_ReachAndMeHTTP())
-
-    assert adapter.chat_uids == frozenset({"cht_a"})
-    if me_status == 200:
-        assert adapter._identity == {"signup": SIGNUP, "number": NUMBER}
+    if refreshes:
+        await adapter._refresh_reach(_ReachAndMeHTTP())
+        assert adapter.chat_uids == frozenset({"cht_a"})
     else:
-        assert adapter._identity == {"signup": None, "number": None}
+        with pytest.raises(RuntimeError):
+            await adapter._refresh_reach(_ReachAndMeHTTP())
+
+    assert adapter._identity == {"signup": SIGNUP, "number": NUMBER}
 
 
 class _SocketHTTP(_HTTP):

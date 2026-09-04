@@ -165,15 +165,14 @@ def _collaboration_prompt(prompt, chat, identity):
         return _with_identity(prompt, _agent_name(chat), identity)
 
     peer_fact = ", ".join(peers)
-    self_name = _agent_name(chat) or "this Plow agent"
-    return (
-        f"Collaboration context: You are {self_name}. Other Plow agents here: {peer_fact}. "
+    collaboration = (
+        f"Collaboration context: Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
         "Work with them in this visible thread. Respond when addressed or when you have a useful contribution; "
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
-        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}. "
-        f"{_plow_facts(identity)} {prompt}"
+        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
     )
+    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat), identity)
 
 
 def _collaboration_turn_context(chat, sender):
@@ -382,12 +381,17 @@ def _plow_facts(identity):
     at reach refresh; the URLs are Plow's own. None of it is sender-supplied
     text, so carrying it in the prompt is not the injection seam a sender name
     would be. A deployment whose API serves no signup block simply omits the
-    phrase sentence.
+    offer sentence.
+
+    The variant name belongs HERE, not in the who-sentence: the resolver falls
+    back to the Life row for any provider with no phrase of its own, so it
+    names what someone else can get, never what this agent is.
     """
     signup = identity.get("signup") or {}
     facts = []
-    if signup.get("phrase") and identity.get("number"):
-        facts.append(f'Anyone can get their own by texting "{signup["phrase"]}" to {identity["number"]}.')
+    if signup.get("name") and signup.get("phrase") and identity.get("number"):
+        facts.append(f'Anyone can get their own Plow {signup["name"]} by texting '
+                     f'"{signup["phrase"]}" to {identity["number"]}.')
     facts.append("If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that.")
     facts.append(f"Plow Latch ({LATCH_URL}) is the Mac app through which you reach your owner's accounts and browser; "
                  "if a task needs it and it is not connected, say so once with the link.")
@@ -403,12 +407,11 @@ def _with_identity(prompt, name, identity):
 
     "hey Elm" in a group only reads as addressed if the model knows it IS
     Elm; the name is ops-seeded on the line. An unnamed line still learns what
-    kind of agent it is.
+    kind of agent it is. Every turn prompt opens here, the peer paragraph
+    included -- it hands itself in as `prompt`, so there is one identity seam.
     """
-    signup = identity.get("signup") or {}
-    kind = f"Plow {signup['name']}" if signup.get("name") else "Plow assistant"
-    who = (f"You are {name}, a {kind}; people here address you by that name."
-           if name else f"You are a {kind}.")
+    who = (f"You are {name}, a Plow assistant; people here address you by that name."
+           if name else "You are a Plow assistant.")
     return f"{who} {_plow_facts(identity)} {prompt}"
 
 
@@ -616,15 +619,24 @@ class PlowChatAdapter(BasePlatformAdapter):
             if body["has_more"]:
                 raise RuntimeError("the granted chat listing is truncated")
             self._set_reach(body["data"])
-            # Who this agent is, for the prompt prefix. A non-200 -- an older
-            # API's 404, or a token /me cannot identify -- leaves the phrase
-            # out and the phone line up. Deliberately NOT given an except of
-            # its own: a transport error or a malformed body fails the refresh
-            # exactly like the grant read above, and the caller reconnects.
+            # Who this agent is, for the prompt prefix. Only a 200 sets it:
+            # refresh has no timer (connect, group creation, an unknown-chat
+            # frame), so overwriting on a failure would let one blip strip the
+            # offer for the life of a healthy socket.
             async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
-                me = await resp.json(content_type=None) if resp.status == 200 else {}
-            self._identity = {"signup": me.get("signup"),
-                              "number": (me.get("line") or {}).get("provider_key")}
+                if resp.status == 200:
+                    me = await resp.json(content_type=None)
+                    self._identity = {"signup": me.get("signup"),
+                                      "number": (me.get("line") or {}).get("provider_key")}
+                elif resp.status != 404:
+                    # 404 is the documented "this token is not one agent" -- a
+                    # wildcard or multi-line grant -- and keeps what we hold.
+                    # Anything else is not an answer about identity: through the
+                    # credential seam (a 401 is terminal), then fail the refresh
+                    # like the grant read above so _listen retries, rather than
+                    # silently running without the offer.
+                    _auth_raise_for_status(resp)
+                    raise RuntimeError(f"the identity read returned HTTP {resp.status}")
         except _PlowAuthError:
             raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
