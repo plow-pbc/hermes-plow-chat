@@ -3862,3 +3862,31 @@ async def test_two_turns_racing_a_settlement_announce_it_once(
 
     assert sent.await_count == 1, "a goal settles, and says so, exactly once"
     assert module._goal_load("cht_a")["status"] == "met"
+
+
+async def test_a_goal_that_expired_while_nothing_ran_still_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Testing liveness at the top of the wake loop dropped straight out for an
+    already-expired goal, retiring it in silence — the same silent settle the
+    judged path refuses, reached by the clock instead of a verdict."""
+    delivered = True
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    expired = module._goal_new("book the campsite")
+    expired["expires_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    expired["status"] = module.GOAL_ACTIVE
+    module._goal_save("cht_a", expired)
+    sent = mock.AsyncMock(return_value=_SendResult(success=delivered))
+    monkeypatch.setattr(adapter, "send", sent)
+    monkeypatch.setattr(adapter, "_goal_fire", mock.AsyncMock())
+
+    task = asyncio.create_task(adapter._goal_wake("cht_a"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    sent.assert_awaited()
+    assert "expired" in sent.await_args[0][1].lower()
+    assert module._goal_load("cht_a")["status"] == "expired"

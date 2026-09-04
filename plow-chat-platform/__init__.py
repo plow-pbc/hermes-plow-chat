@@ -1091,7 +1091,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._goal_wakes[chat_uid] = asyncio.create_task(self._goal_wake(chat_uid))
 
     async def _goal_wake(self, chat_uid):
-        """Re-fire a goal that nothing external is feeding.
+        """Re-fire a goal that nothing external is feeding, and retire it when
+        its clock or budget runs out.
 
         The fired turn may legally stay silent -- its channel prompt carries the
         sentinel -- so a wake with nothing to say costs one turn and posts
@@ -1103,19 +1104,32 @@ class PlowChatAdapter(BasePlatformAdapter):
         fired = 0
         while True:
             goal = _goal_load(chat_uid)
-            if not _goal_active(goal):
+            if not goal or goal.get("status") != GOAL_ACTIVE:
                 return
-            await asyncio.sleep(_goal_wake_delay(max(int(goal.get("attempts") or 0), fired)))
-            async with self._goal_lock(chat_uid):
+            # Exhaustion is checked BEFORE the sleep as well as after it. A goal
+            # whose clock ran out while nothing was running -- across a restart,
+            # say -- is still owed its notice, and testing liveness at the top
+            # of the loop instead would drop straight out and retire it in
+            # silence.
+            reason = _goal_exhaustion(goal)
+            if reason is None:
+                await asyncio.sleep(_goal_wake_delay(max(int(goal.get("attempts") or 0), fired)))
                 goal = _goal_load(chat_uid)
                 if not goal or goal.get("status") != GOAL_ACTIVE:
                     return
                 reason = _goal_exhaustion(goal)
-                if reason:
-                    goal["status"] = reason
-                    _goal_save(chat_uid, goal)
-            if reason:
-                await self._goal_announce(chat_uid, reason, "no attempts left")
+            if reason is not None:
+                async with self._goal_lock(chat_uid):
+                    current = _goal_load(chat_uid)
+                    if not current or current.get("status") != GOAL_ACTIVE:
+                        return
+                    current["status"] = reason
+                    _goal_save(chat_uid, current)
+                # Out of clock or out of budget, there is no further work to
+                # keep it alive for, so an undelivered notice is logged rather
+                # than holding the goal open to retry one.
+                if not await self._goal_announce(chat_uid, reason, "no attempts left"):
+                    log.warning("[plow_chat] goal %s notice undelivered for %s", reason, chat_uid)
                 return
             fired += 1
             try:
