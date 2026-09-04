@@ -1598,12 +1598,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             return {"skipped": "deferred_consent_unavailable"}
 
         home = await self.get_chat_info(self.home_chat_uid)
-        home_members = [
-            participant
-            for participant in self._chats[self.home_chat_uid]["participants"]
-            if participant.get("type") == "member"
-        ]
-        if home["type"] != "dm" or len(home_members) != 1 or home_members[0].get("role") != "owner":
+        if not _is_owner_dm(self._chats[self.home_chat_uid]):
             raise RuntimeError("invite consent requires an owner-authenticated direct-message home")
         source = self.build_source(
             chat_id=self.home_chat_uid,

@@ -3759,7 +3759,12 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
     silenced = "do not reply to it" in handled[0]["channel_prompt"]
     assert silenced is expect_silenced
     if expect_silenced:
-        assert module.NO_REPLY_SENTINEL in handled[0]["channel_prompt"]
+        prompt = handled[0]["channel_prompt"]
+        assert module.NO_REPLY_SENTINEL in prompt
+        # The paragraph after the silence prefix must not invite the very
+        # contribution the prefix just forbade.
+        assert "only while a goal for this thread is active" in prompt
+        assert "when you have a useful contribution" not in prompt
 
 
 async def test_an_active_goal_rides_every_turn_as_untrusted_thread_data(
@@ -4281,30 +4286,42 @@ async def test_pacing_does_not_outlive_the_socket_session(
     adapter._goal_pause_wakes()
 
 
-async def test_a_room_holding_a_peer_agent_is_never_a_dm(
+@pytest.mark.parametrize(
+    ("keep", "expected_type"),
+    [
+        (lambda p: p.get("type") != "member" or p.get("role") == "owner", "group"),
+        (lambda p: p.get("relationship") == "self" or p.get("role") == "member", "dm"),
+    ],
+    ids=["peer_present", "owner_departed"],
+)
+async def test_scheduled_wake_authority_matches_current_participants(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    keep: Any, expected_type: str,
 ) -> None:
-    """One human plus another household's agent is not a private thread.
-    Counting humans alone called it a DM, which handed its scheduled wake owner
-    authority over content that peer had written."""
+    """Only a private thread with the OWNER may carry owner authority.
+
+    Both rows are the same mistake — answering "is this room private?" by
+    counting rather than by asking who is in it. One human plus another
+    household's agent is not private; neither is a room the owner has left,
+    however 1:1 its shape.
+    """
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
-    solo_with_peer = _collaboration_chat()
-    solo_with_peer["participants"] = [
-        participant for participant in solo_with_peer["participants"]
-        if participant.get("type") != "member" or participant.get("role") == "owner"
-    ]
-    adapter._set_reach([solo_with_peer])
+    room = _collaboration_chat()
+    room["participants"] = [p for p in room["participants"] if keep(p)]
+    adapter._set_reach([room])
     _mark_anchored(adapter, "cht_a")
     module._goal_save("cht_a", module._goal_new("book the campsite"))
     handled = _capture_events(monkeypatch, adapter)
     monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
 
-    assert (await adapter.get_chat_info("cht_a"))["type"] == "group"
+    assert (await adapter.get_chat_info("cht_a"))["type"] == expected_type
+    assert module._is_owner_dm(room) is False
 
     await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
 
     assert handled[0]["source"]["role_authorized"] is False
+    assert module.EXTERNAL_CHANNEL_PROMPT in handled[0]["channel_prompt"]
 
 
 @pytest.mark.parametrize(
@@ -4363,46 +4380,3 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
     assert "only your owner directs work on the Mac" in text
     assert "not your owner" in text
-
-
-async def test_a_departed_owner_does_not_leave_a_stranger_holding_owner_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """"Nobody else here" stops meaning "just the owner" the moment the owner
-    leaves. A group left holding one non-owner read as a private thread, which
-    handed them a scheduled turn with owner-only tools."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
-    orphaned = _collaboration_chat()
-    orphaned["participants"] = [
-        participant for participant in orphaned["participants"]
-        if participant.get("type") == "agent" and participant.get("relationship") == "self"
-    ] + [{"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member"}]
-    adapter._set_reach([orphaned])
-    _mark_anchored(adapter, "cht_a")
-    module._goal_save("cht_a", module._goal_new("book the campsite"))
-    handled = _capture_events(monkeypatch, adapter)
-    monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
-
-    # The room now looks 1:1 by shape, and is still not the owner's.
-    assert (await adapter.get_chat_info("cht_a"))["type"] == "dm"
-    assert module._is_owner_dm(orphaned) is False
-
-    await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
-
-    assert handled[0]["source"]["role_authorized"] is False
-    assert module.EXTERNAL_CHANNEL_PROMPT in handled[0]["channel_prompt"]
-
-
-def test_an_unaddressed_peer_reply_is_permitted_only_under_a_goal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """The silence prefix said not to reply while the collaboration paragraph
-    still invited an unsolicited contribution — the loop the README says is
-    suppressed, permitted by the very prompt that follows the suppression."""
-    module = _load(monkeypatch, tmp_path)
-    prompt = module._collaboration_prompt(
-        module.EXTERNAL_CHANNEL_PROMPT, _collaboration_chat(), {"signup": None, "number": None})
-
-    assert "only while a goal for this thread is active" in prompt
-    assert "when you have a useful contribution" not in prompt
