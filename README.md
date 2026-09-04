@@ -150,13 +150,13 @@ in the untrusted roster context above, never in the prompt.
 The owner may also tell the agent what to call a roster member and who that
 person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
 which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
-The tool writes only from the owner's own turn; it refuses outright during a
-member's turn, and outside any active turn at all, so nothing a member says
-about themselves, however phrased, becomes a label. A relationship renders as
+The tool is owner-turn-authorized only; it refuses outright during a member's
+turn, and outside any active turn at all, so nothing a member says about
+themselves, however phrased, becomes a label. A relationship renders as
 `Name [uid] (relationship)` in the untrusted roster context above, never in
 the channel prompt, which instead states generically that a roster
-relationship is the owner's own assertion and that a member's claim about who
-they are is just that — a claim.
+relationship is a label recorded on the owner's turn, and that a member's
+claim about who they are is just that — a claim.
 
 ## Media
 
