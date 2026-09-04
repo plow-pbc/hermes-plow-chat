@@ -1862,6 +1862,7 @@ def test_tools_register_with_optional_deferred_questions(
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
+        "plow_chat_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
     ]
@@ -1870,11 +1871,16 @@ def test_tools_register_with_optional_deferred_questions(
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    trust_tool = ctx.tools[1]
+    name_contact_tool = ctx.tools[1]
+    assert name_contact_tool["schema"]["name"] == "plow_chat_name_contact"
+    assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert name_contact_tool["check_fn"]()
+
+    trust_tool = ctx.tools[2]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[2]
+    invite_tool = ctx.tools[3]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -1909,6 +1915,34 @@ def _live_tool(
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
     return adapter
+
+
+def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A member saying "I'm Sam's wife" cannot become a label: while their turn
+    is open the tool cannot write. The owner saying it, on the owner's turn, can."""
+    module = _load(monkeypatch, tmp_path)
+    record: list[Any] = []
+    _live_tool(
+        module, monkeypatch, "name_contact",
+        result=lambda chat_id, participant_id, body: {
+            "uid": participant_id, "display_name": body.get("display_name"),
+            "relationship": body.get("relationship"),
+        },
+        record=record,
+    )
+    args = {"chat_id": "cht_a", "participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
+    refused = json.loads(module._plow_name_contact(dict(args)))
+    assert refused["success"] is False and "owner" in refused["error"]
+    assert record == []
+
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    out = json.loads(module._plow_name_contact(dict(args)))
+    assert out["success"] is True
+    assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
 
 
 def _invite_turn(**overrides: Any) -> dict[str, Any]:

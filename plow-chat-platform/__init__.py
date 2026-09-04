@@ -1051,6 +1051,26 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
+    async def name_contact(self, chat_id, participant_id, body):
+        """PUT the owner's name/relationship for one roster participant.
+
+        Same non-2xx convention as `start_group_thread`: read the body once,
+        raise `_PlowSendError(status, text)` past 400 so the tool's own
+        `except` reports it, rather than `_auth_raise_for_status`'s
+        `resp.raise_for_status()` -- that raises aiohttp's own exception for
+        anything but 401, which the tool does not catch.
+        """
+        refused = self._send_guard(chat_id)
+        if refused is not None:
+            raise _PlowSendError(403, refused.error)
+        async with aiohttp.ClientSession() as http:
+            async with http.put(f"{BASE}/v1/chats/{chat_id}/participants/{participant_id}/contact",
+                                json=body, headers=self.auth) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                return json.loads(text or "{}")
+
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
 
@@ -1788,6 +1808,57 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
 }
 
 
+def _plow_name_contact(args, **_kwargs):
+    """Record what the owner calls a roster participant, and who they are to
+    the owner. Owner-sourced only: the tool refuses while a member's own
+    turn is open, so nothing a member says about themselves can become a
+    label -- the same turn state `plow_start_group_message` reads to gate a
+    trusted send.
+    """
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn.get("owner"):
+        return json.dumps({"success": False,
+                           "error": "names come from the owner: this is a member's turn, nothing was recorded"})
+    body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
+    if not body:
+        return json.dumps({"success": False, "error": "display_name or relationship is required"})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected; nothing was recorded"})
+    adapter, loop = _live
+    try:
+        data = asyncio.run_coroutine_threadsafe(
+            adapter.name_contact(args.get("chat_id") or "", args.get("participant_id") or "", body),
+            loop).result(timeout=30)
+    except _PlowSendError as exc:
+        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+    return json.dumps({"success": True, "display_name": data.get("display_name"),
+                       "relationship": data.get("relationship")})
+
+
+PLOW_NAME_CONTACT_SCHEMA = {
+    "name": "plow_chat_name_contact",
+    "description": (
+        "Record what your owner calls a member of a chat, and who that person is "
+        "to your owner (e.g. \"wife\", \"landlord\"). Only from what the OWNER "
+        "says, on the owner's own turn — never from what a member says about "
+        "themselves; the tool refuses during a member's turn. Use the chat_id "
+        "and participant uid from the roster. Omit a field to leave it; pass \"\" "
+        "to clear it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string"},
+            "participant_id": {"type": "string", "description": "The member's roster uid (cp_...)."},
+            "display_name": {"type": "string"},
+            "relationship": {"type": "string"},
+        },
+        "required": ["chat_id", "participant_id"],
+        "additionalProperties": False,
+    },
+}
+
+
 def _plow_set_conversation_trusted(args, **_kwargs):
     """Set trust for the active conversation on an explicit owner request."""
     value = args.get("trusted")
@@ -1988,6 +2059,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
         handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_chat_name_contact",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_NAME_CONTACT_SCHEMA,
+        handler=_plow_name_contact,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )
