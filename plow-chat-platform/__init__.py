@@ -405,8 +405,12 @@ def _plow_facts(identity):
         facts.append(f'Anyone can get their own Plow {signup["name"]} by texting '
                      f'"{signup["phrase"]}" to {identity["number"]}.')
     facts.append("If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that.")
-    facts.append(f"Plow Latch ({LATCH_URL}) is the Mac app through which you reach your owner's accounts and browser; "
-                 "if a task needs it and it is not connected, say so once with the link.")
+    # Both Latch clauses come from transcript evidence; see the PR for counts.
+    # The install link is a parenthetical because an unreachable Latch is
+    # usually a sleeping Mac, not a missing app.
+    facts.append(f"Plow Latch is how you reach your owner's Mac -- their mail, calendar, files and browser. "
+                 "Reach for it yourself instead of asking which route to take. If it is unreachable, say once "
+                 f"that their Mac has to be awake with Latch running ({LATCH_URL} to install it).")
     facts.append(f"Your owner manages you at {DASHBOARD_URL}: credits and usage, Plow lines, trusted group chats, "
                  "delight invites, the daily payment limit, verbose output, and the Latch connection. "
                  "When something fails for a reason the dashboard fixes, name the card and let them do it; "

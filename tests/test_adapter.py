@@ -1306,6 +1306,7 @@ def test_the_identity_prefix_says_these_things_in_this_order(
 
     assert prefix.startswith(opening)
     _assert_in_order(prefix, opening, *filter(None, (offer,)), "call plow_offer_invite",
+                     "Reach for it yourself", "has to be awake with Latch running",
                      module.LATCH_URL, module.DASHBOARD_URL, *_CARDS, "PROMPT")
     if offer is None:
         assert "Anyone can get their own" not in prefix, "no phrase, no offer sentence"
