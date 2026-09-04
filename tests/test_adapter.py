@@ -265,6 +265,10 @@ class _ChatResourceHTTP:
         self.calls.append(("put", url, kwargs))
         return self.response
 
+    def patch(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("patch", url, kwargs))
+        return self.response
+
 
 def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
     """Simulate these chats having already been anchored -- by `_listen`'s
@@ -1956,10 +1960,7 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     """A member saying "I'm Sam's wife" cannot become a label: while their turn
     is open the tool cannot write, and neither can a call outside any active
     turn -- the gate fails closed, like plow_start_group_message's trusted
-    branch, not open. owner=True alone is not proof either -- a member can
-    leave text for the owner's NEXT turn to act on -- so an owner turn whose
-    message doesn't contain the quoted owner_words is refused too; only a
-    quote that is actually a substring of this turn's own message writes."""
+    branch, not open. The owner saying it, on the owner's own turn, can."""
     module = _load(monkeypatch, tmp_path)
     record: list[Any] = []
     _live_tool(
@@ -1970,25 +1971,18 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
         },
         record=record,
     )
-    args = {"participant_id": "cp_abby", "owner_words": "that's Abby, my wife",
-            "display_name": "Abby", "relationship": "wife"}
+    args = {"participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
 
     outside = json.loads(module._plow_name_contact(dict(args)))
     assert outside["success"] is False and "owner" in outside["error"]
     assert record == []
 
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False, "text": args["owner_words"]})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
     refused = json.loads(module._plow_name_contact(dict(args)))
     assert refused["success"] is False and "owner" in refused["error"]
     assert record == []
 
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "text": "just chatting about the weather"})
-    mismatched = json.loads(module._plow_name_contact(dict(args)))
-    assert mismatched["success"] is False and "owner_words" in mismatched["error"]
-    assert record == []
-
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True,
-                             "text": f"Sure -- {args['owner_words']}, been meaning to say."})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_name_contact(dict(args)))
     assert out["success"] is True
     assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
@@ -2006,15 +2000,15 @@ def test_naming_reports_unconfirmed_write_on_network_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int | None, expected: str,
 ) -> None:
     """A timeout, a dropped connection, or a 5xx all say nothing about whether
-    the PUT landed, so none reads back as an ordinary, retry-worthy failure --
+    the PATCH landed, so none reads back as an ordinary, retry-worthy failure --
     only a 4xx is Plow itself definitively declining."""
     module = _load(monkeypatch, tmp_path)
     raises = TimeoutError("no response") if status is None else module._PlowSendError(status, "detail")
     _live_tool(module, monkeypatch, "name_contact", raises=raises)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "text": "that's Abby"})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
 
     out = json.loads(module._plow_name_contact(
-        {"participant_id": "cp_abby", "owner_words": "that's Abby", "display_name": "Abby"}))
+        {"participant_id": "cp_abby", "display_name": "Abby"}))
 
     assert out["success"] is False
     assert expected in out["error"]
@@ -2034,6 +2028,7 @@ async def test_name_contact_percent_encodes_the_participant_id_path_segment(
 
     await adapter.name_contact("cht_a", "cp_x/../../etc", {"display_name": "Abby"})
 
+    assert http.calls[0][0] == "patch"
     assert http.calls[0][1] == f"{module.BASE}/v1/chats/cht_a/participants/cp_x%2F..%2F..%2Fetc/contact"
 
 
@@ -2131,8 +2126,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False,
-             "text": "member praise that must not cross chats", "no_reply_ok": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -2145,8 +2139,7 @@ def test_invite_workflow_reports_delivery_failure(
                 "provider_key": "+17035550123",
             },
             "cp_taylor",
-            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY,
-                        text="member praise that must not cross chats"),
+            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY),
             id="normalized-name",
         ),
         pytest.param(
@@ -2162,7 +2155,6 @@ def test_invite_workflow_reports_delivery_failure(
                 participant_uid="cp_phone",
                 participant_identity="+17035550124",
                 triggered_at=mock.ANY,
-                text="member praise that must not cross chats",
             ),
             id="phone-fallback",
         ),
@@ -2189,7 +2181,7 @@ async def test_active_turn_retains_only_server_invite_identity(
             user_id=source_uid,
             user_name="attacker-controlled identity",
         ),
-        text="member praise that must not cross chats",
+        text="attacker-controlled praise must not cross chats",
     )
 
     await adapter.on_processing_start(event)

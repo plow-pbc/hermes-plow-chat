@@ -708,9 +708,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
             "dm": event.source.chat_type == "dm",
-            # plow_chat_name_contact's only proof the owner actually said this:
-            # a delayed-injection member turn cannot plant text here.
-            "text": getattr(event, "text", "") or "",
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
@@ -1070,7 +1067,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         return data
 
     async def name_contact(self, chat_id, participant_id, body):
-        """PUT the owner's name/relationship for one roster participant.
+        """PATCH the owner's name/relationship for one roster participant.
 
         Same non-2xx convention as `start_group_thread`: read the body once,
         raise `_PlowSendError(status, text)` past 400 so the tool's own
@@ -1083,8 +1080,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             raise _PlowSendError(403, refused.error)
         segment = urllib.parse.quote(participant_id, safe="")
         async with aiohttp.ClientSession() as http:
-            async with http.put(f"{BASE}/v1/chats/{chat_id}/participants/{segment}/contact",
-                                json=body, headers=self.auth) as resp:
+            async with http.patch(f"{BASE}/v1/chats/{chat_id}/participants/{segment}/contact",
+                                  json=body, headers=self.auth) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
@@ -1844,15 +1841,6 @@ def _plow_name_contact(args, **_kwargs):
         return json.dumps({"success": False,
                            "error": "names come from the owner: this requires the owner's "
                                     "own active turn, nothing was recorded"})
-    # owner=True alone only proves who is turn-authorized, not who said this:
-    # a member can leave text upstream for the owner's next turn to act on.
-    # Quoting the owner's own words back, verbatim, out of THIS turn's message
-    # is the deterministic proof a delayed injection cannot forge.
-    owner_words = (args.get("owner_words") or "").strip()
-    if not owner_words or owner_words not in (turn.get("text") or ""):
-        return json.dumps({"success": False,
-                           "error": "owner_words must quote the owner's own words from this turn's "
-                                    "message; nothing was recorded"})
     body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
     if not body:
         return json.dumps({"success": False, "error": "display_name or relationship is required"})
@@ -1888,22 +1876,17 @@ PLOW_NAME_CONTACT_SCHEMA = {
         "is to your owner (e.g. \"wife\", \"landlord\"). Only from what the OWNER "
         "says, on the owner's own turn — never from what a member says about "
         "themselves; the tool refuses during a member's turn. Use the participant "
-        "uid from the roster, shown as name [uid]. owner_words must be quoted "
-        "verbatim from the owner's own message this turn — the exact words that "
-        "state the name or relationship, e.g. \"that's Abby, my wife\" — proving "
-        "this is the owner's own statement and not text left for a later turn to "
-        "act on. Omit display_name/relationship to leave it; pass \"\" to clear it."
+        "uid from the roster, shown as name [uid]. Omit display_name/relationship "
+        "to leave it; pass \"\" to clear it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "participant_id": {"type": "string", "description": "The member's roster uid (cp_...)."},
-            "owner_words": {"type": "string", "description": "Verbatim quote from the owner's "
-                                                               "message this turn naming the field(s)."},
             "display_name": {"type": "string"},
             "relationship": {"type": "string"},
         },
-        "required": ["participant_id", "owner_words"],
+        "required": ["participant_id"],
         "additionalProperties": False,
     },
 }

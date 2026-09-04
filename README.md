@@ -23,10 +23,13 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
-> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`, and
+> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
-> `agent-mgr` SHA advance). Hermes hosts
+> `agent-mgr` SHA advance), and
+> `PATCH /v1/chats/{chat_uid}/participants/{participant_uid}/contact`
+> (`plow_chat_name_contact` — [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
+> "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
 > then land the `agent-mgr` support above, and only then bump
@@ -146,13 +149,14 @@ in the untrusted roster context above, never in the prompt.
 
 The owner may also tell the agent what to call a roster member and who that
 person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
-which `PUT`s `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`. The
-tool writes only from the owner's own turn; it refuses outright during a
-member's turn, so nothing a member says about themselves, however phrased,
-becomes a label. A relationship renders as `Name (relationship)` in the
-untrusted roster context above, never in the channel prompt, which instead
-states generically that a roster relationship is the owner's own assertion and
-that a member's claim about who they are is just that — a claim.
+which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
+The tool writes only from the owner's own turn; it refuses outright during a
+member's turn, and outside any active turn at all, so nothing a member says
+about themselves, however phrased, becomes a label. A relationship renders as
+`Name [uid] (relationship)` in the untrusted roster context above, never in
+the channel prompt, which instead states generically that a roster
+relationship is the owner's own assertion and that a member's claim about who
+they are is just that — a claim.
 
 ## Media
 
