@@ -120,6 +120,16 @@ def _represented_member(chat, agent):
                  if p.get("type") == "member" and p.get("uid") == uid), None)
 
 
+# The owner asked for "3 nights that work for me" and the agent answered in
+# the owner's own voice: nothing said whose voice this is. This names it --
+# the concrete mapping ("Elm represents Samuel Odio") already reaches the
+# model through the untrusted roster prefix (_collaboration_turn_context);
+# the name itself stays there, never in this system-authority prompt.
+_VOICE_RULE = ('You speak for the human the roster maps you to. Speak as '
+               'yourself, in your own voice; refer to them by name, never '
+               'as "I" or "me". ')
+
+
 def _speaker_name(sender, chat):
     if sender.get("type") == "agent":
         represented = _represented_member(chat, sender)
@@ -153,6 +163,8 @@ def _collaboration_prompt(prompt, chat):
     -- telling the model its collaborators were "none", and to stay silent,
     in threads where it had just been addressed directly.
     """
+    if not _is_solo_dm(chat):
+        prompt = _VOICE_RULE + prompt
     participants = chat.get("participants") or []
     peers = [
         (peer.get("line") or {}).get("display_name") or "an unnamed peer agent"
