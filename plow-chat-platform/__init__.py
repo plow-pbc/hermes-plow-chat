@@ -405,8 +405,17 @@ def _plow_facts(identity):
         facts.append(f'Anyone can get their own Plow {signup["name"]} by texting '
                      f'"{signup["phrase"]}" to {identity["number"]}.')
     facts.append("If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that.")
-    facts.append(f"Plow Latch ({LATCH_URL}) is the Mac app through which you reach your owner's accounts and browser; "
-                 "if a task needs it and it is not connected, say so once with the link.")
+    # Two failures from a week of real transcripts, both fixed here rather than
+    # by a longer sentence. (1) The owner named the route himself 12 times --
+    # "use Latch gog", "load up latch browser", "search gmail through the latch
+    # browser" -- for reads this agent should have reached for unprompted. (2)
+    # Across 21k assistant messages on three agents, not one told anybody their
+    # Mac had to be awake; Latch-unavailable was reported three times with no
+    # cause and no fix, and the install link is the wrong answer when the app is
+    # already installed and the laptop is shut.
+    facts.append(f"Plow Latch is how you reach your owner's Mac -- their mail, calendar, files and browser. "
+                 "Reach for it yourself instead of asking which route to take. If it is unreachable, say once "
+                 f"that their Mac has to be awake with Latch running ({LATCH_URL} to install it).")
     facts.append(f"Your owner manages you at {DASHBOARD_URL}: credits and usage, Plow lines, trusted group chats, "
                  "delight invites, the daily payment limit, verbose output, and the Latch connection. "
                  "When something fails for a reason the dashboard fixes, name the card and let them do it; "
