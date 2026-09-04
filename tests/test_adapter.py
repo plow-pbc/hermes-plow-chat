@@ -1971,6 +1971,22 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
 
 
+def test_naming_reports_unconfirmed_write_on_network_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A timeout or dropped connection says nothing about whether the PUT
+    landed, so it must not read back as an ordinary, retry-worthy failure --
+    same shape as the sibling network tools' broad except Exception."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "name_contact", raises=TimeoutError("no response"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+
+    out = json.loads(module._plow_name_contact({"participant_id": "cp_abby", "display_name": "Abby"}))
+
+    assert out["success"] is False
+    assert "could not confirm the write" in out["error"]
+
+
 def _invite_turn(**overrides: Any) -> dict[str, Any]:
     from datetime import datetime, timezone
 
