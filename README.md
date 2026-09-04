@@ -134,8 +134,10 @@ caller that stopped waiting cannot strand a delivered message unrecorded. A
 chat's session is born on its first inbound message, so a chat that has never
 spoken has nowhere to record to: the adapter logs a warning and that chat
 will not remember the send. A thread `plow_start_group_message` created is
-in that state; one it resumed has spoken before, and its opener is recorded
-like any other cross-chat send. Posting to the Plow API directly from a
+in that state; one it resumed is handled like any other cross-chat send,
+which records the opener only where a session already exists (a thread
+resumed before anyone replied has none, and logs the same warning). Posting
+to the Plow API directly from a
 script bypasses all of this and leaves the target chat amnesiac; the tool
 exists so the model never has to.
 
