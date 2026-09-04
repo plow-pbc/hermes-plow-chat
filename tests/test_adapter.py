@@ -1473,10 +1473,14 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     module = _load(monkeypatch, tmp_path)
     chat = _collaboration_chat()
     member = next(p for p in chat["participants"] if p.get("type") == "member" and p.get("role") != "owner")
-    member["display_name"], member["relationship"] = "Abby", "wife"
+    # A relationship word not already inside _RELATIONSHIP_FACT's own "(wife)"
+    # example -- otherwise a leaked relationship would go uncaught below.
+    member["display_name"], member["relationship"] = "Abby", "landlord"
     context = module._collaboration_turn_context(chat, member)
-    assert "Abby (wife)" in context
-    assert "Abby" not in module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat)
+    assert "Abby (landlord)" in context
+    prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat)
+    assert "Abby" not in prompt
+    assert "landlord" not in prompt
     for prompt in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
                    module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
         assert module._RELATIONSHIP_FACT in prompt
@@ -1950,7 +1954,7 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
         },
         record=record,
     )
-    args = {"chat_id": "cht_a", "participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+    args = {"participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
 
     outside = json.loads(module._plow_name_contact(dict(args)))
     assert outside["success"] is False and "owner" in outside["error"]

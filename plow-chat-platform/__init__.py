@@ -1824,7 +1824,11 @@ def _plow_name_contact(args, **_kwargs):
     trusted branch and `plow_set_conversation_trusted` -- both a member's own
     turn and no active turn at all refuse, so nothing a member says about
     themselves, and nothing invoked outside a turn, can become a label the
-    roster then presents to the model as the owner's own assertion.
+    roster then presents to the model as the owner's own assertion. The chat
+    is the open owner turn's own `chat_uid`, the same source
+    `plow_set_conversation_trusted` reads -- this tool only ever names someone
+    in the chat whose owner turn is open, so there is no model-supplied
+    chat_id to trust or validate.
     """
     turn = _ACTIVE_TURN.get()
     if turn is None or not turn.get("owner"):
@@ -1839,10 +1843,16 @@ def _plow_name_contact(args, **_kwargs):
     adapter, loop = _live
     try:
         data = asyncio.run_coroutine_threadsafe(
-            adapter.name_contact(args.get("chat_id") or "", args.get("participant_id") or "", body),
+            adapter.name_contact(turn["chat_uid"], args.get("participant_id") or "", body),
             loop).result(timeout=30)
     except _PlowSendError as exc:
         return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+    except Exception as exc:  # noqa: BLE001 - report no unconfirmed write as success
+        return json.dumps({
+            "success": False,
+            "error": f"could not confirm the write ({type(exc).__name__}); nothing may have been "
+                     "recorded; retrying is safe",
+        })
     return json.dumps({"success": True, "display_name": data.get("display_name"),
                        "relationship": data.get("relationship")})
 
@@ -1850,22 +1860,20 @@ def _plow_name_contact(args, **_kwargs):
 PLOW_NAME_CONTACT_SCHEMA = {
     "name": "plow_chat_name_contact",
     "description": (
-        "Record what your owner calls a member of a chat, and who that person is "
-        "to your owner (e.g. \"wife\", \"landlord\"). Only from what the OWNER "
+        "Record what your owner calls a member of THIS chat, and who that person "
+        "is to your owner (e.g. \"wife\", \"landlord\"). Only from what the OWNER "
         "says, on the owner's own turn — never from what a member says about "
-        "themselves; the tool refuses during a member's turn. Use the chat_id "
-        "and participant uid from the roster. Omit a field to leave it; pass \"\" "
-        "to clear it."
+        "themselves; the tool refuses during a member's turn. Use the participant "
+        "uid from the roster. Omit a field to leave it; pass \"\" to clear it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "chat_id": {"type": "string"},
             "participant_id": {"type": "string", "description": "The member's roster uid (cp_...)."},
             "display_name": {"type": "string"},
             "relationship": {"type": "string"},
         },
-        "required": ["chat_id", "participant_id"],
+        "required": ["participant_id"],
         "additionalProperties": False,
     },
 }
