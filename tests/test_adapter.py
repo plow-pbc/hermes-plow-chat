@@ -3829,17 +3829,17 @@ def test_recall_returns_none_when_nothing_matches(
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
-def test_recall_logs_and_stands_down_when_the_store_raises(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+def test_recall_lets_a_store_failure_propagate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
     module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "trusted": False})
-    with caplog.at_level(logging.WARNING):
-        assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
-    assert "recall" in caplog.text and "fts locked" in caplog.text
+    with pytest.raises(RuntimeError, match="fts locked"):
+        module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
+    assert db.closed is True
 
 
 def test_recall_hook_is_registered(

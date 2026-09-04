@@ -1651,8 +1651,9 @@ def _recall(session_id, user_message, platform, **_kwargs):
     reaches every chat, the owner's DMs included -- trust means members may
     have owner material. An untrusted member turn stays inside its own
     chat's sessions. The current session is never recalled: the model has
-    it. Errors are logged and the turn proceeds without recall; a recall
-    outage must not silence the agent."""
+    it. Errors propagate: Hermes isolates and logs a failing pre_llm_call
+    hook and proceeds without recall, so a broken store is visible in the
+    gateway log instead of hidden here."""
     turn = _ACTIVE_TURN.get()
     if platform != PLATFORM_NAME or turn is None:
         return None
@@ -1677,9 +1678,6 @@ def _recall(session_id, user_message, platform, **_kwargs):
             lines.append(f"- [{when}] {row['role']}: {row['snippet']}")
             if len(lines) == _RECALL_LIMIT:
                 break
-    except Exception:  # noqa: BLE001 - the turn must go on without recall
-        log.warning("[plow_chat] recall failed for %s", session_id, exc_info=True)
-        return None
     finally:
         release_or_close(db)
     if not lines:
