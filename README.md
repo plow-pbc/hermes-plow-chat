@@ -141,6 +141,28 @@ to the Plow API directly from a
 script bypasses all of this and leaves the target chat amnesiac; the tool
 exists so the model never has to.
 
+### Recall from other chats
+
+Hermes keeps one session per chat, so a turn in one chat knows nothing of the
+others unless told. On every Plow Chat turn the plugin's `pre_llm_call` hook
+runs an OR-query built from the message's own words over the Hermes session
+store and appends up to six dated one-line snippets from other sessions to the
+turn (upstream's seam for per-turn recall: the user message, never the system
+prompt). The room is the boundary, not the asker: the home chat (the owner's
+own DM) and a trusted room recall from every chat, the owner's DMs included —
+that is what trust means here. Every other turn, an owner's turn in an
+untrusted group included, recalls only from its own chat's earlier sessions.
+The current session is never recalled. Snippets are labelled as data, not
+instructions, the same way the roster is. A failing store is not caught
+here: Hermes isolates and logs a failing hook and the turn proceeds without
+recall, so the failure is visible in the gateway log instead of hidden.
+Recall is a filter over the store's thirty best matches across all chats, so
+in a busy install a room-scoped turn can find nothing even when its own chat
+holds matches; that ceiling is deliberate until it is felt. Hermes stamps
+injected context onto the turn's wire copy and replays it for the life of
+the session, so a snippet recalled once stays in that session's context
+afterwards.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from
