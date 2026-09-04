@@ -3634,6 +3634,8 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
 
 _HOME_SOLE_MEMBER_NOT_OWNER = _chat("cht_a")
 next(p for p in _HOME_SOLE_MEMBER_NOT_OWNER["participants"] if p["type"] == "member")["role"] = "member"
+_HOME_WITH_PEER_AGENT = _chat("cht_a")
+_HOME_WITH_PEER_AGENT["participants"].append({"type": "agent", "relationship": "peer"})
 
 
 @pytest.mark.parametrize(
@@ -3644,9 +3646,11 @@ next(p for p in _HOME_SOLE_MEMBER_NOT_OWNER["participants"] if p["type"] == "mem
         ("cht_a", _chat("cht_a"), True),
         ("cht_a", _chat("cht_a", group=True), False),
         ("cht_a", _HOME_SOLE_MEMBER_NOT_OWNER, False),
+        ("cht_a", _HOME_WITH_PEER_AGENT, False),
     ],
     ids=["other-untrusted-room", "other-trusted-room", "home-owner-dm",
-         "home-configured-as-a-group", "home-sole-member-not-owner"],
+         "home-configured-as-a-group", "home-sole-member-not-owner",
+         "home-with-peer-agent"],
 )
 async def test_the_active_turn_carries_one_recall_decision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,

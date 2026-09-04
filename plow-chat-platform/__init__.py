@@ -164,11 +164,12 @@ def _is_solo_dm(chat):
 
 
 def _owner_dm(chat):
-    """The owner's own 1:1 with this agent: exactly one human, and it is the
-    owner. The shape that may hold owner-private material -- invite consent
-    is asked there, and recall reaches every chat from there."""
+    """The owner's own 1:1 with this agent: a solo DM (one human, no peer
+    agent listening) whose human is the owner. The shape that may hold
+    owner-private material -- invite consent is asked there, and recall
+    reaches every chat from there."""
     members = [p for p in chat.get("participants") or [] if p.get("type") == "member"]
-    return len(members) == 1 and members[0].get("role") == "owner"
+    return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
 
 
 def _collaboration_prompt(prompt, chat, identity):
