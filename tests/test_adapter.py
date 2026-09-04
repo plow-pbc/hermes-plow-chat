@@ -2158,6 +2158,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "chat_uid": "cht_b",
         "owner": False,
         "dm": False,
+        "home": False,
         "trusted": False,
         "no_reply_ok": False,
         "participant_uid": "cp_taylor",
@@ -2246,7 +2247,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "trusted": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "home": False, "trusted": False,
              "no_reply_ok": False, "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -3632,18 +3633,26 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
 
 
 @pytest.mark.parametrize("trusted", [True, False])
+@pytest.mark.parametrize(
+    ("chat_uid", "expected_home"),
+    [("cht_room", False), ("cht_a", True)],
+    ids=["other-chat", "home-chat"],
+)
 async def test_the_active_turn_carries_the_rooms_trust_flag(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool,
+    chat_uid: str, expected_home: bool,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats["cht_room"] = {"uid": "cht_room", "trusted": trusted, "participants": []}
+    adapter._chats[chat_uid] = {"uid": chat_uid, "trusted": trusted, "participants": []}
     event = SimpleNamespace(
-        source=SimpleNamespace(chat_id="cht_room", role_authorized=False, chat_type="group", user_id="cp_m"),
+        source=SimpleNamespace(chat_id=chat_uid, role_authorized=False, chat_type="group", user_id="cp_m"),
         message_id="msg_1", channel_prompt="",
     )
     await adapter.on_processing_start(event)
-    assert module._ACTIVE_TURN.get()["trusted"] is trusted
+    turn = module._ACTIVE_TURN.get()
+    assert turn["trusted"] is trusted
+    assert turn["home"] is expected_home
     await adapter.on_processing_complete(event, None)
 
 
@@ -3772,7 +3781,7 @@ def _stub_hermes_state(monkeypatch: pytest.MonkeyPatch, db: _FakeDb) -> None:
 
 
 _ROWS = [
-    {"id": 1, "session_id": "s_dm", "role": "assistant", "snippet": "three possible\naddresses",
+    {"id": 1, "session_id": "s_dm", "role": "assistant", "snippet": "three >>>possible<<<\naddresses",
      "timestamp": 1788477294.5, "source": "plow_chat"},
     {"id": 2, "session_id": "s_here", "role": "user", "snippet": "current session noise",
      "timestamp": 1788477300.0, "source": "plow_chat"},
@@ -3782,12 +3791,22 @@ _ROWS = [
 _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "s_room_old": {"chat_id": "cht_room"}}
 
 
-@pytest.mark.parametrize("turn, expected_snippets", [
-    ({"chat_uid": "cht_room", "owner": True, "dm": True, "trusted": False}, ["three possible addresses", "earlier in this room"]),
-    ({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False}, ["earlier in this room"]),
-    ({"chat_uid": "cht_room", "owner": False, "dm": False, "trusted": True}, ["three possible addresses", "earlier in this room"]),
-    ({"chat_uid": "cht_room", "owner": False, "dm": False, "trusted": False}, ["earlier in this room"]),
-])
+@pytest.mark.parametrize(
+    ("turn", "expected_snippets"),
+    [
+        ({"chat_uid": "cht_room", "owner": True, "dm": True, "home": True, "trusted": False},
+         ["three possible addresses", "earlier in this room"]),
+        ({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False},
+         ["earlier in this room"]),
+        ({"chat_uid": "cht_room", "owner": False, "dm": False, "home": False, "trusted": True},
+         ["three possible addresses", "earlier in this room"]),
+        ({"chat_uid": "cht_room", "owner": False, "dm": False, "home": False, "trusted": False},
+         ["earlier in this room"]),
+        ({"chat_uid": "cht_room", "owner": False, "dm": True, "home": False, "trusted": False},
+         ["earlier in this room"]),
+    ],
+    ids=["home", "owner-untrusted-group", "trusted-member", "untrusted-member", "non-owner-dm"],
+)
 def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], expected_snippets: list[str]
 ) -> None:
@@ -3803,10 +3822,12 @@ def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     assert text.startswith("Recalled from this agent's other Plow chats")
     assert [s for s in ("three possible addresses", "earlier in this room", "current session noise") if s in text] == expected_snippets
     assert db.calls == [{"query": "where OR addresses", "source_filter": [module.PLATFORM_NAME],
-                         "role_filter": ["user", "assistant"], "limit": 30}]
+                         "role_filter": ["user", "assistant"], "limit": 30,
+                         "fields": ("session_id", "role", "snippet", "timestamp")}]
     assert db.closed is True
-    if turn["dm"]:
+    if turn["home"] or turn["trusted"]:
         assert text.splitlines()[1] == "- [2026-09-03] assistant: three possible addresses"
+    assert text.splitlines()[-1] == "(end of recalled snippets)"
 
 
 def test_recall_caps_at_six_lines(
@@ -3820,7 +3841,7 @@ def test_recall_caps_at_six_lines(
     ]
     db = _FakeDb(rows, {})
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "home": True, "trusted": False})
     out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert out["context"].count("- [") == 6
 
@@ -3831,7 +3852,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -3844,7 +3865,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -3855,7 +3876,7 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True
