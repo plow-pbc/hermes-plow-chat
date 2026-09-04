@@ -1119,6 +1119,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
+            # Read from the prompt for the same reason, and enforced in `send`
+            # rather than asked for: the sentinel only suppresses the exact
+            # sentinel, so a model that verbalises its silence ("(no reply
+            # needed)") posted it. Prompt prose not holding is the failure this
+            # whole feature exists to answer -- the peer gate cannot rest on it.
+            "suppress_reply": _GOAL_PEER_SILENCE in (getattr(event, "channel_prompt", "") or ""),
             "source_message_id": str(
                 getattr(event, "invite_operation_message_id", event.message_id)
             ) if event.message_id else None,
@@ -1273,6 +1279,15 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.warning("[plow_chat] goal notice to %s failed: %s", chat_uid, exc)
             return False
         return bool(getattr(result, "success", False))
+
+    @staticmethod
+    def _goal_reply_suppressed(turn, chat_id):
+        """Whether this turn owes the thread silence.
+
+        Scoped to the turn's OWN chat: a suppressed turn may still act, and an
+        explicit send to another granted chat is not the reply being gated.
+        """
+        return bool(turn) and turn.get("suppress_reply") and chat_id == turn["chat_uid"]
 
     async def _goal_reply(self, chat_uid, text):
         """A direct answer to `/goal`.
@@ -1530,6 +1545,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
+        if self._goal_reply_suppressed(turn, chat_id):
+            log.info("[plow_chat] suppressed an unaddressed peer reply for %s", chat_id)
+            return SendResult(success=True)
         if (body == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn's whole answer was "nothing to say" — honor it. Gated
@@ -1750,6 +1768,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         refused = self._send_guard(chat_id)
         if refused is not None:
             return refused
+        if self._goal_reply_suppressed(self._active_turn.get(), chat_id):
+            log.info("[plow_chat] suppressed an unaddressed peer attachment for %s", chat_id)
+            return SendResult(success=True)
         filename = filename or os.path.basename(path)
         with open(path, "rb") as fh:
             data = fh.read()

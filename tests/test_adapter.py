@@ -2161,6 +2161,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "owner": False,
         "dm": False,
         "no_reply_ok": False,
+        "suppress_reply": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
         "source_message_id": "msg_delight_1",
@@ -2248,7 +2249,7 @@ def test_invite_workflow_reports_delivery_failure(
             None,
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
-             "source_message_id": "msg_delight_1"},
+             "suppress_reply": False, "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
         pytest.param(
@@ -4674,3 +4675,47 @@ def test_reply_target_prompt_names_the_send_tool(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     assert "plow_send_message" in module.REPLY_TARGET_PROMPT
+
+
+@pytest.mark.parametrize("send_kind", ["text", "attachment"], ids=["text", "attachment"])
+async def test_an_unaddressed_peer_turn_cannot_speak_even_if_the_model_tries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, send_kind: str,
+) -> None:
+    """The sentinel suppresses only the exact sentinel, so a model that
+    verbalises its silence — "(no reply needed)" — posted it anyway. Asking a
+    model not to speak is the failure this whole feature answers; the peer gate
+    cannot rest on it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    posted = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, "_post_message", posted)
+    adapter._active_turn.set({"chat_uid": "cht_a", "owner": False,
+                              "no_reply_ok": True, "suppress_reply": True})
+
+    if send_kind == "text":
+        result = await adapter.send("cht_a", "(no reply needed)")
+    else:
+        attachment = tmp_path / "note.txt"
+        attachment.write_text("unsolicited")
+        result = await adapter._send_attachment("cht_a", str(attachment), caption="here you go")
+
+    assert result.success is True, "the turn is not an error, it is silent"
+    posted.assert_not_awaited()
+
+
+async def test_a_suppressed_turn_may_still_speak_in_another_granted_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Scoped to the turn's own chat: silence toward the peer is not a gag on
+    an explicit send elsewhere, which is a different act entirely."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    adapter.chat_uids = frozenset({"cht_a", "cht_b"})
+    posted = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, "_post_message", posted)
+    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True,
+                              "no_reply_ok": True, "suppress_reply": True})
+
+    await adapter.send("cht_b", "the thing you asked me to relay")
+
+    posted.assert_awaited()
