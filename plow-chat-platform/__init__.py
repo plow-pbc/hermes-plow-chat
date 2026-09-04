@@ -362,6 +362,17 @@ def _goal_backoff_seconds(attempts):
     return min(GOAL_WAKE_BASE_SECONDS * (2 ** max(0, int(attempts or 0))), GOAL_WAKE_MAX_SECONDS)
 
 
+def _goal_wake_delay(attempts):
+    """Seconds to wait before the attempt after `attempts` already spent.
+
+    The first one runs at once: being put on a task means starting, not sitting
+    out a backoff nobody asked for. Only after an attempt has actually come back
+    with nothing does waiting longer buy anything.
+    """
+    attempts = int(attempts or 0)
+    return 0 if attempts == 0 else _goal_backoff_seconds(attempts - 1)
+
+
 def _goal_status_line(record, now=None):
     if not record:
         return "No goal set for this thread. Set one with: /goal <what you want done>"
@@ -1051,11 +1062,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         sentinel -- so a wake with nothing to say costs one turn and posts
         nothing, instead of narrating its own idleness into the thread.
         """
+        # Counted here as well as on the record: `attempts` only advances when a
+        # turn reaches its judge pass, so a turn that dies before that would
+        # leave the delay pinned at zero and spin this loop hot.
+        fired = 0
         while True:
             goal = _goal_load(chat_uid)
             if not _goal_active(goal):
                 return
-            await asyncio.sleep(_goal_backoff_seconds(goal.get("attempts")))
+            await asyncio.sleep(_goal_wake_delay(max(int(goal.get("attempts") or 0), fired)))
             async with self._goal_lock(chat_uid):
                 goal = _goal_load(chat_uid)
                 if not goal or goal.get("status") != GOAL_ACTIVE:
@@ -1067,6 +1082,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             if reason:
                 await self._goal_announce(chat_uid, reason, "no attempts left")
                 return
+            fired += 1
             try:
                 await self._goal_fire(chat_uid, goal)
             except asyncio.CancelledError:

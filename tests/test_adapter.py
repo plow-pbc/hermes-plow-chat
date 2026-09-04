@@ -8,6 +8,7 @@ the adapter without adding Hermes itself as a dependency.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import logging
@@ -3504,14 +3505,18 @@ async def test_only_the_owner_may_set_a_goal(
     await _settle(adapter)
 
     # The command is ours: it never reaches hermes' slash router.
-    assert handled == []
+    assert not any("/goal book the campsite" in (event["text"] or "") for event in handled)
     record = module._goal_load("cht_a")
     if role == "owner":
         assert record["text"] == "book the campsite"
         assert record["status"] == module.GOAL_ACTIVE
         assert "book the campsite" in sent.await_args[0][1]
+        # Being put on a task means starting: the first attempt is already out.
+        assert any("Continue working toward the goal" in (event["text"] or "")
+                   for event in handled)
     else:
         assert record is None
+        assert handled == []
         assert "owner" in sent.await_args[0][1].lower()
 
 
@@ -3734,3 +3739,48 @@ async def test_concurrent_turns_do_not_lose_an_attempt(
     ))
 
     assert module._goal_load("cht_a")["attempts"] == 4
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected_kind"),
+    [(0, "immediate"), (1, "base"), (2, "doubled"), (99, "capped")],
+    ids=["first_starts_now", "second_backs_off", "third_doubles", "far_out_caps"],
+)
+def test_the_first_attempt_starts_at_once_then_backs_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, attempts: int, expected_kind: str,
+) -> None:
+    """Setting a goal should start the work, not schedule it a quarter-hour out."""
+    module = _load(monkeypatch, tmp_path)
+    delay = module._goal_wake_delay(attempts)
+    expected = {
+        "immediate": 0,
+        "base": module.GOAL_WAKE_BASE_SECONDS,
+        "doubled": module.GOAL_WAKE_BASE_SECONDS * 2,
+        "capped": module.GOAL_WAKE_MAX_SECONDS,
+    }[expected_kind]
+    assert delay == expected
+
+
+async def test_the_wake_loop_does_not_spin_when_a_turn_never_reaches_its_judge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """`attempts` only advances in the judge pass, so a turn that dies before it
+    would pin the delay at zero and burn the loop hot until the TTL."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite", "mem_sam_cht_a"))
+
+    fires: list[str] = []
+
+    async def fire(chat_uid: str, _goal: Any) -> None:
+        fires.append(chat_uid)           # deliberately never advances `attempts`
+
+    monkeypatch.setattr(adapter, "_goal_fire", fire)
+
+    task = asyncio.create_task(adapter._goal_wake("cht_a"))
+    await asyncio.sleep(0.05)            # ample for a spinning loop to run away
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert fires == ["cht_a"], "the first attempt fires at once; the second must back off"
