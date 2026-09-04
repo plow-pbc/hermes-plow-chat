@@ -330,7 +330,7 @@ def _message_type(media_types):
 _ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
-    "send tool and will be refused on an external turn."
+    "plow_send_message tool and will be refused on an external turn."
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT}"
 # Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
@@ -868,7 +868,15 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
-            return await self._post_message(http, chat_id, {"body": body})
+            result = await self._post_message(http, chat_id, {"body": body})
+        if result.success and turn is not None and chat_id != turn["chat_uid"]:
+            # A turn speaking in another chat: record it where it landed, on
+            # the delivery's own coroutine, so a caller that stopped waiting
+            # cannot strand a delivered message unmirrored. A turn's reply to
+            # its own chat is already that chat's assistant turn, and a
+            # turn-less (cron) delivery is mirrored by Hermes itself.
+            await asyncio.to_thread(_mirror_sent, chat_id, body)
+        return result
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.
@@ -1126,6 +1134,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             chat_id = resource["uid"]
             data = {"chat_id": chat_id, "created": resource["created"],
                     "trusted": resource["trusted"]}
+            if not data["created"]:
+                # A resumed thread has spoken before, so a session may own it:
+                # record the opener there like any cross-chat send. A thread
+                # created just now has no session yet -- nothing to record to.
+                await asyncio.to_thread(_mirror_sent, chat_id, body)
             try:
                 await self._refresh_reach(http)
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly
@@ -1591,6 +1604,49 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._checkpoint(burst[-1].uid, chat_uid)
 
 
+def _lost_answer(exc):
+    """The tool result for a send that got no answer. A timeout or dropped
+    connection says nothing about whether Plow committed the POST, so an
+    ordinary failure would invite a retry that sends the message twice to
+    real phones. Name the ambiguity and forbid the retry."""
+    return json.dumps({
+        "success": False,
+        "delivery_unknown": True,
+        "error": f"{exc} — the request failed without a response, so the message "
+                 f"may or may not have been sent. Do NOT retry; check the thread.",
+    })
+
+
+def _mirror_sent(chat_uid, body):
+    """Record a message this agent just posted to `chat_uid` in that chat's
+    own Hermes session, as the assistant turn it is.
+
+    Hermes keeps one session per chat, and the adapter drops the echo of our
+    own sends, so a message posted from ANOTHER chat's turn is invisible to
+    the target chat's next turn unless it is mirrored here -- the exact
+    amnesia that answered "I didn't give numbered options" to a reply to a
+    list this agent had posted. Same mechanism as upstream's cron and
+    `hermes send` deliveries (tools/send_message_tool.py); assistant role
+    because the text is genuinely the agent speaking.
+
+    Best-effort: the send already succeeded, so a mirror failure here must
+    never propagate and turn a delivered message into a reported failure --
+    that would risk a resend and a duplicate. Every caller (this tool and,
+    from Task 3, `_plow_start_group_message`) inherits the guard from here."""
+    try:
+        from gateway.mirror import mirror_to_session  # in-process with Hermes
+        mirrored = mirror_to_session(PLATFORM_NAME, chat_uid, body,
+                                     source_label=PLATFORM_NAME, role="assistant")
+    except Exception as exc:  # noqa: BLE001 - best effort, see docstring
+        log.warning("[plow_chat] message to %s was sent but not mirrored: %s",
+                    chat_uid, exc, exc_info=True)
+        return False
+    if not mirrored:
+        log.warning("[plow_chat] message to %s was sent but not mirrored: "
+                    "no live session owns that chat yet", chat_uid)
+    return mirrored
+
+
 class _PlowSendError(Exception):
     """An HTTP error from the thread-creation POST, carrying the status."""
 
@@ -1734,17 +1790,8 @@ def _plow_start_group_message(args, **_kwargs):
         return json.dumps({"success": False,
                            "error": f"could not resolve this agent's line ({exc}); "
                                     "nothing was sent"})
-    except Exception as exc:
-        # No answer. A timeout or dropped connection says nothing about whether
-        # Plow committed the POST, so reporting an ordinary failure invites a
-        # retry that sends the approved message twice to real phones. Name the
-        # ambiguity instead and refuse to imply it is safe to try again.
-        return json.dumps({
-            "success": False,
-            "delivery_unknown": True,
-            "error": f"{exc} — the request failed without a response, so the message "
-                     f"may or may not have been sent. Do NOT retry; check the thread.",
-        })
+    except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
+        return _lost_answer(exc)
     # Reported rather than assumed: a thread nobody is listening to is the bug this
     # tool shipped with, so delivery must not read as reachability.
     return json.dumps({
@@ -1857,6 +1904,51 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     # byte-identical re-send, never the next email.
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
     return {"action": "approve", "message": summary, "rule_key": f"google-send:{digest}"}
+
+
+def _plow_send_message(args, **_kwargs):
+    """Post to another granted chat and record it in that chat's session.
+
+    The adapter's send() is the authority on reach: outside the grant, or a
+    cross-chat send during a member's turn, comes back refused and is
+    relayed as-is. Nothing here is a second gate."""
+    chat_id = (args.get("chat_id") or "").strip()
+    body = (args.get("body") or "").strip()
+    if not chat_id or not body:
+        return json.dumps({"success": False, "error": "chat_id and body are required"})
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    try:
+        result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+    except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
+        return _lost_answer(exc)
+    if not result.success:
+        return json.dumps({"success": False, "error": result.error})
+    return json.dumps({"success": True, "chat_id": chat_id, "message_id": result.message_id})
+
+
+PLOW_SEND_MESSAGE_SCHEMA = {
+    "name": "plow_send_message",
+    "description": (
+        "Post a message into another Plow chat this agent is already in, by its "
+        "cht_ id (the roster and channel list carry the ids). A chat that has "
+        "ever spoken to you remembers the message in its own history; a chat "
+        "that has never sent anything has no history yet and will not. Refused "
+        "outside the grant and, on a member's turn, for any chat but the "
+        "current one. Your reply to the CURRENT chat needs no tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string", "description": "Target chat uid, cht_…"},
+            "body": {"type": "string", "description": "Message text to post."},
+        },
+        "required": ["chat_id", "body"],
+        "additionalProperties": False,
+    },
+}
 
 
 PLOW_START_GROUP_MESSAGE_SCHEMA = {
@@ -2182,6 +2274,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
         handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_send_message",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_SEND_MESSAGE_SCHEMA,
+        handler=_plow_send_message,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )

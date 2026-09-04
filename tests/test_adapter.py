@@ -2009,6 +2009,7 @@ def test_tools_register_with_optional_deferred_questions(
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
+        "plow_send_message",
         "plow_chat_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
@@ -2018,16 +2019,24 @@ def test_tools_register_with_optional_deferred_questions(
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    name_contact_tool = ctx.tools[1]
+    send_message_tool = ctx.tools[1]
+    assert send_message_tool["schema"]["name"] == "plow_send_message"
+    assert send_message_tool["toolset"] == module.PLATFORM_NAME
+    assert send_message_tool["handler"] is module._plow_send_message
+    assert send_message_tool["schema"]["parameters"]["required"] == ["chat_id", "body"]
+    assert send_message_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert send_message_tool["check_fn"]()
+
+    name_contact_tool = ctx.tools[2]
     assert name_contact_tool["schema"]["name"] == "plow_chat_name_contact"
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert name_contact_tool["check_fn"]()
 
-    trust_tool = ctx.tools[2]
+    trust_tool = ctx.tools[3]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[3]
+    invite_tool = ctx.tools[4]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -3208,6 +3217,25 @@ def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
     assert "delivery_unknown" not in out
 
 
+@pytest.mark.parametrize("created, mirrored", [(False, ["cht_old"]), (True, [])],
+                         ids=["resumed", "created"])
+async def test_start_group_thread_records_the_opener_only_where_a_session_can_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, created: bool, mirrored: list[str]
+) -> None:
+    """POST /v1/chats resumes a thread that already exists, and that thread
+    has spoken before, so its session must get the opener like any other
+    cross-chat send. A thread created by this call has no session yet."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"uid": "cht_old", "created": created, "trusted": False},
+                        granted=[_chat("cht_a"), _chat("cht_old")])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    calls = _stub_mirror(monkeypatch)
+    data = await adapter.start_group_thread(["+15550001111"], "hello again")
+    assert data["created"] is created and data["adoption"] == "adopted"
+    assert [(c["chat_id"], c["text"]) for c in calls] == [(uid, "hello again") for uid in mirrored]
+
+
 async def test_start_group_thread_raises_plow_send_error_on_4xx(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
@@ -3663,3 +3691,145 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
     assert "only your owner directs work on the Mac" in text
     assert "not your owner" in text
+
+
+def _stub_mirror(
+    monkeypatch: pytest.MonkeyPatch, *, result: bool = True, raises: Exception | None = None
+) -> list[dict[str, Any]]:
+    """Install a fake gateway.mirror and return the list of calls it saw."""
+    calls: list[dict[str, Any]] = []
+    mirror = types.ModuleType("gateway.mirror")
+
+    def mirror_to_session(platform: str, chat_id: str, message_text: str, **kw: Any) -> bool:
+        calls.append({"platform": platform, "chat_id": chat_id, "text": message_text, **kw})
+        if raises is not None:
+            raise raises
+        return result
+
+    mirror.mirror_to_session = mirror_to_session  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway.mirror", mirror)
+    return calls
+
+
+def test_mirror_sent_appends_an_assistant_turn_to_the_target_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls = _stub_mirror(monkeypatch)
+    assert module._mirror_sent("cht_target", "the three addresses") is True
+    assert calls == [{
+        "platform": module.PLATFORM_NAME, "chat_id": "cht_target",
+        "text": "the three addresses", "source_label": module.PLATFORM_NAME,
+        "role": "assistant",
+    }]
+
+
+@pytest.mark.parametrize(
+    "mirror_kw",
+    [{"result": False}, {"raises": RuntimeError("db locked")}],
+    ids=["missing-session", "exception"],
+)
+def test_mirror_sent_reports_a_failure_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+    mirror_kw: dict[str, Any],
+) -> None:
+    """The send it records already succeeded; a missing session or a broken
+    mirror must report False, never raise -- raising would surface a
+    delivered message as a failed tool call and risk a resend."""
+    module = _load(monkeypatch, tmp_path)
+    _stub_mirror(monkeypatch, **mirror_kw)
+    with caplog.at_level(logging.WARNING):
+        assert module._mirror_sent("cht_target", "hello") is False
+    assert "cht_target" in caplog.text and "not mirrored" in caplog.text
+
+
+def test_plow_send_message_sends_through_the_live_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
+    _live_tool(module, monkeypatch, "send",
+               result=_SendResult(success=True, message_id="msg_1"), record=sent)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": " 1. A\n2. B "}))
+    assert out == {"success": True, "chat_id": "cht_other", "message_id": "msg_1"}
+    assert sent == [("cht_other", "1. A\n2. B")]
+
+
+@pytest.mark.parametrize("turn, target, mirrored", [
+    ({"chat_uid": "cht_a", "owner": True}, "cht_b", ["cht_b"]),
+    ({"chat_uid": "cht_a", "owner": True}, "cht_a", []),
+    (None, "cht_b", []),
+], ids=["cross-chat", "own-chat", "no-turn"])
+async def test_send_mirrors_exactly_a_turns_message_to_another_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None, target: str, mirrored: list[str],
+) -> None:
+    """Recording rides the delivery: a turn's message to another chat is
+    mirrored there once the POST succeeds, on the same coroutine, so a tool
+    that stopped waiting cannot strand it. A reply to the turn's own chat is
+    already that chat's assistant turn, and a turn-less (cron) delivery is
+    mirrored by Hermes itself -- neither is recorded twice."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
+    calls = _stub_mirror(monkeypatch)
+    adapter._active_turn.set(turn)
+    result = await adapter.send(target, "the three addresses")
+    assert result.success and result.message_id == "msg_sent"
+    assert [(c["chat_id"], c["text"]) for c in calls] == [(uid, "the three addresses") for uid in mirrored]
+
+
+def test_plow_send_message_reports_the_adapter_refusal_and_mirrors_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The adapter's _send_guard is the authority (grant + member-turn
+    confinement); the tool relays its refusal verbatim."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send",
+               result=_SendResult(success=False, error="Plow Chat member turn is confined to 'cht_here'"))
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": "hi"}))
+    assert out["success"] is False and "confined" in out["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("args", [{"chat_id": "", "body": "hi"}, {"chat_id": "cht_x", "body": "  "}])
+def test_plow_send_message_requires_chat_id_and_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, args: dict[str, Any]
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send", raises=AssertionError("must not send"))
+    out = json.loads(module._plow_send_message(args))
+    assert out["success"] is False and "required" in out["error"]
+
+
+def test_plow_send_message_needs_the_live_gateway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._live = None
+    out = json.loads(module._plow_send_message({"chat_id": "cht_x", "body": "hi"}))
+    assert out["success"] is False and "not connected" in out["error"]
+
+
+def test_plow_send_message_reports_a_lost_answer_as_delivery_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """No response says nothing about whether Plow committed the POST; a
+    plain failure would invite a resend, so the tool forbids the retry and
+    mirrors nothing it cannot vouch for."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send", raises=TimeoutError("no answer"))
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_x", "body": "hi"}))
+    assert out["success"] is False and out["delivery_unknown"] is True
+    assert "Do NOT retry" in out["error"]
+    assert calls == []
+
+
+def test_reply_target_prompt_names_the_send_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert "plow_send_message" in module.REPLY_TARGET_PROMPT
