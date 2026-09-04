@@ -2164,6 +2164,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "recall_everywhere": False,
         "no_reply_ok": False,
         "suppress_reply": False,
+        "recall_text": None,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
         "source_message_id": "msg_delight_1",
@@ -2251,7 +2252,7 @@ def test_invite_workflow_reports_delivery_failure(
             None,
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "recall_everywhere": False,
-             "no_reply_ok": False, "suppress_reply": False,
+             "no_reply_ok": False, "suppress_reply": False, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -4902,3 +4903,31 @@ async def test_suppression_is_scoped_to_the_turns_own_chat(
 
     assert result.success is True, "silence is not an error the gateway should retry"
     assert posted.await_count == (1 if delivered else 0)
+
+
+@pytest.mark.parametrize("kind", ["inbound", "wake"], ids=["inbound", "wake"])
+async def test_recall_searches_what_was_said_not_the_rendered_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, kind: str,
+) -> None:
+    """`_recall_query` strips the roster paragraph by marker, but a goal line is
+    a second wrapper in front of it — left in, it spends most of the eight-term
+    budget describing the goal instead of searching for what was said."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite for June"))
+    handled = _capture_events(monkeypatch, adapter)
+
+    if kind == "wake":
+        monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
+        await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
+        expected = "book the campsite for June"
+    else:
+        await adapter._on_frame(
+            _envelope("evt_r", "cht_a", "msg_r", body="did the kayak rental confirm"), object())
+        await _settle(adapter)
+        expected = "did the kayak rental confirm"
+
+    assert handled[0].recall_text == expected
+    query = module._recall_query(handled[0].recall_text)
+    assert "untrusted" not in query, "the fence is not a search term"
+    assert query.split(" OR ")[0] in expected.lower()

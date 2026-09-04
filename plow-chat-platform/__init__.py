@@ -1136,6 +1136,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             # needed)") posted it. Prompt prose not holding is the failure this
             # whole feature exists to answer -- the peer gate cannot rest on it.
             "suppress_reply": _GOAL_PEER_SILENCE in (getattr(event, "channel_prompt", "") or ""),
+            # What recall should search for, when it is not the delivered text.
+            "recall_text": getattr(event, "recall_text", None),
             "source_message_id": str(
                 getattr(event, "invite_operation_message_id", event.message_id)
             ) if event.message_id else None,
@@ -1444,7 +1446,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         await self._refresh_current_chat(chat_uid)
         chat = await self.get_chat_info(chat_uid)
         owner_dm = _owner_dm(self._chats[chat_uid])
-        await self.handle_message(MessageEvent(
+        event = MessageEvent(
             text=(f"{_goal_turn_line(goal)}\n\n"
                   "No new messages since your last turn. Continue working toward the goal. "
                   f"If there is nothing new to do or report, reply with exactly {NO_REPLY_SENTINEL}."),
@@ -1455,7 +1457,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
                                            self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
-        ))
+        )
+        # A wake has no spoken words; the goal itself is what it is about.
+        event.recall_text = goal["text"]
+        await self.handle_message(event)
 
     async def _goal_after_turn(self, chat_uid, event, said):
         async with self._goal_lock(chat_uid):
@@ -2344,6 +2349,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             channel_prompt=channel_prompt,
         )
         event.invite_operation_message_id = burst[0].uid
+        # Recall queries the speaker's own words, not the rendered prompt. The
+        # roster paragraph is stripped by marker, but a goal line is a second
+        # wrapper in front of it and would spend most of the term budget
+        # describing the goal instead of searching for what was said.
+        event.recall_text = spoken
         await self.handle_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
@@ -2402,7 +2412,7 @@ def _recall(session_id, user_message, platform, **_kwargs):
     turn = _ACTIVE_TURN.get()
     if platform != PLATFORM_NAME or turn is None:
         return None
-    query = _recall_query(user_message)
+    query = _recall_query(turn.get("recall_text") or user_message)
     if not query:
         return None
     everywhere = turn["recall_everywhere"]
