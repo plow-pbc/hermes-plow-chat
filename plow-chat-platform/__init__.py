@@ -36,6 +36,8 @@ from gateway.platforms.base import (
 from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
+LATCH_URL = "https://plow.co/latch"
+DASHBOARD_URL = "https://app.plow.co/dashboard"
 BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 # TODO(remove): once the fleet image pin includes srosro/hermes-agent's
 # turn-stop-status PR, turn-stop text arrives as status frames and this
@@ -155,7 +157,7 @@ def _is_solo_dm(chat):
     return sum(1 for p in participants if p.get("type") == "member") <= 1
 
 
-def _collaboration_prompt(prompt, chat):
+def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
     Gated on a PEER, which is narrower than the roster prefix's gate: this
@@ -174,17 +176,17 @@ def _collaboration_prompt(prompt, chat):
         if peer.get("type") == "agent" and peer.get("relationship") == "peer"
     ]
     if not peers:
-        return _with_identity(prompt, _agent_name(chat))
+        return _with_identity(prompt, _agent_name(chat), identity)
 
     peer_fact = ", ".join(peers)
-    self_name = _agent_name(chat) or "this Plow agent"
-    return (
-        f"Collaboration context: You are {self_name}. Other Plow agents here: {peer_fact}. "
+    collaboration = (
+        f"Collaboration context: Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
         "Work with them in this visible thread. Respond when addressed or when you have a useful contribution; "
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
-        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}. {prompt}"
+        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
     )
+    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat), identity)
 
 
 def _collaboration_turn_context(chat, sender):
@@ -469,12 +471,12 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
-def _channel_prompt(chat, role, roster):
+def _channel_prompt(chat, role, roster, identity):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
-    disclosure posture as a spoken turn, and a second copy of this selection is
-    how a wake ends up with none.
+    disclosure posture as a spoken turn -- and the same identity facts -- and a
+    second copy of this selection is how a wake ends up with neither.
     """
     return _collaboration_prompt(
         (TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT if role != "owner"
@@ -484,6 +486,7 @@ def _channel_prompt(chat, role, roster):
         else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
         else OWNER_CHANNEL_PROMPT,
         roster,
+        identity,
     )
 
 
@@ -691,17 +694,49 @@ TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
 )
 
 
-def _with_identity(prompt, name):
-    """Prefix the turn prompt with who this agent is, when its line is named.
+def _plow_facts(identity):
+    """What every Plow agent should know about Plow, as prompt prose.
 
-    "hey Elm" in a group only reads as addressed if the model knows it IS Elm.
-    The name is ops-seeded on the line (not provider- or member-supplied text),
-    so carrying it in the prompt is not the injection seam a sender name would
-    be. Unnamed lines keep the exact prompts they have today.
+    The signup phrase and this agent's number come from /v1/agents/cloud/me
+    at reach refresh; the URLs are Plow's own. None of it is sender-supplied
+    text, so carrying it in the prompt is not the injection seam a sender name
+    would be. A deployment whose API serves no signup block simply omits the
+    offer sentence.
+
+    The variant name belongs HERE, not in the who-sentence: the resolver falls
+    back to the Life row for any provider with no phrase of its own, so it
+    names what someone else can get, never what this agent is.
     """
-    if name is None:
-        return prompt
-    return f"You are {name}, a Plow assistant; people here address you by that name. {prompt}"
+    signup = identity.get("signup") or {}
+    facts = []
+    if signup.get("name") and signup.get("phrase") and identity.get("number"):
+        facts.append(f'Anyone can get their own Plow {signup["name"]} by texting '
+                     f'"{signup["phrase"]}" to {identity["number"]}.')
+    facts.append("If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that.")
+    # Both Latch clauses come from transcript evidence; see the PR for counts.
+    # The install link is a parenthetical because an unreachable Latch is
+    # usually a sleeping Mac, not a missing app.
+    facts.append(f"Plow Latch is how you reach your owner's Mac -- their mail, calendar, files and browser. "
+                 "Reach for it yourself instead of asking which route to take. If it is unreachable, say once "
+                 f"that their Mac has to be awake with Latch running ({LATCH_URL} to install it).")
+    facts.append(f"Your owner manages you at {DASHBOARD_URL}: credits and usage, Plow lines, trusted group chats, "
+                 "delight invites, the daily payment limit, verbose output, and the Latch connection. "
+                 "When something fails for a reason the dashboard fixes, name the card and let them do it; "
+                 "never ask them to send you a credential.")
+    return " ".join(facts)
+
+
+def _with_identity(prompt, name, identity):
+    """Prefix the turn prompt with what this agent is, then the Plow facts.
+
+    "hey Elm" in a group only reads as addressed if the model knows it IS
+    Elm; the name is ops-seeded on the line. An unnamed line still learns what
+    kind of agent it is. Every turn prompt opens here, the peer paragraph
+    included -- it hands itself in as `prompt`, so there is one identity seam.
+    """
+    who = (f"You are {name}, a Plow assistant; people here address you by that name."
+           if name else "You are a Plow assistant.")
+    return f"{who} {_plow_facts(identity)} {prompt}"
 
 
 def _participant_identity(participant):
@@ -776,6 +811,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
         self.home_chat_uid = self._configured_home_chat_uid
         self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
+        self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
         self._chats = {
@@ -910,6 +946,24 @@ class PlowChatAdapter(BasePlatformAdapter):
             if body["has_more"]:
                 raise RuntimeError("the granted chat listing is truncated")
             self._set_reach(body["data"])
+            # Who this agent is, for the prompt prefix. Only a 200 sets it:
+            # refresh has no timer (connect, group creation, an unknown-chat
+            # frame), so overwriting on a failure would let one blip strip the
+            # offer for the life of a healthy socket.
+            async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
+                if resp.status == 200:
+                    me = await resp.json(content_type=None)
+                    self._identity = {"signup": me.get("signup"),
+                                      "number": (me.get("line") or {}).get("provider_key")}
+                elif resp.status != 404:
+                    # 404 is the documented "this token is not one agent" -- a
+                    # wildcard or multi-line grant -- and keeps what we hold.
+                    # Anything else is not an answer about identity: through the
+                    # credential seam (a 401 is terminal), then fail the refresh
+                    # like the grant read above so _listen retries, rather than
+                    # silently running without the offer.
+                    _auth_raise_for_status(resp)
+                    raise RuntimeError(f"the identity read returned HTTP {resp.status}")
         except _PlowAuthError:
             raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
@@ -1315,7 +1369,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if is_dm else "member",
-                                           self._chats[chat_uid]) + _SILENCE_OPTION,
+                                           self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
         ))
 
     async def _goal_after_turn(self, chat_uid, event, said):
@@ -2135,7 +2189,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{turn_context}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
