@@ -802,6 +802,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
+        self._goal_paced = False              # pacing runs only inside a live socket session
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -992,9 +993,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._inbound.clear()
         for chat_uid in tuple(self._typing):
             self._cancel_typing(chat_uid)
-        for task in self._goal_wakes.values():
-            task.cancel()
-        self._goal_wakes.clear()
+        self._goal_pause_wakes()
         self._mark_disconnected()
 
     async def on_processing_start(self, event):
@@ -1113,19 +1112,27 @@ class PlowChatAdapter(BasePlatformAdapter):
         return self._goal_locks.setdefault(chat_uid, asyncio.Lock())
 
     def _goal_arm_wakes(self):
-        """Arm pacing for every chat holding an OPEN goal.
+        """Open the pacing gate, and arm every chat holding an OPEN goal.
 
         Open rather than runnable: a goal whose clock ran out while the
         container was down is exactly the one that still owes the thread a
         notice, and the wake loop makes that distinction itself.
         """
+        self._goal_paced = True
         for chat_uid in tuple(self.chat_uids):
             record = _goal_load(chat_uid)
             if record and record.get("status") == GOAL_ACTIVE:
                 self._goal_start_wake(chat_uid)
 
     def _goal_pause_wakes(self):
-        """Stop pacing for the duration of a socket outage."""
+        """Close the gate, then stop pacing, for the duration of an outage.
+
+        Closed BEFORE the cancellations: a turn already in flight finishes after
+        teardown and asks to re-arm, so cancelling a snapshot of what existed at
+        that instant let autonomous work resume during the outage -- ahead of
+        the `/goal clear` the reconnect would have delivered.
+        """
+        self._goal_paced = False
         for chat_uid in tuple(self._goal_wakes):
             self._goal_stop_wake(chat_uid)
 
@@ -1205,7 +1212,9 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     def _goal_start_wake(self, chat_uid):
         """One pacing task per chat. A second would double the wake rate every
-        time a turn completed."""
+        time a turn completed, and none at all runs while the gate is closed."""
+        if not self._goal_paced:
+            return
         task = self._goal_wakes.get(chat_uid)
         if task is not None and not task.done():
             return
@@ -1734,8 +1743,11 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         chat = self._chats[chat_id]
-        member_count = sum(participant.get("type") == "member" for participant in chat["participants"])
-        chat_type = "group" if member_count > 1 else "dm"
+        # `_is_solo_dm` is the one answer to "is anyone else in this room?", and
+        # it counts a peer agent as somebody. Counting humans alone called a
+        # room holding one human and another household's agent a DM, which
+        # handed its scheduled wake owner authority over peer-written content.
+        chat_type = "dm" if _is_solo_dm(chat) else "group"
         name = _resolve_chat_names((chat,), self.home_chat_uid)[chat_id]
         return {"name": name, "type": chat_type, "chat_id": chat_id,
                 "trusted": bool(chat.get("trusted", False))}

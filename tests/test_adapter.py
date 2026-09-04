@@ -3430,6 +3430,9 @@ def _goal_chat_with_owner_speaking(module: Any) -> Any:
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_collaboration_chat()])
     _mark_anchored(adapter, "cht_a")
+    # These tests stand in for a live socket session, which is the only state in
+    # which pacing may run at all.
+    adapter._goal_paced = True
     return adapter
 
 
@@ -4157,3 +4160,57 @@ async def test_pacing_does_not_outlive_the_socket_session(
 
     assert adapter._goal_wakes == {}, "the session's pacing is gone with it"
     assert paced.cancelled() or paced.done()
+
+
+async def test_work_finishing_after_teardown_cannot_re_arm_pacing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Cancelling a snapshot of what existed at teardown is not the same as
+    stopping: a turn already in flight finishes afterwards and asks to re-arm,
+    resuming autonomous work during the outage — ahead of the `/goal clear` the
+    reconnect would have delivered."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite"))
+    monkeypatch.setattr(adapter, "_goal_wake", mock.AsyncMock())
+
+    adapter._goal_pause_wakes()                # the socket dropped
+    adapter._goal_start_wake("cht_a")          # an in-flight turn lands late
+
+    assert adapter._goal_wakes == {}, "no pacing runs outside a live session"
+
+    adapter._goal_arm_wakes()                  # reconnect, after backfill
+    assert "cht_a" in adapter._goal_wakes
+    adapter._goal_pause_wakes()
+
+
+async def test_a_room_holding_a_peer_agent_is_never_a_dm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """One human plus another household's agent is not a private thread.
+    Counting humans alone called it a DM, which handed its scheduled wake owner
+    authority over content that peer had written."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    solo_with_peer = {
+        "uid": "cht_a",
+        "participants": [
+            {"type": "agent", "relationship": "self", "represents_participant_uid": "mem_sam_cht_a",
+             "line": {"uid": "ln_elm", "display_name": "Elm"}},
+            {"type": "agent", "relationship": "peer", "represents_participant_uid": "mem_dan",
+             "line": {"uid": "ln_ash", "display_name": "Ash"}},
+            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner"},
+        ],
+    }
+    adapter._set_reach([solo_with_peer])
+    _mark_anchored(adapter, "cht_a")
+    adapter._goal_paced = True
+    module._goal_save("cht_a", module._goal_new("book the campsite"))
+    handled = _capture_events(monkeypatch, adapter)
+    monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
+
+    assert (await adapter.get_chat_info("cht_a"))["type"] == "group"
+
+    await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
+
+    assert handled[0]["source"]["role_authorized"] is False
