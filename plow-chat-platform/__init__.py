@@ -1786,7 +1786,7 @@ def _plow_start_group_message(args, **_kwargs):
         # Usually False: the thread's session is born on its first inbound
         # message, after this send. Reported, not hidden, so a later reader
         # of the tool result knows the opener is not in that chat's history.
-        "mirrored": bool(data.get("chat_id")) and _mirror_sent(data["chat_id"], body),
+        "mirrored": _mirror_sent(data["chat_id"], body),
     })
 
 
@@ -1907,7 +1907,17 @@ def _plow_send_message(args, **_kwargs):
         return json.dumps({"success": False,
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
     adapter, loop = _live
-    result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+    try:
+        result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+    except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
+        # A timeout or dropped connection says nothing about whether Plow
+        # committed the POST; an ordinary failure would invite a resend.
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"{exc} — the request failed without a response, so the message "
+                     f"may or may not have been sent. Do NOT retry; check the thread.",
+        })
     if not result.success:
         return json.dumps({"success": False, "error": result.error})
     return json.dumps({"success": True, "chat_id": chat_id,

@@ -2021,6 +2021,9 @@ def test_tools_register_with_optional_deferred_questions(
 
     send_message_tool = ctx.tools[1]
     assert send_message_tool["schema"]["name"] == "plow_send_message"
+    assert send_message_tool["toolset"] == module.PLATFORM_NAME
+    assert send_message_tool["handler"] is module._plow_send_message
+    assert send_message_tool["schema"]["parameters"]["required"] == ["chat_id", "body"]
     assert send_message_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert send_message_tool["check_fn"]()
 
@@ -3702,24 +3705,20 @@ def test_mirror_sent_appends_an_assistant_turn_to_the_target_chat(
     }]
 
 
-def test_mirror_sent_reports_a_missing_target_session_loudly(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "mirror_kw",
+    [{"result": False}, {"raises": RuntimeError("db locked")}],
+    ids=["missing-session", "exception"],
+)
+def test_mirror_sent_reports_a_failure_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+    mirror_kw: dict[str, Any],
 ) -> None:
+    """The send it records already succeeded; a missing session or a broken
+    mirror must report False, never raise -- raising would surface a
+    delivered message as a failed tool call and risk a resend."""
     module = _load(monkeypatch, tmp_path)
-    _stub_mirror(monkeypatch, result=False)
-    with caplog.at_level(logging.WARNING):
-        assert module._mirror_sent("cht_target", "hello") is False
-    assert "cht_target" in caplog.text and "not mirrored" in caplog.text
-
-
-def test_mirror_sent_survives_a_mirror_exception_without_propagating_it(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The send it records already succeeded; a broken mirror must report
-    False, never raise -- raising would surface a delivered message as a
-    failed tool call and risk a resend."""
-    module = _load(monkeypatch, tmp_path)
-    _stub_mirror(monkeypatch, raises=RuntimeError("db locked"))
+    _stub_mirror(monkeypatch, **mirror_kw)
     with caplog.at_level(logging.WARNING):
         assert module._mirror_sent("cht_target", "hello") is False
     assert "cht_target" in caplog.text and "not mirrored" in caplog.text
@@ -3772,22 +3771,19 @@ def test_plow_send_message_needs_the_live_gateway(
     assert out["success"] is False and "not connected" in out["error"]
 
 
-def test_plow_send_message_is_registered_on_the_platform_toolset(
+def test_plow_send_message_reports_a_lost_answer_as_delivery_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
+    """No response says nothing about whether Plow committed the POST; a
+    plain failure would invite a resend, so the tool forbids the retry and
+    mirrors nothing it cannot vouch for."""
     module = _load(monkeypatch, tmp_path)
-    registered: list[dict[str, Any]] = []
-    ctx = SimpleNamespace(
-        register_hook=lambda *a, **k: None,
-        register_platform=lambda **k: None,
-        register_system_prompt_section=lambda *a, **k: None,
-        register_tool=lambda **k: registered.append(k),
-    )
-    module.register(ctx)
-    tool = next(t for t in registered if t["name"] == "plow_send_message")
-    assert tool["toolset"] == module.PLATFORM_NAME
-    assert tool["handler"] is module._plow_send_message
-    assert tool["schema"]["parameters"]["required"] == ["chat_id", "body"]
+    _live_tool(module, monkeypatch, "send", raises=TimeoutError("no answer"))
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_x", "body": "hi"}))
+    assert out["success"] is False and out["delivery_unknown"] is True
+    assert "Do NOT retry" in out["error"]
+    assert calls == []
 
 
 def test_start_group_message_mirrors_the_opener_into_the_new_chat(
