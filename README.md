@@ -36,6 +36,38 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
 > available fails loudly instead of silently skipping delivery.
 
+## Where changes go
+
+This repo is one of several that assemble a Plow agent. The map of which repo
+owns what is in
+[`plow-hermes-agent` README § The repos](https://github.com/plow-pbc/plow-hermes-agent#the-repos);
+read it before a change that touches a neighbour. The test is **who else would
+have to change if this fact changed** — if the answer is a sibling, the change
+belongs there; this repo only follows, by bumping its pin if it holds one.
+
+Not here:
+
+- The `plow-gog` argv grammar, and what a Latch tool says about itself —
+  [`plow-pbc/latch`](https://github.com/plow-pbc/latch) vendors the binary,
+  pins its version, and owns the only bump checklist.
+- Per-chat state the owner sets or clears — trust, contact labels, anything
+  keyed by a `cht_` id — [`plow-pbc/plow`](https://github.com/plow-pbc/plow).
+  A file written under `$HERMES_HOME` instead is invisible to the dashboard
+  and to support.
+- Boot, `plow-init`, the gateway config seed, and the base persona —
+  [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+  which pins this plugin rather than being configured by it.
+
+Examples:
+
+- Adheres: #61 deleted `_invite_message_template` — the `$100 in cloud credits`
+  line and the activation-code placeholders — so plow composes the whole invite,
+  net −32 LOC: https://github.com/plow-pbc/hermes-plow-chat/pull/61
+- Violates: #64 put ~110 lines of `plow-gog` verb tables, flag parsing and an
+  explicit re-implementation of latch's `isHelpInvocation` in this plugin — a
+  second copy latch's pin-bump checklist does not know about:
+  https://github.com/plow-pbc/hermes-plow-chat/pull/64
+
 ## Who consumes this
 
 [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
@@ -140,6 +172,28 @@ resumed before anyone replied has none, and logs the same warning). Posting
 to the Plow API directly from a
 script bypasses all of this and leaves the target chat amnesiac; the tool
 exists so the model never has to.
+
+### Recall from other chats
+
+Hermes keeps one session per chat, so a turn in one chat knows nothing of the
+others unless told. On every Plow Chat turn the plugin's `pre_llm_call` hook
+runs an OR-query built from the message's own words over the Hermes session
+store and appends up to six dated one-line snippets from other sessions to the
+turn (upstream's seam for per-turn recall: the user message, never the system
+prompt). The room is the boundary, not the asker: the home chat (the owner's
+own DM) and a trusted room recall from every chat, the owner's DMs included —
+that is what trust means here. Every other turn, an owner's turn in an
+untrusted group included, recalls only from its own chat's earlier sessions.
+The current session is never recalled. Snippets are labelled as data, not
+instructions, the same way the roster is. A failing store is not caught
+here: Hermes isolates and logs a failing hook and the turn proceeds without
+recall, so the failure is visible in the gateway log instead of hidden.
+Recall is a filter over the store's thirty best matches across all chats, so
+in a busy install a room-scoped turn can find nothing even when its own chat
+holds matches; that ceiling is deliberate until it is felt. Hermes stamps
+injected context onto the turn's wire copy and replays it for the life of
+the session, so a snippet recalled once stays in that session's context
+afterwards.
 
 ### What a group thread is called
 
