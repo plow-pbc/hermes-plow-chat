@@ -71,6 +71,7 @@ URL in git.
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
 | `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
+| `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
 Diagnostic chatter — agent status frames, 💾 background-review posts, ⚠️
 turn-stop warnings — is dropped unless the credential's
