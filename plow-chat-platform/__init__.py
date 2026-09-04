@@ -741,6 +741,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
+        self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -1024,6 +1025,17 @@ class PlowChatAdapter(BasePlatformAdapter):
             f"unreachable, or after {GOAL_TTL_HOURS}h. `/goal` for status, `/goal clear` to stop.")
         self._goal_start_wake(chat_uid)
 
+    def _goal_lock(self, chat_uid):
+        """One lock per chat around every load-modify-save of its goal.
+
+        A real inbound turn and a wake turn can be in flight at once. Both would
+        otherwise read the same `attempts`, increment independently, and the
+        later write would erase the earlier one -- quietly loosening the very
+        budget that bounds the loop. Never held across `_goal_fire`, which
+        triggers the turn that comes back for this same lock.
+        """
+        return self._goal_locks.setdefault(chat_uid, asyncio.Lock())
+
     def _goal_start_wake(self, chat_uid):
         """One pacing task per chat. A second would double the wake rate every
         time a turn completed."""
@@ -1044,13 +1056,15 @@ class PlowChatAdapter(BasePlatformAdapter):
             if not _goal_active(goal):
                 return
             await asyncio.sleep(_goal_backoff_seconds(goal.get("attempts")))
-            goal = _goal_load(chat_uid)
-            if not goal or goal.get("status") != GOAL_ACTIVE:
-                return
-            reason = _goal_exhaustion(goal)
+            async with self._goal_lock(chat_uid):
+                goal = _goal_load(chat_uid)
+                if not goal or goal.get("status") != GOAL_ACTIVE:
+                    return
+                reason = _goal_exhaustion(goal)
+                if reason:
+                    goal["status"] = reason
+                    _goal_save(chat_uid, goal)
             if reason:
-                goal["status"] = reason
-                _goal_save(chat_uid, goal)
                 await self._goal_announce(chat_uid, reason, "no attempts left")
                 return
             try:
@@ -1090,21 +1104,22 @@ class PlowChatAdapter(BasePlatformAdapter):
         await self.send(chat_uid, f"{headline} \u2014 {evidence}" if evidence else headline)
 
     async def _goal_after_turn(self, chat_uid, event, outcome):
-        goal = _goal_load(chat_uid)
-        if not _goal_active(goal):
-            return
-        goal["attempts"] = int(goal.get("attempts") or 0) + 1
-        _goal_append_history(goal, "thread", getattr(event, "text", "") or "")
-        _goal_append_history(goal, "agent", _goal_outcome_text(outcome))
-        verdict, evidence = await self._goal_judge(goal)
-        goal["last_verdict"] = {"verdict": verdict, "evidence": evidence}
-        # The judge owns only `met` and `unachievable`; the budget and the TTL
-        # are ours, so a judge that answers `not_met` forever still cannot buy
-        # unbounded turns.
-        settled = verdict if verdict in GOAL_JUDGE_TERMINAL else _goal_exhaustion(goal)
-        if settled:
-            goal["status"] = settled
-        _goal_save(chat_uid, goal)
+        async with self._goal_lock(chat_uid):
+            goal = _goal_load(chat_uid)
+            if not _goal_active(goal):
+                return
+            goal["attempts"] = int(goal.get("attempts") or 0) + 1
+            _goal_append_history(goal, "thread", getattr(event, "text", "") or "")
+            _goal_append_history(goal, "agent", _goal_outcome_text(outcome))
+            verdict, evidence = await self._goal_judge(goal)
+            goal["last_verdict"] = {"verdict": verdict, "evidence": evidence}
+            # The judge owns only `met` and `unachievable`; the budget and the
+            # TTL are ours, so a judge that answers `not_met` forever -- or one
+            # that is simply down -- still cannot buy unbounded turns.
+            settled = verdict if verdict in GOAL_JUDGE_TERMINAL else _goal_exhaustion(goal)
+            if settled:
+                goal["status"] = settled
+            _goal_save(chat_uid, goal)
         if settled:
             await self._goal_announce(chat_uid, settled, evidence)
         else:
@@ -1124,12 +1139,22 @@ class PlowChatAdapter(BasePlatformAdapter):
             "temperature": 0,
             "max_tokens": 300,
         }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
-            async with http.post(f"{BASE}/v1/chat/completions", json=body, headers=self.auth) as resp:
-                _auth_raise_for_status(resp)
-                payload = await resp.json(content_type=None)
-        choices = payload.get("choices") or [{}]
-        return _goal_parse_verdict((choices[0].get("message") or {}).get("content"))
+        # A judge that is down, slow, or returns a shape we did not expect must
+        # still cost an attempt. Letting it raise would skip the save below it,
+        # so the increment never lands and an outage silently buys unbounded
+        # turns -- leaving the TTL as the only real bound instead of two.
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as http:
+                async with http.post(f"{BASE}/v1/chat/completions", json=body, headers=self.auth) as resp:
+                    _auth_raise_for_status(resp)
+                    payload = await resp.json(content_type=None)
+            choices = payload.get("choices") or [{}]
+            content = (choices[0].get("message") or {}).get("content")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                # noqa: BLE001 - unreachable is a verdict, not an escape
+            return ("unknown", f"judge request failed: {type(exc).__name__}")
+        return _goal_parse_verdict(content)
 
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within

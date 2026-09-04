@@ -3686,3 +3686,51 @@ def test_a_torn_goal_file_reads_as_no_goal(monkeypatch: pytest.MonkeyPatch, tmp_
     module.GOALS_DIR.mkdir(parents=True, exist_ok=True)
     module._goal_path("cht_a").write_text("{not json")
     assert module._goal_load("cht_a") is None
+
+
+async def test_an_unreachable_judge_still_costs_an_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A judge outage must not buy free turns. If the failure escaped, the save
+    below it would be skipped, the increment would never land, and the TTL would
+    be the only real bound instead of two independent ones."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite", "mem_sam_cht_a"))
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda chat_uid: None)
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession",
+                        mock.Mock(side_effect=OSError("connection refused")))
+
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="tick"), None)
+
+    record = module._goal_load("cht_a")
+    assert record["attempts"] == 1
+    assert record["last_verdict"]["verdict"] == "unknown"
+    assert "judge request failed" in record["last_verdict"]["evidence"]
+
+
+async def test_concurrent_turns_do_not_lose_an_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A real turn and a wake turn can land together. Unserialized, both read
+    the same count, increment, and the later write erases the earlier one."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite", "mem_sam_cht_a"))
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda chat_uid: None)
+
+    async def slow_judge(_record: Any) -> tuple[str, str]:
+        await asyncio.sleep(0)               # yield, so an unlocked version interleaves
+        return ("not_met", "still working")
+
+    monkeypatch.setattr(adapter, "_goal_judge", slow_judge)
+
+    await asyncio.gather(*(
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text=f"turn {n}"), None)
+        for n in range(4)
+    ))
+
+    assert module._goal_load("cht_a")["attempts"] == 4
