@@ -1134,6 +1134,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             chat_id = resource["uid"]
             data = {"chat_id": chat_id, "created": resource["created"],
                     "trusted": resource["trusted"]}
+            if not data["created"]:
+                # A resumed thread has spoken before, so a session may own it:
+                # record the opener there like any cross-chat send. A thread
+                # created just now has no session yet -- nothing to record to.
+                await asyncio.to_thread(_mirror_sent, chat_id, body)
             try:
                 await self._refresh_reach(http)
             except Exception as exc:  # noqa: BLE001 - delivery happened; report adoption honestly

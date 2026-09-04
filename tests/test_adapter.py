@@ -3217,6 +3217,25 @@ def test_a_preflight_failure_reports_nothing_sent_not_delivery_unknown(
     assert "delivery_unknown" not in out
 
 
+@pytest.mark.parametrize("created, mirrored", [(False, ["cht_old"]), (True, [])],
+                         ids=["resumed", "created"])
+async def test_start_group_thread_records_the_opener_only_where_a_session_can_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, created: bool, mirrored: list[str]
+) -> None:
+    """POST /v1/chats resumes a thread that already exists, and that thread
+    has spoken before, so its session must get the opener like any other
+    cross-chat send. A thread created by this call has no session yet."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _adapter_with_home_line(module)
+    http = _create_http([], resource={"uid": "cht_old", "created": created, "trusted": False},
+                        granted=[_chat("cht_a"), _chat("cht_old")])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    calls = _stub_mirror(monkeypatch)
+    data = await adapter.start_group_thread(["+15550001111"], "hello again")
+    assert data["created"] is created and data["adoption"] == "adopted"
+    assert [(c["chat_id"], c["text"]) for c in calls] == [(uid, "hello again") for uid in mirrored]
+
+
 async def test_start_group_thread_raises_plow_send_error_on_4xx(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:

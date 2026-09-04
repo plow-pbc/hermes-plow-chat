@@ -133,8 +133,9 @@ for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
 caller that stopped waiting cannot strand a delivered message unrecorded. A
 chat's session is born on its first inbound message, so a chat that has never
 spoken has nowhere to record to: the adapter logs a warning and that chat
-will not remember the send, and a thread `plow_start_group_message` just
-opened is always in that state. Posting to the Plow API directly from a
+will not remember the send. A thread `plow_start_group_message` created is
+in that state; one it resumed has spoken before, and its opener is recorded
+like any other cross-chat send. Posting to the Plow API directly from a
 script bypasses all of this and leaves the target chat amnesiac; the tool
 exists so the model never has to.
 
