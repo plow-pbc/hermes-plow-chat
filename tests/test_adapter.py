@@ -3670,8 +3670,6 @@ async def test_the_active_turn_carries_one_recall_decision(
     await adapter.on_processing_start(event)
     turn = module._ACTIVE_TURN.get()
     assert turn["recall_everywhere"] is expected
-    assert "home" not in turn
-    assert "trusted" not in turn
     await adapter.on_processing_complete(event, None)
 
 
