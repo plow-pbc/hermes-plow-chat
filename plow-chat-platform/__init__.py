@@ -158,6 +158,19 @@ def _is_solo_dm(chat):
     return sum(1 for p in participants if p.get("type") == "member") <= 1
 
 
+def _is_owner_dm(chat):
+    """A private thread with the OWNER, the only room where an unattended turn
+    may carry owner authority.
+
+    `_is_solo_dm` answers "is anyone else here?", which stops being the same
+    question the moment the owner leaves: a group can be left holding one
+    remaining non-owner, and reading that as a private thread hands them a
+    scheduled turn with owner-only tools and no shared-room disclosure.
+    """
+    members = [p for p in (chat.get("participants") or []) if p.get("type") == "member"]
+    return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
+
+
 def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
@@ -183,7 +196,7 @@ def _collaboration_prompt(prompt, chat, identity):
     collaboration = (
         f"Collaboration context: Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
-        "Work with them in this visible thread. Respond when addressed or when you have a useful contribution; "
+        "Work with them in this visible thread. Respond when addressed, and otherwise only while a goal for this thread is active; "
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
         f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
     )
@@ -1398,17 +1411,17 @@ class PlowChatAdapter(BasePlatformAdapter):
         # has since revoked that trust.
         await self._refresh_current_chat(chat_uid)
         chat = await self.get_chat_info(chat_uid)
-        is_dm = chat["type"] == "dm"
+        owner_dm = _is_owner_dm(self._chats[chat_uid])
         await self.handle_message(MessageEvent(
             text=(f"{_goal_turn_line(goal)}\n\n"
                   "No new messages since your last turn. Continue working toward the goal. "
                   f"If there is nothing new to do or report, reply with exactly {NO_REPLY_SENTINEL}."),
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id="plow_goal", user_name="Goal check",
-                                     role_authorized=is_dm),
+                                     role_authorized=owner_dm),
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
-            channel_prompt=_channel_prompt(chat, "owner" if is_dm else "member",
+            channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
                                            self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
         ))
 

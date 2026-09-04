@@ -4363,3 +4363,46 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
     assert "only your owner directs work on the Mac" in text
     assert "not your owner" in text
+
+
+async def test_a_departed_owner_does_not_leave_a_stranger_holding_owner_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """"Nobody else here" stops meaning "just the owner" the moment the owner
+    leaves. A group left holding one non-owner read as a private thread, which
+    handed them a scheduled turn with owner-only tools."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    orphaned = _collaboration_chat()
+    orphaned["participants"] = [
+        participant for participant in orphaned["participants"]
+        if participant.get("type") == "agent" and participant.get("relationship") == "self"
+    ] + [{"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member"}]
+    adapter._set_reach([orphaned])
+    _mark_anchored(adapter, "cht_a")
+    module._goal_save("cht_a", module._goal_new("book the campsite"))
+    handled = _capture_events(monkeypatch, adapter)
+    monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
+
+    # The room now looks 1:1 by shape, and is still not the owner's.
+    assert (await adapter.get_chat_info("cht_a"))["type"] == "dm"
+    assert module._is_owner_dm(orphaned) is False
+
+    await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
+
+    assert handled[0]["source"]["role_authorized"] is False
+    assert module.EXTERNAL_CHANNEL_PROMPT in handled[0]["channel_prompt"]
+
+
+def test_an_unaddressed_peer_reply_is_permitted_only_under_a_goal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The silence prefix said not to reply while the collaboration paragraph
+    still invited an unsolicited contribution — the loop the README says is
+    suppressed, permitted by the very prompt that follows the suppression."""
+    module = _load(monkeypatch, tmp_path)
+    prompt = module._collaboration_prompt(
+        module.EXTERNAL_CHANNEL_PROMPT, _collaboration_chat(), {"signup": None, "number": None})
+
+    assert "only while a goal for this thread is active" in prompt
+    assert "when you have a useful contribution" not in prompt
