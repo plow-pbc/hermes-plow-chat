@@ -802,7 +802,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
-        self._goal_resume = None              # the post-backfill pacing arm
+        self._goal_resumes = set()            # post-backfill pacing arms, held strongly
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -996,9 +996,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         for task in self._goal_wakes.values():
             task.cancel()
         self._goal_wakes.clear()
-        if self._goal_resume is not None:
-            self._goal_resume.cancel()
-            self._goal_resume = None
+        for task in tuple(self._goal_resumes):
+            task.cancel()
+        self._goal_resumes.clear()
         self._mark_disconnected()
 
     async def on_processing_start(self, event):
@@ -1116,19 +1116,38 @@ class PlowChatAdapter(BasePlatformAdapter):
         """
         return self._goal_locks.setdefault(chat_uid, asyncio.Lock())
 
-    async def _goal_resume_pacing(self):
-        """Arm pacing for every OPEN goal, once the inbound backlog has drained.
+    def _goal_arm_resumes(self):
+        """One resume task per chat holding an OPEN goal.
 
         Open rather than runnable: a goal whose clock ran out while the
         container was down is exactly the one that still owes the thread a
         notice, and the wake loop makes that distinction itself.
         """
-        for queue, _server in tuple(self._inbound.values()):
-            await queue.join()
         for chat_uid in tuple(self.chat_uids):
             record = _goal_load(chat_uid)
-            if record and record.get("status") == GOAL_ACTIVE:
-                self._goal_start_wake(chat_uid)
+            if not record or record.get("status") != GOAL_ACTIVE:
+                continue
+            task = asyncio.create_task(self._goal_resume_pacing(chat_uid))
+            # Held until it finishes: asyncio keeps only a weak reference, and a
+            # single-slot handle was silently orphaned when a reconnect
+            # overwrote it -- unreachable even by `disconnect`.
+            self._goal_resumes.add(task)
+            task.add_done_callback(self._goal_resumes.discard)
+
+    async def _goal_resume_pacing(self, chat_uid):
+        """Arm this chat's pacing once ITS OWN backlog has drained.
+
+        Per chat, because `_serve_chat` retries a failing hand-off forever
+        without marking the item done: one broken chat joined in a shared sweep
+        would starve every healthy goal queued behind it for the life of the
+        process.
+        """
+        entry = self._inbound.get(chat_uid)
+        if entry is not None:
+            await entry[0].join()
+        record = _goal_load(chat_uid)
+        if record and record.get("status") == GOAL_ACTIVE:
+            self._goal_start_wake(chat_uid)
 
     def _goal_stop_wake(self, chat_uid):
         """Cancel this chat's pacing task -- unless we ARE it. A settlement runs
@@ -1937,7 +1956,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                         # delivered. Its own task, never awaited here: a chat
                         # whose hand-off is retrying must not hold the socket
                         # loop out of its frame reads.
-                        self._goal_resume = asyncio.create_task(self._goal_resume_pacing())
+                        self._goal_arm_resumes()
                         async for frame in ws:
                             if frame.type == aiohttp.WSMsgType.TEXT:
                                 await self._on_frame(frame.json(), http)

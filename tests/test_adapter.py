@@ -4008,7 +4008,7 @@ async def test_a_goal_that_expired_while_the_container_was_down_is_resumed_to_an
     started: list[str] = []
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
 
-    await adapter._goal_resume_pacing()
+    await adapter._goal_resume_pacing("cht_a")
 
     assert started == ["cht_a"], "an expired goal must still be resumed to say so"
 
@@ -4093,7 +4093,7 @@ async def test_pacing_resumes_only_after_the_inbound_backlog_drains(
     queue.put_nowait("a backfilled message")
     adapter._inbound["cht_a"] = (queue, mock.Mock())
 
-    task = asyncio.create_task(adapter._goal_resume_pacing())
+    task = asyncio.create_task(adapter._goal_resume_pacing("cht_a"))
     await asyncio.sleep(0)
     assert started == [], "still waiting on the backlog"
 
@@ -4102,3 +4102,32 @@ async def test_pacing_resumes_only_after_the_inbound_backlog_drains(
     await task
 
     assert started == ["cht_a"]
+
+
+async def test_one_stuck_chat_does_not_starve_another_chat_s_goal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """`_serve_chat` retries a failing hand-off forever without marking the item
+    done, so joining every queue in one sweep let a single broken chat block
+    every healthy goal behind it for the life of the process."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    adapter._set_reach([_collaboration_chat(), _chat("cht_stuck", group=True)])
+    for uid in ("cht_a", "cht_stuck"):
+        module._goal_save(uid, module._goal_new(f"goal for {uid}"))
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+
+    stuck: asyncio.Queue[str] = asyncio.Queue()
+    stuck.put_nowait("a hand-off that never completes")
+    adapter._inbound["cht_stuck"] = (stuck, mock.Mock())
+    adapter._inbound["cht_a"] = (asyncio.Queue(), mock.Mock())
+
+    adapter._goal_arm_resumes()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "cht_a" in started, "a healthy chat arms while another is wedged"
+    assert "cht_stuck" not in started
+    for task in tuple(adapter._goal_resumes):
+        task.cancel()
