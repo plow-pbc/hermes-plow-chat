@@ -32,6 +32,7 @@ reference realization of a prose spec. That framing is retired along with the
 | — | Flag any **literal secret**, or a probe that surfaces secret values (`env`/`printenv`, `cat` of credential files). This adapter holds the chat token. |
 | — | Flag a change that alters the **plugin id** `plow-chat-platform`, or the installed file set, without a matching change in `agent-mgr`. Every agent's `config.yaml` names that id, and `agent-mgr`'s installer names that directory. |
 | — | Flag **echoing a ticket, token or full frame** into logs. The ws ticket is single-use and short-lived, which is not the same as harmless. |
+| — | Flag a change that a **sibling repo owns** per `plow-hermes-agent` README § The repos: the `plow-gog` / Latch tool grammar (latch owns it), per-chat state written under `$HERMES_HOME` instead of plow, boot and gateway config (the base image). The test is who else would have to change if the fact changed. |
 
 ## Product context
 
