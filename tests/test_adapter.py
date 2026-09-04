@@ -835,6 +835,7 @@ def test_guest_turn_is_not_tool_blocked(
     turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
         assert set(hooks) == {"pre_tool_call", "pre_llm_call"}
+        assert hooks["pre_llm_call"] is module._recall
         assert hooks["pre_tool_call"](
             tool_name="mcp__latch__plow_run_command",
             args={"argv": ["plow-gog", "gmail", "search", "newer_than:7d"]},
@@ -2158,8 +2159,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "chat_uid": "cht_b",
         "owner": False,
         "dm": False,
-        "home": False,
-        "trusted": False,
+        "recall_everywhere": False,
         "no_reply_ok": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -2247,7 +2247,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "home": False, "trusted": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "recall_everywhere": False,
              "no_reply_ok": False, "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -3632,29 +3632,42 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
         await adapter.on_processing_complete(event, None)
 
 
-@pytest.mark.parametrize("trusted", [True, False])
+_HOME_SOLE_MEMBER_NOT_OWNER = _chat("cht_a")
+next(p for p in _HOME_SOLE_MEMBER_NOT_OWNER["participants"] if p["type"] == "member")["role"] = "member"
+
+
 @pytest.mark.parametrize(
-    ("chat_uid", "group", "expected_home"),
-    [("cht_room", False, False), ("cht_a", False, True), ("cht_a", True, False)],
-    ids=["other-chat", "home-chat", "home-configured-as-a-group"],
+    ("chat_uid", "chat", "expected"),
+    [
+        ("cht_room", _chat("cht_room", group=True), False),
+        ("cht_room", _chat("cht_room", group=True, trusted=True), True),
+        ("cht_a", _chat("cht_a"), True),
+        ("cht_a", _chat("cht_a", group=True), False),
+        ("cht_a", _HOME_SOLE_MEMBER_NOT_OWNER, False),
+    ],
+    ids=["other-untrusted-room", "other-trusted-room", "home-owner-dm",
+         "home-configured-as-a-group", "home-sole-member-not-owner"],
 )
-async def test_the_active_turn_carries_the_rooms_trust_flag(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool,
-    chat_uid: str, group: bool, expected_home: bool,
+async def test_the_active_turn_carries_one_recall_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    chat_uid: str, chat: dict[str, Any], expected: bool,
 ) -> None:
-    """`home` is identity AND shape: a PLOW_HOME_CHANNEL that names a group
-    must not hand its members the owner's cross-chat recall."""
+    """`recall_everywhere` is identity AND shape: a PLOW_HOME_CHANNEL that
+    names a group, or whose sole human isn't the owner, must not hand that
+    member the owner's cross-chat recall; a trusted room reaches every chat
+    on its own, home or not."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats[chat_uid] = _chat(chat_uid, group=group, trusted=trusted)
+    adapter._chats[chat_uid] = chat
     event = SimpleNamespace(
         source=SimpleNamespace(chat_id=chat_uid, role_authorized=False, chat_type="group", user_id="cp_m"),
         message_id="msg_1", channel_prompt="",
     )
     await adapter.on_processing_start(event)
     turn = module._ACTIVE_TURN.get()
-    assert turn["trusted"] is trusted
-    assert turn["home"] is expected_home
+    assert turn["recall_everywhere"] is expected
+    assert "home" not in turn
+    assert "trusted" not in turn
     await adapter.on_processing_complete(event, None)
 
 
@@ -3796,18 +3809,12 @@ _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "
 @pytest.mark.parametrize(
     ("turn", "expected_snippets"),
     [
-        ({"chat_uid": "cht_room", "owner": True, "dm": True, "home": True, "trusted": False},
+        ({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True},
          ["three possible addresses", "earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False},
-         ["earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": False, "dm": False, "home": False, "trusted": True},
-         ["three possible addresses", "earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": False, "dm": False, "home": False, "trusted": False},
-         ["earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": False, "dm": True, "home": False, "trusted": False},
+        ({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False},
          ["earlier in this room"]),
     ],
-    ids=["home", "owner-untrusted-group", "trusted-member", "untrusted-member", "non-owner-dm"],
+    ids=["everywhere", "room-only"],
 )
 def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], expected_snippets: list[str]
@@ -3827,7 +3834,7 @@ def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
                          "role_filter": ["user", "assistant"], "limit": 30,
                          "fields": ("session_id", "role", "snippet", "timestamp")}]
     assert db.closed is True
-    if turn["home"] or turn["trusted"]:
+    if turn["recall_everywhere"]:
         assert text.splitlines()[1] == "- [2026-09-03] assistant: three possible addresses"
     assert text.splitlines()[-1] == "(end of recalled snippets)"
 
@@ -3843,7 +3850,7 @@ def test_recall_caps_at_six_lines(
     ]
     db = _FakeDb(rows, {})
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "home": True, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True})
     out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert out["context"].count("- [") == 6
 
@@ -3854,7 +3861,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -3867,7 +3874,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -3878,25 +3885,10 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "home": False, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True
-
-
-def test_recall_hook_is_registered(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    hooks: list[tuple[str, Any]] = []
-    ctx = SimpleNamespace(
-        register_hook=lambda name, fn: hooks.append((name, fn)),
-        register_platform=lambda **k: None,
-        register_system_prompt_section=lambda *a, **k: None,
-        register_tool=lambda **k: None,
-    )
-    module.register(ctx)
-    assert ("pre_llm_call", module._recall) in hooks
 
 
 def test_mirror_sent_appends_an_assistant_turn_to_the_target_chat(

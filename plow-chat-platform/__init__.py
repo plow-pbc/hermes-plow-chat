@@ -163,6 +163,14 @@ def _is_solo_dm(chat):
     return sum(1 for p in participants if p.get("type") == "member") <= 1
 
 
+def _owner_dm(chat):
+    """The owner's own 1:1 with this agent: exactly one human, and it is the
+    owner. The shape that may hold owner-private material -- invite consent
+    is asked there, and recall reaches every chat from there."""
+    members = [p for p in chat.get("participants") or [] if p.get("type") == "member"]
+    return len(members) == 1 and members[0].get("role") == "owner"
+
+
 def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
@@ -793,10 +801,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
             "dm": event.source.chat_type == "dm",
-            # Identity AND shape: the home is where owner-private material
-            # lives, so a home misconfigured as a group must not read as one.
-            "home": chat_uid == self.home_chat_uid and _is_solo_dm(self._chats[chat_uid]),
-            "trusted": self._chats[chat_uid]["trusted"],
+            # One recall decision, made where the room's facts are fresh: the
+            # owner's own home DM or a trusted room reaches every chat; any
+            # other turn stays inside its own chat. Identity AND shape for the
+            # home -- a group or a stranger's DM configured as home is neither.
+            "recall_everywhere": ((chat_uid == self.home_chat_uid and _owner_dm(self._chats[chat_uid]))
+                                  or self._chats[chat_uid]["trusted"]),
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
@@ -942,12 +952,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             return {"skipped": "deferred_consent_unavailable"}
 
         home = await self.get_chat_info(self.home_chat_uid)
-        home_members = [
-            participant
-            for participant in self._chats[self.home_chat_uid]["participants"]
-            if participant.get("type") == "member"
-        ]
-        if home["type"] != "dm" or len(home_members) != 1 or home_members[0].get("role") != "owner":
+        if home["type"] != "dm" or not _owner_dm(self._chats[self.home_chat_uid]):
             raise RuntimeError("invite consent requires an owner-authenticated direct-message home")
         source = self.build_source(
             chat_id=self.home_chat_uid,
@@ -1650,12 +1655,11 @@ def _recall(session_id, user_message, platform, **_kwargs):
     turn's topic, appended to the user message (upstream's seam for per-turn
     recall; never the system prompt, so the prompt cache survives).
 
-    Scope is the room's, not the asker's: the home chat (the owner's own DM,
-    which has no other member) or a trusted room reaches every chat, the
-    owner's DMs included -- trust means members may have owner material. Any
-    other turn, an owner's turn in an untrusted group included, stays inside
-    its own chat's sessions. Identity, not roster shape: a chat whose member
-    count reads as a DM is not thereby the home. The current session is
+    Scope is the turn's `recall_everywhere` decision, made in
+    on_processing_start: the owner's own home DM or a trusted room reaches
+    every chat, the owner's DMs included -- trust means members may have
+    owner material; any other turn, an owner's turn in an untrusted group
+    included, stays inside its own chat's sessions. The current session is
     never recalled: the model has it. Errors propagate: Hermes isolates and
     logs a failing pre_llm_call hook and proceeds without recall, so a
     broken store is visible in the gateway log instead of hidden here."""
@@ -1665,7 +1669,7 @@ def _recall(session_id, user_message, platform, **_kwargs):
     query = _recall_query(user_message)
     if not query:
         return None
-    everywhere = turn["home"] or turn["trusted"]
+    everywhere = turn["recall_everywhere"]
     from hermes_state import get_shared_session_db, release_or_close
     db = get_shared_session_db()
     try:
