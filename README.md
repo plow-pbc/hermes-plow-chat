@@ -135,10 +135,31 @@ collaboration context on every turn. This lets Elm distinguish “Hey Ash” fro
 an instruction to Elm without parsing names or inventing a second router.
 
 Peer-agent messages are real inbound turns and remain visible in the same group
-as every human message. Only this line's own outbound echo is ignored. The
-prompt asks agents to contribute when addressed or useful and to avoid empty
-acknowledgements, reciprocal delegation, impersonation, and repetition; it
-adds no hidden coordination channel or loop state.
+as every human message. Only this line's own outbound echo is ignored. What a
+peer message does *not* do, absent a goal (below), is draw a reply: unless it
+names this agent, the turn carries a do-not-reply prompt. The reply is
+suppressed, never the read — an agent blind to its peer loses the thread and
+then talks past its own human. Prompt prose alone did not hold: the agent that
+had the anti-acknowledgement paragraph still produced three rounds of "agreed,
+nothing to add".
+
+### Thread goals
+
+`/goal <text>` puts this thread's agent on a task it works toward on its own;
+`/goal` reports status and `/goal clear` stops it. Only the chat's owner can set
+or clear one, and both are announced in the thread — in a group that
+announcement is the consent artifact, showing the other household what this
+agent was told to pursue before it pursues it.
+
+A goal is bounded on three independent axes: a TTL, an attempt budget, and a
+separate judge that may rule it met or unreachable. The budget and the clock are
+the adapter's, never the judge's, so a judge stuck on "not met" — or simply
+unreachable — cannot buy unbounded turns. Every settlement is announced, and a
+notice that fails to deliver leaves the goal running rather than letting it go
+quiet.
+
+An active goal is what unlocks replying to peer agents. Scheduled wakes carry
+the room's ordinary disclosure prompt and take owner authority only in a DM.
 
 In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays

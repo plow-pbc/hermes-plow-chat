@@ -262,17 +262,19 @@ def _goal_path(chat_uid):
 
 
 def _goal_load(chat_uid):
-    """This chat's goal record, or None when absent or unreadable.
+    """This chat's goal record, or None when there is none.
 
-    Unreadable reads as absent on purpose: a corrupt goal file must not wedge
-    every turn in the thread behind an exception.
+    This adapter is the only writer and it writes atomically, so a malformed
+    record is not a case to absorb -- only "no file yet" is. A truncated file
+    still reads as absent because JSON says so, not because a shape check
+    caught it.
     """
     try:
         with _goal_path(chat_uid).open() as fh:
             record = json.load(fh)
-    except (OSError, ValueError):
+    except (FileNotFoundError, json.JSONDecodeError):
         return None
-    return record if isinstance(record, dict) and record.get("text") else None
+    return record if record.get("text") else None
 
 
 def _goal_save(chat_uid, record):
@@ -287,12 +289,17 @@ def _goal_save(chat_uid, record):
     tmp.replace(path)
 
 
-def _goal_new(text, set_by, now=None):
+def _goal_new(text, now=None):
+    """A fresh goal.
+
+    `generation` is what makes a handed-off turn attributable: work fired under
+    one goal can land after the owner has replaced it, and without an identity
+    to compare it would judge, count, and settle its successor.
+    """
     now = now or datetime.now(timezone.utc)
     return {
         "text": text[:GOAL_MAX_TEXT_CHARS],
-        "set_by": set_by,
-        "created_at": now.isoformat(),
+        "generation": uuid.uuid4().hex,
         "expires_at": (now + timedelta(hours=GOAL_TTL_HOURS)).isoformat(),
         "attempts": 0,
         "status": GOAL_ACTIVE,
@@ -337,7 +344,7 @@ def _goal_parse_command(body):
     rest = rest.strip()
     if not rest:
         return ("show", None)
-    if rest.lower() in {"clear", "stop", "cancel", "off"}:
+    if rest.lower() == "clear":
         return ("clear", None)
     return ("set", rest)
 
@@ -424,18 +431,33 @@ def _goal_judge_prompt(record):
     return "\n".join(lines)
 
 
-def _goal_outcome_text(outcome):
-    """The agent's own reply text out of the gateway's turn outcome.
+def _goal_wake_generation(message_id):
+    """The goal generation a synthetic wake turn was fired under, else None.
 
-    Tolerant by design: the outcome object is upstream's and its shape is not
-    ours to pin, and a goal must not settle differently because an attribute
-    got renamed.
+    Carried in the message id because that is a field the event already has;
+    a real inbound turn has none, and correctly attributes to whatever goal is
+    current when it lands.
     """
-    for attr in ("text", "content", "response", "final_text"):
-        value = getattr(outcome, attr, None)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+    parts = str(message_id or "").split("-")
+    return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
+
+
+def _channel_prompt(chat, role, roster):
+    """The turn's channel prompt for this room and speaker.
+
+    One owner for the matrix: a scheduled goal wake needs exactly the same
+    disclosure posture as a spoken turn, and a second copy of this selection is
+    how a wake ends up with none.
+    """
+    return _collaboration_prompt(
+        (TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT if role != "owner"
+         else TRUSTED_GROUP_OWNER_CHANNEL_PROMPT)
+        if chat["type"] != "dm" and chat["trusted"]
+        else EXTERNAL_CHANNEL_PROMPT if role != "owner"
+        else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
+        else OWNER_CHANNEL_PROMPT,
+        roster,
+    )
 
 
 def _goal_turn_line(record):
@@ -753,6 +775,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
+        self._goal_said = {}                  # chat uid -> what the agent said this turn
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -1004,11 +1027,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         # After the typing stop, never before: the judge is a network round
         # trip and the indicator must not hang behind it.
         try:
-            await self._goal_after_turn(chat_uid, event, outcome)
+            await self._goal_after_turn(chat_uid, event)
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
             log.warning("[plow_chat] goal check failed for %s: %s", chat_uid, exc)
 
-    async def _goal_command(self, chat_uid, text, sender, role, goal):
+    async def _goal_command(self, chat_uid, text, role, goal):
         """Run `/goal`.
 
         Setting and clearing are announced in the thread on purpose: in a group
@@ -1022,13 +1045,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         if role != "owner":
             await self.send(chat_uid, "Only this agent's owner can set or clear its goal.")
             return
+        async with self._goal_lock(chat_uid):
+            current = _goal_load(chat_uid)
+            if action == "clear":
+                if current:
+                    current["status"] = "cleared"
+                    _goal_save(chat_uid, current)
+            else:
+                _goal_save(chat_uid, _goal_new(argument))
+        # The predecessor's wake is asleep on its own backoff; left running it
+        # would keep a just-set goal idle for up to GOAL_WAKE_MAX_SECONDS.
+        self._goal_stop_wake(chat_uid)
         if action == "clear":
-            if goal:
-                goal["status"] = "cleared"
-                _goal_save(chat_uid, goal)
             await self.send(chat_uid, _GOAL_HEADLINES["cleared"])
             return
-        _goal_save(chat_uid, _goal_new(argument, _sender_key(sender)))
         await self.send(
             chat_uid,
             f"\U0001f3af Goal set: {argument}\n\n"
@@ -1046,6 +1076,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         triggers the turn that comes back for this same lock.
         """
         return self._goal_locks.setdefault(chat_uid, asyncio.Lock())
+
+    def _goal_stop_wake(self, chat_uid):
+        task = self._goal_wakes.pop(chat_uid, None)
+        if task is not None:
+            task.cancel()
 
     def _goal_start_wake(self, chat_uid):
         """One pacing task per chat. A second would double the wake rate every
@@ -1093,53 +1128,80 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _goal_fire(self, chat_uid, goal):
         """Inject the goal turn, the same path `gateway/wake.py` uses.
 
-        `role_authorized` is the owner's because only the owner can set a goal;
-        the wake carries exactly the authority that created it, no more.
+        A scheduled wake carries the room's real disclosure prompt, and owner
+        authority ONLY in a DM. In a group the thread is full of other people's
+        words; an owner-authorized turn acting on them unprompted is a confused
+        deputy holding owner-only tools.
         """
         chat = await self.get_chat_info(chat_uid)
+        is_dm = chat["type"] == "dm"
         await self.handle_message(MessageEvent(
             text=(f"{_goal_turn_line(goal)}\n\n"
                   "No new messages since your last turn. Continue working toward the goal. "
                   f"If there is nothing new to do or report, reply with exactly {NO_REPLY_SENTINEL}."),
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id="plow_goal", user_name="Goal check",
-                                     role_authorized=True),
-            message_id=f"goal-{uuid.uuid4().hex}",
+                                     role_authorized=is_dm),
+            message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
-            channel_prompt=_SILENCE_OPTION,
+            channel_prompt=_channel_prompt(chat, "owner" if is_dm else "member",
+                                           self._chats[chat_uid]) + _SILENCE_OPTION,
         ))
 
     async def _goal_announce(self, chat_uid, status, evidence):
-        """Say why the goal stopped.
+        """Say why the goal stopped; True when the thread actually heard it.
 
         An agent that privately concludes a goal is met or unreachable and never
         says so is the failure the 2026-09-04 thread ended on -- both agents got
         there and neither discharged it, so the thread just kept going.
         """
         headline = _GOAL_HEADLINES.get(status, f"Goal {status}")
-        await self.send(chat_uid, f"{headline} \u2014 {evidence}" if evidence else headline)
+        result = await self.send(chat_uid, f"{headline} \u2014 {evidence}" if evidence else headline)
+        return bool(getattr(result, "success", False))
 
-    async def _goal_after_turn(self, chat_uid, event, outcome):
+    async def _goal_after_turn(self, chat_uid, event):
+        said = self._goal_said.pop(chat_uid, [])
         async with self._goal_lock(chat_uid):
             goal = _goal_load(chat_uid)
             if not _goal_active(goal):
                 return
+            # Work fired under a goal the owner has since replaced must not
+            # count against, judge, or settle its successor. A real inbound
+            # turn carries no generation and belongs to whatever goal is live.
+            fired_under = _goal_wake_generation(getattr(event, "message_id", ""))
+            if fired_under is not None and fired_under != goal.get("generation"):
+                return
+            generation = goal.get("generation")
             goal["attempts"] = int(goal.get("attempts") or 0) + 1
             _goal_append_history(goal, "thread", getattr(event, "text", "") or "")
-            _goal_append_history(goal, "agent", _goal_outcome_text(outcome))
+            for reply in said:
+                _goal_append_history(goal, "agent", reply)
+            # Saved BEFORE the judge round trip: a crash mid-request would
+            # otherwise lose an attempt the agent has already spent.
+            _goal_save(chat_uid, goal)
             verdict, evidence = await self._goal_judge(goal)
             goal["last_verdict"] = {"verdict": verdict, "evidence": evidence}
             # The judge owns only `met` and `unachievable`; the budget and the
             # TTL are ours, so a judge that answers `not_met` forever -- or one
             # that is simply down -- still cannot buy unbounded turns.
             settled = verdict if verdict in GOAL_JUDGE_TERMINAL else _goal_exhaustion(goal)
-            if settled:
-                goal["status"] = settled
             _goal_save(chat_uid, goal)
-        if settled:
-            await self._goal_announce(chat_uid, settled, evidence)
-        else:
+        if not settled:
             self._goal_start_wake(chat_uid)
+            return
+        # Stop waking only once the thread has actually been told. A goal that
+        # goes quiet without its announcement landing is the silent settle this
+        # whole feature exists to prevent.
+        if not await self._goal_announce(chat_uid, settled, evidence):
+            log.warning("[plow_chat] goal %s notice undelivered for %s; staying active",
+                        settled, chat_uid)
+            self._goal_start_wake(chat_uid)
+            return
+        async with self._goal_lock(chat_uid):
+            current = _goal_load(chat_uid)
+            if current and current.get("generation") == generation:
+                current["status"] = settled
+                _goal_save(chat_uid, current)
 
     async def _goal_judge(self, record):
         """Score the goal in a separate model call.
@@ -1208,6 +1270,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
+            # The judge needs what the agent actually said, and the turn
+            # outcome is a SUCCESS/FAILURE enum that never carried it. Gated on
+            # an open turn for THIS chat, so a goal announcement -- sent after
+            # the turn closes -- is not read back as the agent's own words.
+            if turn is not None and chat_id == turn["chat_uid"]:
+                said = self._goal_said.setdefault(chat_id, [])
+                said.append(body)
+                del said[:-GOAL_HISTORY_ENTRIES]
             return await self._post_message(http, chat_id, {"body": body})
 
     async def _verbose_enabled(self, http):
@@ -1880,7 +1950,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # `/goal` is ours to claim before the hand-off: every `/...` routes to
         # hermes' own slash router, which has never heard of it.
         if burst[0].starts_slash_command and _goal_parse_command(text):
-            await self._goal_command(chat_uid, text, sender, role, goal)
+            await self._goal_command(chat_uid, text, role, goal)
             self._checkpoint(burst[-1].uid, chat_uid)
             return
         # A command is addressed to the gateway, not to the thread: it needs
@@ -1894,15 +1964,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{turn_context}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _collaboration_prompt(
-            (TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT if role != "owner"
-             else TRUSTED_GROUP_OWNER_CHANNEL_PROMPT)
-            if chat["type"] != "dm" and chat["trusted"]
-            else EXTERNAL_CHANNEL_PROMPT if role != "owner"
-            else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
-            else OWNER_CHANNEL_PROMPT,
-            roster,
-        )
+        channel_prompt = _channel_prompt(chat, role, roster)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
