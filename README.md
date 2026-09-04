@@ -43,7 +43,7 @@ owns what is in
 [`plow-hermes-agent` README § The repos](https://github.com/plow-pbc/plow-hermes-agent#the-repos);
 read it before a change that touches a neighbour. The test is **who else would
 have to change if this fact changed** — if the answer is a sibling, the change
-belongs there and this repo takes a pin bump.
+belongs there; this repo only follows, by bumping its pin if it holds one.
 
 Not here:
 

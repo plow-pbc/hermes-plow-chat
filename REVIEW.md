@@ -39,8 +39,3 @@ reference realization of a prose spec. That framing is retired along with the
 A Python Hermes platform adapter (`plow_chat`) plus its manifest. The suite
 stubs the `gateway.*` modules Hermes supplies at runtime, so it needs no Hermes
 install and touches no network.
-
-There is a **second implementation of this same plugin id** in `plow-pbc/plow`
-(`cloud-agents/hermes/plugins/plow_chat/`), serving Plow's multi-tenant cloud
-agents with a different env contract. Convergence is the goal; a PR here that
-narrows or widens the gap should say which it does.
