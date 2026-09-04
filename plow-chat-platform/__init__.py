@@ -431,6 +431,18 @@ def _goal_judge_prompt(record):
     return "\n".join(lines)
 
 
+def _goal_retire(record, status):
+    """Close a goal out.
+
+    The transcript is dropped with it: nothing reads `history` once the runtime
+    consumer is gone, so keeping roster names, thread text and connected-account
+    output on the persistent volume past that point is retention with no reader.
+    """
+    record["status"] = status
+    record.pop("history", None)
+    return record
+
+
 def _goal_wake_generation(message_id):
     """The goal generation a synthetic wake turn was fired under, else None.
 
@@ -775,7 +787,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
-        self._goal_said = {}                  # chat uid -> what the agent said this turn
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -1011,6 +1022,10 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome):
         chat_uid = event.source.chat_id
+        # Read before the turn is cleared below: this is the only place the
+        # turn's own replies are still reachable.
+        turn = self._active_turn.get()
+        said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # The final reply's kick may have re-raised the indicator after the
@@ -1027,7 +1042,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # After the typing stop, never before: the judge is a network round
         # trip and the indicator must not hang behind it.
         try:
-            await self._goal_after_turn(chat_uid, event)
+            await self._goal_after_turn(chat_uid, event, said)
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
             log.warning("[plow_chat] goal check failed for %s: %s", chat_uid, exc)
 
@@ -1045,25 +1060,32 @@ class PlowChatAdapter(BasePlatformAdapter):
         if role != "owner":
             await self.send(chat_uid, "Only this agent's owner can set or clear its goal.")
             return
-        async with self._goal_lock(chat_uid):
-            current = _goal_load(chat_uid)
-            if action == "clear":
-                if current:
-                    current["status"] = "cleared"
-                    _goal_save(chat_uid, current)
-            else:
-                _goal_save(chat_uid, _goal_new(argument))
-        # The predecessor's wake is asleep on its own backoff; left running it
-        # would keep a just-set goal idle for up to GOAL_WAKE_MAX_SECONDS.
-        self._goal_stop_wake(chat_uid)
         if action == "clear":
+            async with self._goal_lock(chat_uid):
+                current = _goal_load(chat_uid)
+                if current:
+                    _goal_save(chat_uid, _goal_retire(current, "cleared"))
+            self._goal_stop_wake(chat_uid)
             await self.send(chat_uid, _GOAL_HEADLINES["cleared"])
             return
-        await self.send(
+        # Announced BEFORE anything is saved or scheduled. In a group the
+        # announcement is the participants' disclosure that this agent is about
+        # to start working on its own; autonomous work that begins while that
+        # notice was refused has crossed the consent boundary the README
+        # promises. Raising leaves the command uncheckpointed, so the delivery
+        # retry re-runs it rather than dropping it.
+        announced = await self.send(
             chat_uid,
             f"\U0001f3af Goal set: {argument}\n\n"
             f"I'll work toward it and report back. It stops on its own when it is done, "
             f"unreachable, or after {GOAL_TTL_HOURS}h. `/goal` for status, `/goal clear` to stop.")
+        if not getattr(announced, "success", False):
+            raise RuntimeError(f"goal announcement was not delivered to {chat_uid}")
+        # The predecessor's wake is asleep on its own backoff; left running it
+        # would keep a just-set goal idle for up to GOAL_WAKE_MAX_SECONDS.
+        self._goal_stop_wake(chat_uid)
+        async with self._goal_lock(chat_uid):
+            _goal_save(chat_uid, _goal_new(argument))
         self._goal_start_wake(chat_uid)
 
     def _goal_lock(self, chat_uid):
@@ -1119,17 +1141,21 @@ class PlowChatAdapter(BasePlatformAdapter):
                     return
                 reason = _goal_exhaustion(goal)
             if reason is not None:
+                # One settlement rule for both paths: the thread hears it, then
+                # the goal stops. An undelivered notice leaves the record open
+                # so the next pass retries -- a goal that goes quiet without
+                # saying why is the failure this whole feature exists to
+                # prevent, and running out of clock is no different.
                 async with self._goal_lock(chat_uid):
                     current = _goal_load(chat_uid)
                     if not current or current.get("status") != GOAL_ACTIVE:
                         return
-                    current["status"] = reason
-                    _goal_save(chat_uid, current)
-                # Out of clock or out of budget, there is no further work to
-                # keep it alive for, so an undelivered notice is logged rather
-                # than holding the goal open to retry one.
-                if not await self._goal_announce(chat_uid, reason, "no attempts left"):
-                    log.warning("[plow_chat] goal %s notice undelivered for %s", reason, chat_uid)
+                    if not await self._goal_announce(chat_uid, reason, "no attempts left"):
+                        log.warning("[plow_chat] goal %s notice undelivered for %s; retrying",
+                                    reason, chat_uid)
+                        fired += 1
+                        continue
+                    _goal_save(chat_uid, _goal_retire(current, reason))
                 return
             fired += 1
             try:
@@ -1173,8 +1199,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         result = await self.send(chat_uid, f"{headline} \u2014 {evidence}" if evidence else headline)
         return bool(getattr(result, "success", False))
 
-    async def _goal_after_turn(self, chat_uid, event):
-        said = self._goal_said.pop(chat_uid, [])
+    async def _goal_after_turn(self, chat_uid, event, said):
         async with self._goal_lock(chat_uid):
             goal = _goal_load(chat_uid)
             if not _goal_active(goal):
@@ -1212,8 +1237,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                             settled, chat_uid)
                 self._goal_start_wake(chat_uid)
                 return
-            goal["status"] = settled
-            _goal_save(chat_uid, goal)
+            _goal_save(chat_uid, _goal_retire(goal, settled))
 
     async def _goal_judge(self, record):
         """Score the goal in a separate model call.
@@ -1282,15 +1306,18 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
-            # The judge needs what the agent actually said, and the turn
-            # outcome is a SUCCESS/FAILURE enum that never carried it. Gated on
-            # an open turn for THIS chat, so a goal announcement -- sent after
-            # the turn closes -- is not read back as the agent's own words.
-            if turn is not None and chat_id == turn["chat_uid"]:
-                said = self._goal_said.setdefault(chat_id, [])
+            result = await self._post_message(http, chat_id, {"body": body})
+            # The judge needs what the agent actually said, and the turn outcome
+            # is a SUCCESS/FAILURE enum that never carried it. Recorded on the
+            # TURN, not on the chat: two turns for one chat overlap, and a
+            # chat-keyed buffer hands one turn's words to the other. Only after
+            # the post succeeds -- text that never reached the thread is not
+            # something the agent said.
+            if turn is not None and chat_id == turn["chat_uid"] and getattr(result, "success", False):
+                said = turn.setdefault("said", [])
                 said.append(body)
                 del said[:-GOAL_HISTORY_ENTRIES]
-            return await self._post_message(http, chat_id, {"body": body})
+            return result
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.

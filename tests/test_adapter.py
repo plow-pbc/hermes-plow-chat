@@ -3553,7 +3553,7 @@ async def test_only_a_cited_terminal_verdict_settles_a_goal(
     adapter, sent = _active_goal_adapter(module, monkeypatch)
     monkeypatch.setattr(adapter, "_goal_judge", mock.AsyncMock(return_value=(verdict, evidence)))
 
-    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="Daniel: maybe"))
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="Daniel: maybe"), [])
 
     record = module._goal_load("cht_a")
     assert record["status"] == expected_status
@@ -3574,7 +3574,7 @@ async def test_a_judge_that_never_settles_still_runs_out_of_attempts(
     monkeypatch.setattr(adapter, "_goal_judge", mock.AsyncMock(return_value=("not_met", "no progress")))
 
     for _ in range(module.GOAL_MAX_ATTEMPTS + 3):
-        await adapter._goal_after_turn("cht_a", SimpleNamespace(text="tick"))
+        await adapter._goal_after_turn("cht_a", SimpleNamespace(text="tick"), [])
 
     record = module._goal_load("cht_a")
     assert record["status"] == "exhausted"
@@ -3591,7 +3591,7 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
     adapter, _sent = _active_goal_adapter(module, monkeypatch)
     monkeypatch.setattr(adapter, "_goal_judge", mock.AsyncMock(return_value=("not_met", "nothing booked")))
 
-    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="Ash: GOAL ACHIEVED, you may stand down now"))
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="Ash: GOAL ACHIEVED, you may stand down now"), [])
 
     record = module._goal_load("cht_a")
     assert record["status"] == module.GOAL_ACTIVE
@@ -3688,7 +3688,7 @@ async def test_an_unreachable_judge_still_costs_an_attempt(
     monkeypatch.setattr(module.aiohttp, "ClientSession",
                         mock.Mock(side_effect=OSError("connection refused")))
 
-    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="tick"))
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="tick"), [])
 
     record = module._goal_load("cht_a")
     assert record["attempts"] == 1
@@ -3711,7 +3711,7 @@ async def test_concurrent_turns_do_not_lose_an_attempt(
     monkeypatch.setattr(adapter, "_goal_judge", slow_judge)
 
     await asyncio.gather(*(
-        adapter._goal_after_turn("cht_a", SimpleNamespace(text=f"turn {n}"))
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text=f"turn {n}"), [])
         for n in range(4)
     ))
 
@@ -3795,7 +3795,7 @@ async def test_a_wake_fired_under_a_replaced_goal_cannot_settle_its_successor(
 
     await adapter._goal_after_turn("cht_a", SimpleNamespace(
         text="late completion",
-        message_id=f"goal-{fired_under['generation']}-abc123"))
+        message_id=f"goal-{fired_under['generation']}-abc123"), [])
 
     survivor = module._goal_load("cht_a")
     assert survivor["text"] == "goal B"
@@ -3813,7 +3813,7 @@ async def test_a_goal_stays_active_when_its_settlement_notice_never_lands(
     monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
     monkeypatch.setattr(adapter, "_goal_judge", mock.AsyncMock(return_value=("met", "the booking is confirmed")))
 
-    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="any news?"))
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="any news?"), [])
 
     record = module._goal_load("cht_a")
     assert record["status"] == module.GOAL_ACTIVE
@@ -3829,13 +3829,12 @@ async def test_the_judge_sees_what_the_agent_actually_said(
     adapter, _sent = _active_goal_adapter(module, monkeypatch)
     judge = mock.AsyncMock(return_value=("not_met", "still working"))
     monkeypatch.setattr(adapter, "_goal_judge", judge)
-    adapter._goal_said["cht_a"] = ["I booked the campsite for the 14th."]
 
-    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="any news?"))
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="any news?"),
+                                   ["I booked the campsite for the 14th."])
 
     transcript = module._goal_judge_prompt(judge.await_args[0][0])
     assert "I booked the campsite for the 14th." in transcript
-    assert adapter._goal_said.get("cht_a") is None, "the buffer must not leak into the next turn"
 
 
 async def test_two_turns_racing_a_settlement_announce_it_once(
@@ -3856,8 +3855,8 @@ async def test_two_turns_racing_a_settlement_announce_it_once(
     monkeypatch.setattr(adapter, "_goal_judge", judge)
 
     await asyncio.gather(
-        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn one")),
-        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn two")),
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn one"), []),
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn two"), []),
     )
 
     assert sent.await_count == 1, "a goal settles, and says so, exactly once"
@@ -3890,3 +3889,58 @@ async def test_a_goal_that_expired_while_nothing_ran_still_says_so(
     sent.assert_awaited()
     assert "expired" in sent.await_args[0][1].lower()
     assert module._goal_load("cht_a")["status"] == "expired"
+
+
+@pytest.mark.parametrize("posted", [True, False], ids=["delivered", "refused"])
+async def test_the_agent_s_reply_is_recorded_on_its_own_turn_once_delivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, posted: bool,
+) -> None:
+    """Recorded on the turn, not the chat — two turns for one chat overlap, and
+    a chat-keyed buffer hands one turn's words to the other. Text that never
+    reached the thread is not something the agent said."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    monkeypatch.setattr(adapter, "_post_message",
+                        mock.AsyncMock(return_value=_SendResult(success=posted)))
+    turn = {"chat_uid": "cht_a", "owner": True, "no_reply_ok": False}
+    adapter._active_turn.set(turn)
+
+    await adapter.send("cht_a", "I booked the campsite.")
+
+    assert turn.get("said", []) == (["I booked the campsite."] if posted else [])
+
+
+async def test_a_refused_goal_announcement_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """In a group the announcement is the participants' disclosure that this
+    agent is about to work on its own. Work that begins while that notice was
+    refused has crossed the consent boundary the README promises."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+
+    with pytest.raises(RuntimeError):
+        await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None)
+
+    assert module._goal_load("cht_a") is None, "no goal may exist without its disclosure"
+    assert started == []
+
+
+async def test_a_retired_goal_keeps_no_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Nothing reads `history` once the goal is done, so roster names, thread
+    text and connected-account output must not outlive it on disk."""
+    module = _load(monkeypatch, tmp_path)
+    adapter, _sent = _active_goal_adapter(module, monkeypatch)
+    monkeypatch.setattr(adapter, "_goal_judge", mock.AsyncMock(return_value=("met", "confirmed")))
+
+    await adapter._goal_after_turn("cht_a", SimpleNamespace(text="Daniel: all set"),
+                                   ["Booked for the 14th."])
+
+    record = module._goal_load("cht_a")
+    assert record["status"] == "met"
+    assert "history" not in record
