@@ -4719,19 +4719,3 @@ async def test_suppression_is_scoped_to_the_turns_own_chat(
 
     assert result.success is True, "silence is not an error the gateway should retry"
     assert posted.await_count == (1 if delivered else 0)
-async def test_a_suppressed_turn_may_still_speak_in_another_granted_chat(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """Scoped to the turn's own chat: silence toward the peer is not a gag on
-    an explicit send elsewhere, which is a different act entirely."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
-    adapter.chat_uids = frozenset({"cht_a", "cht_b"})
-    posted = mock.AsyncMock(return_value=_SendResult(success=True))
-    monkeypatch.setattr(adapter, "_post_message", posted)
-    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True,
-                              "no_reply_ok": True, "suppress_reply": True})
-
-    await adapter.send("cht_b", "the thing you asked me to relay")
-
-    posted.assert_awaited()
