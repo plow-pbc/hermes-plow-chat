@@ -3967,3 +3967,26 @@ async def test_an_undeliverable_expiry_notice_retries_on_the_backoff_not_in_a_ti
 
     assert sent.await_count == 1, "a refused notice waits out the backoff before retrying"
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE
+
+
+async def test_a_goal_that_expired_while_the_container_was_down_is_resumed_to_announce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The restart gate asked whether the goal could still run, not whether it
+    was still open — so the one record that most needs finalizing, an expiry
+    nobody was around to announce, was the one never resumed."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    stale = module._goal_new("book the campsite")
+    stale["expires_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    module._goal_save("cht_a", stale)
+    assert module._goal_active(module._goal_load("cht_a")) is False, "precondition: not runnable"
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+    monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
+    monkeypatch.setattr(adapter, "_persist_home", mock.AsyncMock())
+    monkeypatch.setattr(adapter, "_listen", mock.AsyncMock())
+
+    await adapter.connect()
+
+    assert started == ["cht_a"], "an expired goal must still be resumed to say so"

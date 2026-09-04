@@ -964,8 +964,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._ws_task = asyncio.create_task(self._listen())
         # Restart survival. `Restart=always` means a goal set before a crash
         # would otherwise sit idle until somebody happened to speak.
+        #
+        # Gated on the record still being OPEN, not on it being runnable: a goal
+        # whose clock ran out while the container was down is exactly the one
+        # that still owes the thread a notice, and `_goal_active` is false for
+        # it. The wake loop makes that distinction itself.
         for chat_uid in tuple(self.chat_uids):
-            if _goal_active(_goal_load(chat_uid)):
+            record = _goal_load(chat_uid)
+            if record and record.get("status") == GOAL_ACTIVE:
                 self._goal_start_wake(chat_uid)
         return True
 
