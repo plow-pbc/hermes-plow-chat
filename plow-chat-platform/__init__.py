@@ -1591,6 +1591,26 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._checkpoint(burst[-1].uid, chat_uid)
 
 
+def _mirror_sent(chat_uid, body):
+    """Record a message this agent just posted to `chat_uid` in that chat's
+    own Hermes session, as the assistant turn it is.
+
+    Hermes keeps one session per chat, and the adapter drops the echo of our
+    own sends, so a message posted from ANOTHER chat's turn is invisible to
+    the target chat's next turn unless it is mirrored here -- the exact
+    amnesia that answered "I didn't give numbered options" to a reply to a
+    list this agent had posted. Same mechanism as upstream's cron and
+    `hermes send` deliveries (tools/send_message_tool.py); assistant role
+    because the text is genuinely the agent speaking."""
+    from gateway.mirror import mirror_to_session  # in-process with Hermes
+    mirrored = mirror_to_session(PLATFORM_NAME, chat_uid, body,
+                                 source_label=PLATFORM_NAME, role="assistant")
+    if not mirrored:
+        log.warning("[plow_chat] message to %s was sent but not mirrored: "
+                    "no live session owns that chat yet", chat_uid)
+    return mirrored
+
+
 class _PlowSendError(Exception):
     """An HTTP error from the thread-creation POST, carrying the status."""
 

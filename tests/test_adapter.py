@@ -3663,3 +3663,40 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
     assert "only your owner directs work on the Mac" in text
     assert "not your owner" in text
+
+
+def _stub_mirror(monkeypatch: pytest.MonkeyPatch, *, result: bool = True) -> list[dict[str, Any]]:
+    """Install a fake gateway.mirror and return the list of calls it saw."""
+    calls: list[dict[str, Any]] = []
+    mirror = types.ModuleType("gateway.mirror")
+
+    def mirror_to_session(platform: str, chat_id: str, message_text: str, **kw: Any) -> bool:
+        calls.append({"platform": platform, "chat_id": chat_id, "text": message_text, **kw})
+        return result
+
+    mirror.mirror_to_session = mirror_to_session  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gateway.mirror", mirror)
+    return calls
+
+
+def test_mirror_sent_appends_an_assistant_turn_to_the_target_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    calls = _stub_mirror(monkeypatch)
+    assert module._mirror_sent("cht_target", "the three addresses") is True
+    assert calls == [{
+        "platform": module.PLATFORM_NAME, "chat_id": "cht_target",
+        "text": "the three addresses", "source_label": module.PLATFORM_NAME,
+        "role": "assistant",
+    }]
+
+
+def test_mirror_sent_reports_a_missing_target_session_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _stub_mirror(monkeypatch, result=False)
+    with caplog.at_level(logging.WARNING):
+        assert module._mirror_sent("cht_target", "hello") is False
+    assert "cht_target" in caplog.text and "not mirrored" in caplog.text
