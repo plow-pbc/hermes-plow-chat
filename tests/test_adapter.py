@@ -3498,3 +3498,44 @@ def test_every_silence_instruction_names_the_sentinel(
     # A solo owner DM never warrants unprompted silence, so its prompt does
     # not reserve the token — send()'s gate keys off exactly this absence.
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
+
+
+def test_latch_section_renders_only_when_a_mac_is_connected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes drops MCP `instructions`, so the plugin is what tells a Hermes
+    agent that the plow_ tools are the owner's Mac and the default for owner
+    work. plow-init exports PLOW_MCP_URL exactly when a Mac exists; without
+    it the section renders empty and Hermes skips it."""
+    module = _load(monkeypatch, tmp_path)
+    sections: dict[str, Any] = {}
+
+    class _Context:
+        deferred_questions = _DeferredQuestions()
+        llm = _Llm()
+
+        def register_hook(self, name: str, callback: Any) -> None: ...
+        def register_platform(self, **kwargs: Any) -> None: ...
+        def register_tool(self, **kwargs: Any) -> None: ...
+
+        def register_system_prompt_section(self, id: str, content: Any, **kwargs: Any) -> None:
+            sections[id] = content
+
+    module.register(_Context())
+    render = sections["plow-latch"]
+
+    monkeypatch.delenv("PLOW_MCP_URL", raising=False)
+    assert render({}) == ""
+
+    monkeypatch.setenv("PLOW_MCP_URL", "https://api.plow.co/v1/relay/devices/u/mcp")
+    text = render({})
+    assert text == module.LATCH_PROMPT
+    assert len(text) <= 4000, "Hermes skips a section over max_chars"
+    for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
+        assert must in text
+    assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
+    # The Mac carries owner authority, so the routing rule must defer to the
+    # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
+    assert "only your owner directs work on the Mac" in text
+    assert "not your owner" in text
