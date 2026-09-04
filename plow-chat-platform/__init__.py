@@ -1828,9 +1828,8 @@ def _plow_name_contact(args, **_kwargs):
     """Record what the owner calls a roster participant, and who they are to
     the owner. Owner-turn-authorized only: fails CLOSED, like `plow_start_group_message`'s
     trusted branch and `plow_set_conversation_trusted` -- both a member's own
-    turn and no active turn at all refuse, so nothing a member says about
-    themselves, and nothing invoked outside a turn, can become a label the
-    roster then presents to the model as recorded on the owner's own turn. The chat
+    turn and no active turn at all refuse a direct write here, so a label can
+    only ever be written by a call made on the owner's own turn. The chat
     is the open owner turn's own `chat_uid`, the same source
     `plow_set_conversation_trusted` reads -- this tool only ever names someone
     in the chat whose owner turn is open, so there is no model-supplied

@@ -151,8 +151,8 @@ The owner may also tell the agent what to call a roster member and who that
 person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
 which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
 The tool is owner-turn-authorized only; it refuses outright during a member's
-turn, and outside any active turn at all, so nothing a member says about
-themselves, however phrased, becomes a label. A relationship renders as
+turn and outside any active turn at all — a direct call cannot write a label
+except on the owner's own turn. A relationship renders as
 `Name [uid] (relationship)` in the untrusted roster context above, never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
