@@ -292,17 +292,23 @@ def _goal_save(chat_uid, record):
     tmp.replace(path)
 
 
-def _goal_new(text, now=None):
+def _goal_new(text, activated_by=None, now=None):
     """A fresh goal.
 
     `generation` is what makes a handed-off turn attributable: work fired under
     one goal can land after the owner has replaced it, and without an identity
     to compare it would judge, count, and settle its successor.
+
+    `activated_by` is the uid of the message that set it. A `/goal` whose
+    checkpoint write failed is replayed after a restart, and without knowing
+    which message already did this a replay mints a new generation and
+    resurrects work that had since finished.
     """
     now = now or datetime.now(timezone.utc)
     return {
         "text": text[:GOAL_MAX_TEXT_CHARS],
         "generation": uuid.uuid4().hex,
+        "activated_by": activated_by,
         "expires_at": (now + timedelta(hours=GOAL_TTL_HOURS)).isoformat(),
         "attempts": 0,
         "status": GOAL_ACTIVE,
@@ -796,6 +802,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._typing = {}
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
+        self._goal_resume = None              # the post-backfill pacing arm
         self._active_turn = _ACTIVE_TURN
 
     def _checkpoint_path(self, chat_uid):
@@ -971,17 +978,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # for why publishing before that task has even run its first anchor
         # pass let a tool call race it.
         self._ws_task = asyncio.create_task(self._listen())
-        # Restart survival. `Restart=always` means a goal set before a crash
-        # would otherwise sit idle until somebody happened to speak.
-        #
-        # Gated on the record still being OPEN, not on it being runnable: a goal
-        # whose clock ran out while the container was down is exactly the one
-        # that still owes the thread a notice, and `_goal_active` is false for
-        # it. The wake loop makes that distinction itself.
-        for chat_uid in tuple(self.chat_uids):
-            record = _goal_load(chat_uid)
-            if record and record.get("status") == GOAL_ACTIVE:
-                self._goal_start_wake(chat_uid)
         return True
 
     async def disconnect(self):
@@ -1000,6 +996,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         for task in self._goal_wakes.values():
             task.cancel()
         self._goal_wakes.clear()
+        if self._goal_resume is not None:
+            self._goal_resume.cancel()
+            self._goal_resume = None
         self._mark_disconnected()
 
     async def on_processing_start(self, event):
@@ -1061,7 +1060,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
             log.warning("[plow_chat] goal check failed for %s: %s", chat_uid, exc)
 
-    async def _goal_command(self, chat_uid, text, role, goal):
+    async def _goal_command(self, chat_uid, text, role, goal, message_uid=None):
         """Run `/goal`.
 
         Setting and clearing are announced in the thread on purpose: in a group
@@ -1087,6 +1086,11 @@ class PlowChatAdapter(BasePlatformAdapter):
                     lambda current: _goal_retire(current, "cleared") if current else None):
                 raise RuntimeError(f"goal clear was not delivered to {chat_uid}")
             return
+        if message_uid is not None and (goal or {}).get("activated_by") == message_uid:
+            # This exact message already set this goal. A `/goal` whose
+            # checkpoint write failed replays after a restart, and re-running it
+            # would mint a new generation over a goal that has since finished.
+            return
         # In a group the announcement is the participants' disclosure that this
         # agent is about to start working on its own, so the transition will not
         # write the goal unless it lands. Raising leaves the command
@@ -1097,7 +1101,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 f"\U0001f3af Goal set: {argument}\n\n"
                 f"I'll work toward it and report back. It stops on its own when it is done, "
                 f"unreachable, or after {GOAL_TTL_HOURS}h. `/goal` for status, `/goal clear` to stop.",
-                lambda _current: _goal_new(argument),
+                lambda _current: _goal_new(argument, message_uid),
                 restart=True):
             raise RuntimeError(f"goal announcement was not delivered to {chat_uid}")
 
@@ -1111,6 +1115,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         triggers the turn that comes back for this same lock.
         """
         return self._goal_locks.setdefault(chat_uid, asyncio.Lock())
+
+    async def _goal_resume_pacing(self):
+        """Arm pacing for every OPEN goal, once the inbound backlog has drained.
+
+        Open rather than runnable: a goal whose clock ran out while the
+        container was down is exactly the one that still owes the thread a
+        notice, and the wake loop makes that distinction itself.
+        """
+        for queue, _server in tuple(self._inbound.values()):
+            await queue.join()
+        for chat_uid in tuple(self.chat_uids):
+            record = _goal_load(chat_uid)
+            if record and record.get("status") == GOAL_ACTIVE:
+                self._goal_start_wake(chat_uid)
 
     def _goal_stop_wake(self, chat_uid):
         """Cancel this chat's pacing task -- unless we ARE it. A settlement runs
@@ -1912,6 +1930,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                         log.info("[plow_chat] websocket connected")
                         for chat_uid in self.chat_uids:
                             await self._backfill(http, chat_uid)
+                        # Restart survival, but AFTER the backlog it would race.
+                        # A resumed goal's first attempt has no backoff, so
+                        # arming this in `connect` let it act before an offline
+                        # `/goal clear` -- or any newer instruction -- had been
+                        # delivered. Its own task, never awaited here: a chat
+                        # whose hand-off is retrying must not hold the socket
+                        # loop out of its frame reads.
+                        self._goal_resume = asyncio.create_task(self._goal_resume_pacing())
                         async for frame in ws:
                             if frame.type == aiohttp.WSMsgType.TEXT:
                                 await self._on_frame(frame.json(), http)
@@ -2066,7 +2092,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # `/goal` is ours to claim before the hand-off: every `/...` routes to
         # hermes' own slash router, which has never heard of it.
         if burst[0].starts_slash_command and _goal_parse_command(text):
-            await self._goal_command(chat_uid, text, role, goal)
+            await self._goal_command(chat_uid, text, role, goal, burst[-1].uid)
             self._checkpoint(burst[-1].uid, chat_uid)
             return
         # A command is addressed to the gateway, not to the thread: it needs

@@ -3787,13 +3787,21 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
     module = _load(monkeypatch, tmp_path)
     adapter, _sent = _active_goal_adapter(module, monkeypatch)
     handled = _capture_events(monkeypatch, adapter)
+    # Trust is stale until the wake re-reads it: the owner revoked it while the
+    # goal was already running.
+    adapter._chats["cht_a"]["trusted"] = True
+
+    async def refresh(chat_uid: str) -> None:
+        adapter._chats[chat_uid]["trusted"] = False
+
+    monkeypatch.setattr(adapter, "_refresh_current_chat", refresh)
 
     await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
 
     assert handled[0]["source"]["role_authorized"] is False
-    # And it carries the room's real disclosure prompt, not a bare sentinel.
+    # The room's real disclosure prompt, chosen from trust as it stands NOW.
     prompt = handled[0]["channel_prompt"]
-    assert prompt != module._SILENCE_OPTION
+    assert module.EXTERNAL_CHANNEL_PROMPT in prompt
     assert module.NO_REPLY_SENTINEL in prompt
 
 
@@ -3999,11 +4007,8 @@ async def test_a_goal_that_expired_while_the_container_was_down_is_resumed_to_an
     assert module._goal_active(module._goal_load("cht_a")) is False, "precondition: not runnable"
     started: list[str] = []
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
-    monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
-    monkeypatch.setattr(adapter, "_persist_home", mock.AsyncMock())
-    monkeypatch.setattr(adapter, "_listen", mock.AsyncMock())
 
-    await adapter.connect()
+    await adapter._goal_resume_pacing()
 
     assert started == ["cht_a"], "an expired goal must still be resumed to say so"
 
@@ -4030,27 +4035,6 @@ async def test_a_failed_goal_notice_never_strands_an_open_goal_unpaced(
     assert started == ["cht_a"], "and the pacing it stopped was handed back"
 
 
-async def test_a_scheduled_wake_re_reads_trust_before_choosing_its_prompt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """Inbound delivery refreshes trust before selecting a prompt. A wake that
-    skipped it would keep serving the trusted-group prompt, and the disclosure
-    it permits, into a group whose owner has since revoked that trust."""
-    module = _load(monkeypatch, tmp_path)
-    adapter, _sent = _active_goal_adapter(module, monkeypatch)
-    _capture_events(monkeypatch, adapter)
-    refreshed: list[str] = []
-
-    async def refresh(chat_uid: str) -> None:
-        refreshed.append(chat_uid)
-
-    monkeypatch.setattr(adapter, "_refresh_current_chat", refresh)
-
-    await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
-
-    assert refreshed == ["cht_a"]
-
-
 async def test_a_provider_that_raises_still_leaves_the_goal_paced(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
@@ -4069,3 +4053,52 @@ async def test_a_provider_that_raises_still_leaves_the_goal_paced(
     assert delivered is False
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE
     assert started == ["cht_a"], "the pacing it stopped was handed back"
+
+
+async def test_replaying_the_message_that_set_a_goal_does_not_restart_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A `/goal` whose checkpoint write failed is replayed after a restart.
+    Without knowing which message already did this, the replay mints a new
+    generation over a goal that has since finished."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    sent = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, "send", sent)
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda _uid: None)
+
+    await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None, "msg_set")
+    settled = module._goal_retire(module._goal_load("cht_a"), "met")
+    module._goal_save("cht_a", settled)
+
+    await adapter._goal_command("cht_a", "/goal book the campsite", "owner",
+                                module._goal_load("cht_a"), "msg_set")
+
+    assert module._goal_load("cht_a")["status"] == "met", "finished work stays finished"
+    assert sent.await_count == 1, "and the replay says nothing"
+
+
+async def test_pacing_resumes_only_after_the_inbound_backlog_drains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A resumed goal's first attempt has no backoff, so arming it before the
+    backfill is handled lets it act on a thread whose newest instruction — an
+    offline `/goal clear` — is still sitting in the queue."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("book the campsite"))
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    queue.put_nowait("a backfilled message")
+    adapter._inbound["cht_a"] = (queue, mock.Mock())
+
+    task = asyncio.create_task(adapter._goal_resume_pacing())
+    await asyncio.sleep(0)
+    assert started == [], "still waiting on the backlog"
+
+    queue.get_nowait()
+    queue.task_done()
+    await task
+
+    assert started == ["cht_a"]
