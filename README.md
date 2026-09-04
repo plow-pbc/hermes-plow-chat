@@ -118,6 +118,21 @@ chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
 older API the per-message refresh fails loudly and the chat waits for retry
 rather than guessing a trust state.
 
+### Speaking in another chat
+
+Hermes keeps one session per chat, and this adapter drops the echo of the
+agent's own sends. So a message the agent posts to chat B from a turn in chat
+A is invisible to chat B's next turn unless it is recorded there. The
+`plow_send_message` tool is the one sanctioned way to post cross-chat: it sends
+through the live adapter (the grant and member-turn confinement apply exactly
+as for a reply) and then mirrors the text into chat B's session as an
+assistant turn, with upstream's `gateway.mirror` — the same mechanism Hermes
+uses for cron and `hermes send` deliveries. `plow_start_group_message` mirrors
+the opener the same way and reports `mirrored: false` when the new thread has
+no session yet, which is the normal first-send case. Posting to the Plow API
+directly from a script bypasses all of this and leaves the target chat
+amnesiac; the tool exists so the model never has to.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from

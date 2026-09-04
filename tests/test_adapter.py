@@ -3788,3 +3788,23 @@ def test_plow_send_message_is_registered_on_the_platform_toolset(
     assert tool["toolset"] == module.PLATFORM_NAME
     assert tool["handler"] is module._plow_send_message
     assert tool["schema"]["parameters"]["required"] == ["chat_id", "body"]
+
+
+def test_start_group_message_mirrors_the_opener_into_the_new_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "start_group_thread",
+               result={"chat_id": "cht_new", "message_id": "msg_9", "adoption": "adopted"})
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_start_group_message(
+        {"recipients": ["+15550001111"], "body": "hello there", "dry_run": False, "confirm": True}))
+    assert out["success"] is True and out["mirrored"] is True
+    assert [(c["chat_id"], c["text"]) for c in calls] == [("cht_new", "hello there")]
+
+
+def test_reply_target_prompt_names_the_send_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert "plow_send_message" in module.REPLY_TARGET_PROMPT

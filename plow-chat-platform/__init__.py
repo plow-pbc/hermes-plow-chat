@@ -330,7 +330,7 @@ def _message_type(media_types):
 _ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
-    "send tool and will be refused on an external turn."
+    "plow_send_message tool and will be refused on an external turn."
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT}"
 # Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
@@ -1783,6 +1783,10 @@ def _plow_start_group_message(args, **_kwargs):
         "created": data.get("created"),
         "trusted": data.get("trusted"),
         "adoption": data.get("adoption"),
+        # Usually False: the thread's session is born on its first inbound
+        # message, after this send. Reported, not hidden, so a later reader
+        # of the tool result knows the opener is not in that chat's history.
+        "mirrored": bool(data.get("chat_id")) and _mirror_sent(data["chat_id"], body),
     })
 
 
