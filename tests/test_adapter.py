@@ -2290,8 +2290,8 @@ async def test_active_turn_retains_only_server_invite_identity(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_b"] = _chat("cht_b", group=True)
     if participant is not None:
-        adapter._chats["cht_b"] = _chat("cht_b", group=True)
         adapter._chats["cht_b"]["participants"].append(participant)
     event = SimpleNamespace(
         message_id="msg_delight_1",
@@ -3634,17 +3634,19 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
 
 @pytest.mark.parametrize("trusted", [True, False])
 @pytest.mark.parametrize(
-    ("chat_uid", "expected_home"),
-    [("cht_room", False), ("cht_a", True)],
-    ids=["other-chat", "home-chat"],
+    ("chat_uid", "group", "expected_home"),
+    [("cht_room", False, False), ("cht_a", False, True), ("cht_a", True, False)],
+    ids=["other-chat", "home-chat", "home-configured-as-a-group"],
 )
 async def test_the_active_turn_carries_the_rooms_trust_flag(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool,
-    chat_uid: str, expected_home: bool,
+    chat_uid: str, group: bool, expected_home: bool,
 ) -> None:
+    """`home` is identity AND shape: a PLOW_HOME_CHANNEL that names a group
+    must not hand its members the owner's cross-chat recall."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats[chat_uid] = {"uid": chat_uid, "trusted": trusted, "participants": []}
+    adapter._chats[chat_uid] = _chat(chat_uid, group=group, trusted=trusted)
     event = SimpleNamespace(
         source=SimpleNamespace(chat_id=chat_uid, role_authorized=False, chat_type="group", user_id="cp_m"),
         message_id="msg_1", channel_prompt="",

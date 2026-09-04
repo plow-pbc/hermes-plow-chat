@@ -793,8 +793,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
             "dm": event.source.chat_type == "dm",
-            "home": chat_uid == self.home_chat_uid,
-            "trusted": bool(self._chats.get(chat_uid, {}).get("trusted")),
+            # Identity AND shape: the home is where owner-private material
+            # lives, so a home misconfigured as a group must not read as one.
+            "home": chat_uid == self.home_chat_uid and _is_solo_dm(self._chats[chat_uid]),
+            "trusted": self._chats[chat_uid]["trusted"],
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
