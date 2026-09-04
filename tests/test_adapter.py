@@ -4028,3 +4028,44 @@ async def test_a_failed_goal_notice_never_strands_an_open_goal_unpaced(
 
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE, "nothing was written"
     assert started == ["cht_a"], "and the pacing it stopped was handed back"
+
+
+async def test_a_scheduled_wake_re_reads_trust_before_choosing_its_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Inbound delivery refreshes trust before selecting a prompt. A wake that
+    skipped it would keep serving the trusted-group prompt, and the disclosure
+    it permits, into a group whose owner has since revoked that trust."""
+    module = _load(monkeypatch, tmp_path)
+    adapter, _sent = _active_goal_adapter(module, monkeypatch)
+    _capture_events(monkeypatch, adapter)
+    refreshed: list[str] = []
+
+    async def refresh(chat_uid: str) -> None:
+        refreshed.append(chat_uid)
+
+    monkeypatch.setattr(adapter, "_refresh_current_chat", refresh)
+
+    await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
+
+    assert refreshed == ["cht_a"]
+
+
+async def test_a_provider_that_raises_still_leaves_the_goal_paced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """An escaping send exception would abandon the transition after it had
+    already stopped the wake, leaving the goal with no task to re-fire it."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("the standing goal"))
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(side_effect=OSError("provider down")))
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+
+    delivered = await adapter._goal_transition(
+        "cht_a", "Goal met", lambda current: module._goal_retire(current, "met"))
+
+    assert delivered is False
+    assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE
+    assert started == ["cht_a"], "the pacing it stopped was handed back"

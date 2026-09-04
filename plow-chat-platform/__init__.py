@@ -1079,9 +1079,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             if goal is None:
                 await self.send(chat_uid, _goal_status_line(None))
                 return
-            await self._goal_transition(
-                chat_uid, _GOAL_HEADLINES["cleared"],
-                lambda current: _goal_retire(current, "cleared") if current else None)
+            # Raising for the same reason `set` does: the command stays
+            # uncheckpointed, so the delivery retry re-runs it rather than
+            # dropping it while the goal quietly keeps running.
+            if not await self._goal_transition(
+                    chat_uid, _GOAL_HEADLINES["cleared"],
+                    lambda current: _goal_retire(current, "cleared") if current else None):
+                raise RuntimeError(f"goal clear was not delivered to {chat_uid}")
             return
         # In a group the announcement is the participants' disclosure that this
         # agent is about to start working on its own, so the transition will not
@@ -1119,8 +1123,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         task.cancel()
 
     async def _goal_say(self, chat_uid, text):
-        """True when the thread actually heard it."""
-        return bool(getattr(await self.send(chat_uid, text), "success", False))
+        """True when the thread actually heard it.
+
+        A provider that raises is a notice that did not land, not a reason to
+        abandon the transition mid-flight: an escaping exception leaves the
+        pacing stopped and the goal with no task to re-fire or retire it.
+        """
+        try:
+            result = await self.send(chat_uid, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                # noqa: BLE001 - undelivered is a state, not a crash
+            log.warning("[plow_chat] goal notice to %s failed: %s", chat_uid, exc)
+            return False
+        return bool(getattr(result, "success", False))
 
     def _goal_note_reply(self, chat_id, body):
         """Record what the agent said, on the TURN rather than the chat.
@@ -1240,6 +1256,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         words; an owner-authorized turn acting on them unprompted is a confused
         deputy holding owner-only tools.
         """
+        # Refreshed first. Inbound delivery re-reads trust before choosing a
+        # prompt; a wake that skipped it would keep serving the trusted-group
+        # prompt -- and the disclosure it permits -- into a group whose owner
+        # has since revoked that trust.
+        await self._refresh_current_chat(chat_uid)
         chat = await self.get_chat_info(chat_uid)
         is_dm = chat["type"] == "dm"
         await self.handle_message(MessageEvent(
