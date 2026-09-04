@@ -3398,6 +3398,23 @@ def test_every_silence_instruction_names_the_sentinel(
 # --------------------------------------------------------------- thread goals
 
 
+def _wake_delays(monkeypatch: pytest.MonkeyPatch, module: Any, stop_after: int) -> list[float]:
+    """Record what the wake loop sleeps for, and end it after `stop_after` naps.
+
+    Deciding pacing from a wall-clock window lets a loaded runner fail a correct
+    implementation; the delays themselves are the thing under test.
+    """
+    delays: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= stop_after:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    return delays
+
+
 def _active_goal_adapter(module: Any, monkeypatch: pytest.MonkeyPatch,
                          text: str = "book the campsite") -> tuple[Any, Any]:
     """An adapter with a live goal, a captured `send`, and the wake loop stubbed."""
@@ -3753,14 +3770,13 @@ async def test_the_wake_loop_does_not_spin_when_a_turn_never_reaches_its_judge(
         fires.append(chat_uid)           # deliberately never advances `attempts`
 
     monkeypatch.setattr(adapter, "_goal_fire", fire)
+    delays = _wake_delays(monkeypatch, module, stop_after=2)
 
-    task = asyncio.create_task(adapter._goal_wake("cht_a"))
-    await asyncio.sleep(0.05)            # ample for a spinning loop to run away
-    task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
-        await task
+        await adapter._goal_wake("cht_a")
 
     assert fires == ["cht_a"], "the first attempt fires at once; the second must back off"
+    assert delays == [0, module.GOAL_WAKE_BASE_SECONDS]
 
 
 async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
@@ -3880,14 +3896,11 @@ async def test_a_goal_that_expired_while_nothing_ran_still_says_so(
     monkeypatch.setattr(adapter, "send", sent)
     monkeypatch.setattr(adapter, "_goal_fire", mock.AsyncMock())
 
-    task = asyncio.create_task(adapter._goal_wake("cht_a"))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await adapter._goal_wake("cht_a")        # settles and returns; never sleeps
 
     sent.assert_awaited()
     assert "expired" in sent.await_args[0][1].lower()
+    assert "attempts" not in sent.await_args[0][1].lower(), "expiry is not exhaustion"
     assert module._goal_load("cht_a")["status"] == "expired"
 
 
@@ -3956,16 +3969,19 @@ async def test_an_undeliverable_expiry_notice_retries_on_the_backoff_not_in_a_ti
     expired = module._goal_new("book the campsite")
     expired["expires_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     module._goal_save("cht_a", expired)
-    sent = mock.AsyncMock(return_value=_SendResult(success=False))
+    # Bounded on the SEND side too, so a regression that drops the sleep fails
+    # on the delays assertion instead of hanging the suite forever.
+    sent = mock.AsyncMock(side_effect=[_SendResult(success=False),
+                                       _SendResult(success=False),
+                                       asyncio.CancelledError()])
     monkeypatch.setattr(adapter, "send", sent)
+    delays = _wake_delays(monkeypatch, module, stop_after=1)
 
-    task = asyncio.create_task(adapter._goal_wake("cht_a"))
-    await asyncio.sleep(0.05)            # ample for an unpaced loop to run away
-    task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
-        await task
+        await adapter._goal_wake("cht_a")
 
     assert sent.await_count == 1, "a refused notice waits out the backoff before retrying"
+    assert delays == [module.GOAL_WAKE_BASE_SECONDS], "and the wait is the ordinary cadence"
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE
 
 
