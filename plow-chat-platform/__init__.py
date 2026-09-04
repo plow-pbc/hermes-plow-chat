@@ -16,6 +16,7 @@ import os
 import pathlib
 import uuid
 from datetime import datetime, timezone
+from typing import Any, Mapping
 
 import aiohttp
 from gateway.config import HomeChannel, Platform, persist_home_channel
@@ -303,6 +304,30 @@ REPLY_TARGET_PROMPT = (
     "send tool and will be refused on an external turn."
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT}"
+# Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
+# plugin states the routing rule itself. Rendered only when plow-init exported
+# PLOW_MCP_URL, which it does exactly when the account has a Mac. The MCP
+# server's key differs between installs (`plow` on cloud images, `latch` on
+# the fleet), so this names the plow_ tool prefix and never the mcp__ prefix.
+LATCH_PROMPT = (
+    "You run on a Plow cloud server (Linux). It is your workspace and nothing more; your owner "
+    "cannot see it. Your owner's Mac is connected through Latch: the MCP server whose tool names "
+    "start with plow_ (plow_run_command, plow_read_file, plow_browser_open, plow_list_skills, "
+    "and the rest). Those tools act on the Mac as the owner: their files, apps, signed-in browser "
+    "and accounts, contacts, messages, calendar, clipboard, and speakers.\n\n"
+    "Default to the Mac for anything about your owner or their world. 'My computer', 'my files', "
+    "'my email', 'say this', 'open that', 'find X' mean the Mac unless they say otherwise; your own "
+    "shell and files are for your own work only. Before saying what you can or cannot do, call "
+    "plow_list_skills: the skills that Mac publishes are capabilities you have. When someone says "
+    "'Latch', they mean these tools. If a plow_ tool answers that the Mac is not connected, say so "
+    "and ask the owner to open Latch; do not do the task on your server instead."
+)
+
+
+def _latch_section(_session_info: Mapping[str, Any]) -> str:
+    return LATCH_PROMPT if os.environ.get("PLOW_MCP_URL") else ""
+
+
 # The room is the boundary, not the asker. An owner requesting their own material
 # in a shared chat still publishes it to everyone in that chat, so this is scoped
 # to the thread rather than to who is speaking.
@@ -1968,6 +1993,13 @@ def register(ctx):
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables.",
     )
+    # A Hermes without this API (older fleet pins) must still get its phone
+    # line: the section is guidance, the platform is the product.
+    register_section = getattr(ctx, "register_system_prompt_section", None)
+    if register_section is None:
+        log.warning("plow_chat: this Hermes has no register_system_prompt_section; Latch guidance not injected")
+    else:
+        register_section("plow-latch", _latch_section)
     # Registered unconditionally, like the platform itself: group chats are handled
     # by default, so gating the tool that starts one on a config nobody has to set
     # would leave it permanently unreachable on a stock install.
