@@ -1118,14 +1118,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         """
         action, argument = _goal_parse_command(text)
         if action == "show":
-            await self.send(chat_uid, _goal_status_line(goal))
+            await self._goal_reply(chat_uid, _goal_status_line(goal))
             return
         if role != "owner":
-            await self.send(chat_uid, "Only this agent's owner can set or clear its goal.")
+            await self._goal_reply(chat_uid, "Only this agent's owner can set or clear its goal.")
             return
         if action == "clear":
             if goal is None:
-                await self.send(chat_uid, _goal_status_line(None))
+                await self._goal_reply(chat_uid, _goal_status_line(None))
                 return
             # Raising for the same reason `set` does: the command stays
             # uncheckpointed, so the delivery retry re-runs it rather than
@@ -1215,6 +1215,16 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.warning("[plow_chat] goal notice to %s failed: %s", chat_uid, exc)
             return False
         return bool(getattr(result, "success", False))
+
+    async def _goal_reply(self, chat_uid, text):
+        """A direct answer to `/goal`.
+
+        Raising leaves the command uncheckpointed so the delivery retry re-runs
+        it: someone who asked for status and got silence is owed the retry, not
+        an acknowledgement that the question was handled.
+        """
+        if not await self._goal_say(chat_uid, text):
+            raise RuntimeError(f"goal reply was not delivered to {chat_uid}")
 
     def _goal_note_reply(self, chat_id, body):
         """Record what the agent said, on the TURN rather than the chat.

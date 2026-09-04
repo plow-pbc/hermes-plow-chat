@@ -4305,3 +4305,22 @@ async def test_a_room_holding_a_peer_agent_is_never_a_dm(
     await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
 
     assert handled[0]["source"]["role_authorized"] is False
+
+
+@pytest.mark.parametrize(
+    ("command", "role"),
+    [("/goal", "owner"), ("/goal book it", "member"), ("/goal clear", "owner")],
+    ids=["status", "denied", "nothing_to_clear"],
+)
+async def test_a_direct_goal_reply_that_does_not_land_is_not_acknowledged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str, role: str,
+) -> None:
+    """Checkpointing a command whose answer never arrived tells the user it was
+    handled and removes the retry that would have delivered it. Someone who
+    asked for status and got silence is owed the retry."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
+
+    with pytest.raises(RuntimeError):
+        await adapter._goal_command("cht_a", command, role, None, "msg_cmd")
