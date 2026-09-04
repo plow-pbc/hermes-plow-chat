@@ -1832,6 +1832,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         roster = self._chats[chat_uid]
         text = "\n\n".join(text for _urls, _kinds, text in resolved if text) or "(attachment)"
         goal = _goal_load(chat_uid)
+        # The speaker's own words, kept before any prefix is prepended: the
+        # roster context names THIS agent, so testing the prefixed text for
+        # our own name would read every peer message as addressed to us.
+        spoken = text
         # `/goal` is ours to claim before the hand-off: every `/...` routes to
         # hermes' own slash router, which has never heard of it.
         if burst[0].starts_slash_command and _goal_parse_command(text):
@@ -1862,7 +1866,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
         # that capability is never ambient.
-        if _goal_peer_should_stay_silent(sender, roster, text, goal):
+        if _goal_peer_should_stay_silent(sender, roster, spoken, goal):
             channel_prompt = f"{_GOAL_PEER_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
