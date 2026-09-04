@@ -1150,13 +1150,21 @@ class PlowChatAdapter(BasePlatformAdapter):
                     current = _goal_load(chat_uid)
                     if not current or current.get("status") != GOAL_ACTIVE:
                         return
-                    if not await self._goal_announce(chat_uid, reason, "no attempts left"):
-                        log.warning("[plow_chat] goal %s notice undelivered for %s; retrying",
-                                    reason, chat_uid)
-                        fired += 1
-                        continue
-                    _goal_save(chat_uid, _goal_retire(current, reason))
-                return
+                    delivered = await self._goal_announce(chat_uid, reason, "no attempts left")
+                    if delivered:
+                        _goal_save(chat_uid, _goal_retire(current, reason))
+                if delivered:
+                    return
+                # Paced, and the sleep belongs HERE rather than at the top of
+                # the loop: an exhausted goal recomputes the same reason before
+                # ever reaching the cadence sleep below, so retrying without one
+                # hammers send as fast as it can fail. Outside the lock, so a
+                # stuck notice does not hold every other turn for this chat.
+                log.warning("[plow_chat] goal %s notice undelivered for %s; retrying",
+                            reason, chat_uid)
+                fired += 1
+                await asyncio.sleep(_goal_wake_delay(fired))
+                continue
             fired += 1
             try:
                 await self._goal_fire(chat_uid, goal)

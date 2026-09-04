@@ -3944,3 +3944,26 @@ async def test_a_retired_goal_keeps_no_transcript(
     record = module._goal_load("cht_a")
     assert record["status"] == "met"
     assert "history" not in record
+
+
+async def test_an_undeliverable_expiry_notice_retries_on_the_backoff_not_in_a_tight_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The exhaustion branch re-enters the loop above the cadence sleep, so a
+    persistently refused notice would otherwise hammer send as fast as it fails."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    expired = module._goal_new("book the campsite")
+    expired["expires_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    module._goal_save("cht_a", expired)
+    sent = mock.AsyncMock(return_value=_SendResult(success=False))
+    monkeypatch.setattr(adapter, "send", sent)
+
+    task = asyncio.create_task(adapter._goal_wake("cht_a"))
+    await asyncio.sleep(0.05)            # ample for an unpaced loop to run away
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert sent.await_count == 1, "a refused notice waits out the backoff before retrying"
+    assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE
