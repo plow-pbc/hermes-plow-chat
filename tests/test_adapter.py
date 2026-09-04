@@ -3724,18 +3724,41 @@ def test_mirror_sent_reports_a_failure_loudly(
     assert "cht_target" in caplog.text and "not mirrored" in caplog.text
 
 
-def test_plow_send_message_sends_through_the_live_adapter_and_mirrors(
+def test_plow_send_message_sends_through_the_live_adapter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "send",
                result=_SendResult(success=True, message_id="msg_1"), record=sent)
-    calls = _stub_mirror(monkeypatch)
     out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": " 1. A\n2. B "}))
-    assert out == {"success": True, "chat_id": "cht_other", "message_id": "msg_1", "mirrored": True}
+    assert out == {"success": True, "chat_id": "cht_other", "message_id": "msg_1"}
     assert sent == [("cht_other", "1. A\n2. B")]
-    assert [c["chat_id"] for c in calls] == ["cht_other"]
+
+
+@pytest.mark.parametrize("turn, target, mirrored", [
+    ({"chat_uid": "cht_a", "owner": True}, "cht_b", ["cht_b"]),
+    ({"chat_uid": "cht_a", "owner": True}, "cht_a", []),
+    (None, "cht_b", []),
+], ids=["cross-chat", "own-chat", "no-turn"])
+async def test_send_mirrors_exactly_a_turns_message_to_another_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None, target: str, mirrored: list[str],
+) -> None:
+    """Recording rides the delivery: a turn's message to another chat is
+    mirrored there once the POST succeeds, on the same coroutine, so a tool
+    that stopped waiting cannot strand it. A reply to the turn's own chat is
+    already that chat's assistant turn, and a turn-less (cron) delivery is
+    mirrored by Hermes itself -- neither is recorded twice."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
+    calls = _stub_mirror(monkeypatch)
+    adapter._active_turn.set(turn)
+    result = await adapter.send(target, "the three addresses")
+    assert result.success and result.message_id == "msg_sent"
+    assert [(c["chat_id"], c["text"]) for c in calls] == [(uid, "the three addresses") for uid in mirrored]
 
 
 def test_plow_send_message_reports_the_adapter_refusal_and_mirrors_nothing(
@@ -3784,19 +3807,6 @@ def test_plow_send_message_reports_a_lost_answer_as_delivery_unknown(
     assert out["success"] is False and out["delivery_unknown"] is True
     assert "Do NOT retry" in out["error"]
     assert calls == []
-
-
-def test_start_group_message_mirrors_the_opener_into_the_new_chat(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_new", "message_id": "msg_9", "adoption": "adopted"})
-    calls = _stub_mirror(monkeypatch)
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hello there", "dry_run": False, "confirm": True}))
-    assert out["success"] is True and out["mirrored"] is True
-    assert [(c["chat_id"], c["text"]) for c in calls] == [("cht_new", "hello there")]
 
 
 def test_reply_target_prompt_names_the_send_tool(

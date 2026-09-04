@@ -123,15 +123,20 @@ rather than guessing a trust state.
 Hermes keeps one session per chat, and this adapter drops the echo of the
 agent's own sends. So a message the agent posts to chat B from a turn in chat
 A is invisible to chat B's next turn unless it is recorded there. The
-`plow_send_message` tool is the one sanctioned way to post cross-chat: it sends
-through the live adapter (the grant and member-turn confinement apply exactly
-as for a reply) and then mirrors the text into chat B's session as an
-assistant turn, with upstream's `gateway.mirror` — the same mechanism Hermes
-uses for cron and `hermes send` deliveries. `plow_start_group_message` mirrors
-the opener the same way and reports `mirrored: false` when the new thread has
-no session yet, which is the normal first-send case. Posting to the Plow API
-directly from a script bypasses all of this and leaves the target chat
-amnesiac; the tool exists so the model never has to.
+`plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
+through the adapter's `send()` like every other outbound message (the grant
+and member-turn confinement apply exactly as for a reply). Recording lives in
+that same `send()`: when a turn's message lands in a chat other than the
+turn's own, the adapter mirrors the text into that chat's session as an
+assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
+for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
+caller that stopped waiting cannot strand a delivered message unrecorded. A
+chat's session is born on its first inbound message, so a chat that has never
+spoken has nowhere to record to: the adapter logs a warning and that chat
+will not remember the send, and a thread `plow_start_group_message` just
+opened is always in that state. Posting to the Plow API directly from a
+script bypasses all of this and leaves the target chat amnesiac; the tool
+exists so the model never has to.
 
 ### What a group thread is called
 

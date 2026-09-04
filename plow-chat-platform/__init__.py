@@ -868,7 +868,15 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # sees must not eat the "working" signal either.
                     log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
                     return SendResult(success=True)
-            return await self._post_message(http, chat_id, {"body": body})
+            result = await self._post_message(http, chat_id, {"body": body})
+        if result.success and turn is not None and chat_id != turn["chat_uid"]:
+            # A turn speaking in another chat: record it where it landed, on
+            # the delivery's own coroutine, so a caller that stopped waiting
+            # cannot strand a delivered message unmirrored. A turn's reply to
+            # its own chat is already that chat's assistant turn, and a
+            # turn-less (cron) delivery is mirrored by Hermes itself.
+            await asyncio.to_thread(_mirror_sent, chat_id, body)
+        return result
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.
@@ -1591,6 +1599,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._checkpoint(burst[-1].uid, chat_uid)
 
 
+def _lost_answer(exc):
+    """The tool result for a send that got no answer. A timeout or dropped
+    connection says nothing about whether Plow committed the POST, so an
+    ordinary failure would invite a retry that sends the message twice to
+    real phones. Name the ambiguity and forbid the retry."""
+    return json.dumps({
+        "success": False,
+        "delivery_unknown": True,
+        "error": f"{exc} — the request failed without a response, so the message "
+                 f"may or may not have been sent. Do NOT retry; check the thread.",
+    })
+
+
 def _mirror_sent(chat_uid, body):
     """Record a message this agent just posted to `chat_uid` in that chat's
     own Hermes session, as the assistant turn it is.
@@ -1764,17 +1785,8 @@ def _plow_start_group_message(args, **_kwargs):
         return json.dumps({"success": False,
                            "error": f"could not resolve this agent's line ({exc}); "
                                     "nothing was sent"})
-    except Exception as exc:
-        # No answer. A timeout or dropped connection says nothing about whether
-        # Plow committed the POST, so reporting an ordinary failure invites a
-        # retry that sends the approved message twice to real phones. Name the
-        # ambiguity instead and refuse to imply it is safe to try again.
-        return json.dumps({
-            "success": False,
-            "delivery_unknown": True,
-            "error": f"{exc} — the request failed without a response, so the message "
-                     f"may or may not have been sent. Do NOT retry; check the thread.",
-        })
+    except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
+        return _lost_answer(exc)
     # Reported rather than assumed: a thread nobody is listening to is the bug this
     # tool shipped with, so delivery must not read as reachability.
     return json.dumps({
@@ -1783,10 +1795,6 @@ def _plow_start_group_message(args, **_kwargs):
         "created": data.get("created"),
         "trusted": data.get("trusted"),
         "adoption": data.get("adoption"),
-        # Usually False: the thread's session is born on its first inbound
-        # message, after this send. Reported, not hidden, so a later reader
-        # of the tool result knows the opener is not in that chat's history.
-        "mirrored": _mirror_sent(data["chat_id"], body),
     })
 
 
@@ -1910,29 +1918,21 @@ def _plow_send_message(args, **_kwargs):
     try:
         result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
     except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
-        # A timeout or dropped connection says nothing about whether Plow
-        # committed the POST; an ordinary failure would invite a resend.
-        return json.dumps({
-            "success": False,
-            "delivery_unknown": True,
-            "error": f"{exc} — the request failed without a response, so the message "
-                     f"may or may not have been sent. Do NOT retry; check the thread.",
-        })
+        return _lost_answer(exc)
     if not result.success:
         return json.dumps({"success": False, "error": result.error})
-    return json.dumps({"success": True, "chat_id": chat_id,
-                       "message_id": result.message_id, "mirrored": _mirror_sent(chat_id, body)})
+    return json.dumps({"success": True, "chat_id": chat_id, "message_id": result.message_id})
 
 
 PLOW_SEND_MESSAGE_SCHEMA = {
     "name": "plow_send_message",
     "description": (
         "Post a message into another Plow chat this agent is already in, by its "
-        "cht_ id (the roster and channel list carry the ids). The message is "
-        "recorded in that chat's own history so its next turn remembers what "
-        "you said there. Refused outside the grant and, on a member's turn, "
-        "for any chat but the current one. Your reply to the CURRENT chat "
-        "needs no tool."
+        "cht_ id (the roster and channel list carry the ids). A chat that has "
+        "ever spoken to you remembers the message in its own history; a chat "
+        "that has never sent anything has no history yet and will not. Refused "
+        "outside the grant and, on a member's turn, for any chat but the "
+        "current one. Your reply to the CURRENT chat needs no tool."
     ),
     "parameters": {
         "type": "object",
