@@ -2158,6 +2158,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "chat_uid": "cht_b",
         "owner": False,
         "dm": False,
+        "trusted": False,
         "no_reply_ok": False,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -2245,8 +2246,8 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
-             "source_message_id": "msg_delight_1"},
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "trusted": False,
+             "no_reply_ok": False, "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
         pytest.param(
@@ -3628,6 +3629,22 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
         turn = adapter._active_turn.get()
         assert turn["no_reply_ok"] is expected
         await adapter.on_processing_complete(event, None)
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_the_active_turn_carries_the_rooms_trust_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats["cht_room"] = {"uid": "cht_room", "trusted": trusted, "participants": []}
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="cht_room", role_authorized=False, chat_type="group", user_id="cp_m"),
+        message_id="msg_1", channel_prompt="",
+    )
+    await adapter.on_processing_start(event)
+    assert module._ACTIVE_TURN.get()["trusted"] is trusted
+    await adapter.on_processing_complete(event, None)
 
 
 def test_every_silence_instruction_names_the_sentinel(

@@ -791,6 +791,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
             "dm": event.source.chat_type == "dm",
+            "trusted": bool(self._chats.get(chat_uid, {}).get("trusted")),
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
