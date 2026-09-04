@@ -311,3 +311,48 @@ directory inside its home.
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 The Plow Collective, Inc.
 
 "Plow" and the Plow logo are trademarks of The Plow Collective, Inc. The license grants no trademark rights.
+
+## Ordered owner-DM delivery
+
+`plow_send_sequence` sends a bounded sequence to the active turn's solo owner
+DM. It accepts no destination or file path. Example tool arguments:
+
+```json
+{"items":[{"type":"text","body":"Here are the previews."},{"type":"photos","asset_ids":["preview_a","preview_b","preview_c","preview_d"]},{"type":"pause","seconds":4},{"type":"text","body":"What do you think?"}]}
+```
+
+The variant image supplies `/srv/plow-assets/manifest.json`:
+
+```json
+{"version":1,"assets":{"preview_a":"preview-a.png","preview_b":"preview-b.png","preview_c":"preview-c.png","preview_d":"preview-d.png"}}
+```
+
+The manifest, image files and directories through `/` must be root-owned and
+not group/world writable. Symlinks and paths outside the asset directory are
+refused. Supported images are PNG, JPEG, GIF and WebP, at most 8 MiB each. The
+plugin validates and reads every selected asset before any delivery. Assets
+are variant-owned; this plugin ships no manifest or life-specific IDs.
+
+Limits: 24 items, 4 photos per item, 16 photos / 32 MiB total, 4,000 characters
+per text / 24,000 total, and 60 seconds of total pacing. Pauses accept finite
+numbers from 0 to 15 seconds. Adjacent deliveries have a one-second gap; an
+explicit pause replaces that gap, including a zero-second pause. Operations
+serialize per chat and have a 180-second deadline, including queueing. Ending
+the turn or disconnecting cancels its outstanding sequences. Existing turn
+typing continues through pauses and is rearmed by delivered messages.
+
+The receipt contains `success`, `completed`, and `failure`. Every completed item
+has its zero-based `index`, `type`, and `message_ids` (empty for a pause). A
+failure names the first unresolved `index`, a `status` (`rejected`, `failed`, or
+`delivery_unknown`) and an error. When a four-photo stack is explicitly
+rejected with HTTP 422, the tool may send individual photos using the existing
+uploads. If that fallback stops partway, `failure.message_ids` preserves the
+confirmed sends and `failure.photo_index` identifies the unresolved photo.
+Timeouts, 5xx responses and malformed successful POST responses are delivery
+unknown: they never trigger fallback or automatic replay. Inspect chat history
+before sending any remaining items; never replay the entire sequence blindly.
+
+Tool arguments and receipts stay in the agent's ordinary tool-call history.
+Successful tool delivery already sent the copy: the caller should not repeat
+it in the final reply. The tool does not suppress unrelated replies, change
+ordinary `send()`/`MEDIA:` behavior, or interpret in-band markers.
