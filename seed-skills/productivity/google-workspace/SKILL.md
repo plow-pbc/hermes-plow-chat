@@ -33,6 +33,9 @@ Mac-managed instances):
    in their direct chat. Any other command may show the owner an
    approval card on their Mac; if it hangs, it is waiting there, and
    a refusal there is a denial on the Mac.
-3. If no MCP server with `plow_*` tools is connected, or it lists no
-   `google-workspace` skill, Google is not available to this agent.
-   Say exactly that — do not fall back to local OAuth.
+3. If a connected MCP server lists no `google-workspace` skill, Google is
+   not available to this agent. Say exactly that — do not fall back to
+   local OAuth. If no MCP server with `plow_*` tools is connected at all,
+   that is not the same thing: Latch is unreachable, so say the owner's Mac
+   has to be awake with Latch running. Do not fall back to local OAuth in
+   either case.
