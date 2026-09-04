@@ -1994,21 +1994,30 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        pytest.param(None, "could not confirm the write", id="timeout-unconfirmed"),
+        pytest.param(422, "Plow declined", id="4xx-declined"),
+        pytest.param(503, "could not confirm the write", id="5xx-unconfirmed"),
+    ],
+)
 def test_naming_reports_unconfirmed_write_on_network_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int | None, expected: str,
 ) -> None:
-    """A timeout or dropped connection says nothing about whether the PUT
-    landed, so it must not read back as an ordinary, retry-worthy failure --
-    same shape as the sibling network tools' broad except Exception."""
+    """A timeout, a dropped connection, or a 5xx all say nothing about whether
+    the PUT landed, so none reads back as an ordinary, retry-worthy failure --
+    only a 4xx is Plow itself definitively declining."""
     module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "name_contact", raises=TimeoutError("no response"))
+    raises = TimeoutError("no response") if status is None else module._PlowSendError(status, "detail")
+    _live_tool(module, monkeypatch, "name_contact", raises=raises)
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "text": "that's Abby"})
 
     out = json.loads(module._plow_name_contact(
         {"participant_id": "cp_abby", "owner_words": "that's Abby", "display_name": "Abby"}))
 
     assert out["success"] is False
-    assert "could not confirm the write" in out["error"]
+    assert expected in out["error"]
 
 
 async def test_name_contact_percent_encodes_the_participant_id_path_segment(

@@ -1864,6 +1864,12 @@ def _plow_name_contact(args, **_kwargs):
             adapter.name_contact(turn["chat_uid"], args.get("participant_id") or "", body),
             loop).result(timeout=30)
     except _PlowSendError as exc:
+        if exc.status >= 500:
+            return json.dumps({
+                "success": False,
+                "error": f"could not confirm the write ({exc.status}); nothing may have been "
+                         "recorded; retrying is safe",
+            })
         return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed write as success
         return json.dumps({
