@@ -144,6 +144,16 @@ In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
 in the untrusted roster context above, never in the prompt.
 
+The owner may also tell the agent what to call a roster member and who that
+person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
+which `PUT`s `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`. The
+tool writes only from the owner's own turn; it refuses outright during a
+member's turn, so nothing a member says about themselves, however phrased,
+becomes a label. A relationship renders as `Name (relationship)` in the
+untrusted roster context above, never in the channel prompt, which instead
+states generically that a roster relationship is the owner's own assertion and
+that a member's claim about who they are is just that — a claim.
+
 ## Media
 
 Inbound photos, audio, video and documents arrive on `MessageEvent.media_urls`

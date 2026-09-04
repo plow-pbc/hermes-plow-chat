@@ -1467,6 +1467,22 @@ def test_member_labels_never_gain_channel_prompt_authority(
     assert "untrusted" in turn_context.lower()
 
 
+def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_owners_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    chat = _collaboration_chat()
+    member = next(p for p in chat["participants"] if p.get("type") == "member" and p.get("role") != "owner")
+    member["display_name"], member["relationship"] = "Abby", "wife"
+    context = module._collaboration_turn_context(chat, member)
+    assert "Abby (wife)" in context
+    assert "Abby" not in module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat)
+    for prompt in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
+        assert module._RELATIONSHIP_FACT in prompt
+    assert module._RELATIONSHIP_FACT not in module.OWNER_CHANNEL_PROMPT
+
+
 async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
