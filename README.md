@@ -36,6 +36,38 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
 > available fails loudly instead of silently skipping delivery.
 
+## Where changes go
+
+This repo is one of several that assemble a Plow agent. The map of which repo
+owns what is in
+[`plow-hermes-agent` README § The repos](https://github.com/plow-pbc/plow-hermes-agent#the-repos);
+read it before a change that touches a neighbour. The test is **who else would
+have to change if this fact changed** — if the answer is a sibling, the change
+belongs there; this repo only follows, by bumping its pin if it holds one.
+
+Not here:
+
+- The `plow-gog` argv grammar, and what a Latch tool says about itself —
+  [`plow-pbc/latch`](https://github.com/plow-pbc/latch) vendors the binary,
+  pins its version, and owns the only bump checklist.
+- Per-chat state the owner sets or clears — trust, contact labels, anything
+  keyed by a `cht_` id — [`plow-pbc/plow`](https://github.com/plow-pbc/plow).
+  A file written under `$HERMES_HOME` instead is invisible to the dashboard
+  and to support.
+- Boot, `plow-init`, the gateway config seed, and the base persona —
+  [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+  which pins this plugin rather than being configured by it.
+
+Examples:
+
+- Adheres: #61 deleted `_invite_message_template` — the `$100 in cloud credits`
+  line and the activation-code placeholders — so plow composes the whole invite,
+  net −32 LOC: https://github.com/plow-pbc/hermes-plow-chat/pull/61
+- Violates: #64 put ~110 lines of `plow-gog` verb tables, flag parsing and an
+  explicit re-implementation of latch's `isHelpInvocation` in this plugin — a
+  second copy latch's pin-bump checklist does not know about:
+  https://github.com/plow-pbc/hermes-plow-chat/pull/64
+
 ## Who consumes this
 
 [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
