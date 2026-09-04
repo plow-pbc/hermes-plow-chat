@@ -23,10 +23,13 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
-> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`, and
+> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
-> `agent-mgr` SHA advance). Hermes hosts
+> `agent-mgr` SHA advance), and
+> `PATCH /v1/chats/{chat_uid}/participants/{participant_uid}/contact`
+> (`plow_chat_name_contact` — [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
+> "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
 > then land the `agent-mgr` support above, and only then bump
@@ -115,6 +118,29 @@ chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
 older API the per-message refresh fails loudly and the chat waits for retry
 rather than guessing a trust state.
 
+### Speaking in another chat
+
+Hermes keeps one session per chat, and this adapter drops the echo of the
+agent's own sends. So a message the agent posts to chat B from a turn in chat
+A is invisible to chat B's next turn unless it is recorded there. The
+`plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
+through the adapter's `send()` like every other outbound message (the grant
+and member-turn confinement apply exactly as for a reply). Recording lives in
+that same `send()`: when a turn's message lands in a chat other than the
+turn's own, the adapter mirrors the text into that chat's session as an
+assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
+for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
+caller that stopped waiting cannot strand a delivered message unrecorded. A
+chat's session is born on its first inbound message, so a chat that has never
+spoken has nowhere to record to: the adapter logs a warning and that chat
+will not remember the send. A thread `plow_start_group_message` created is
+in that state; one it resumed is handled like any other cross-chat send,
+which records the opener only where a session already exists (a thread
+resumed before anyone replied has none, and logs the same warning). Posting
+to the Plow API directly from a
+script bypasses all of this and leaves the target chat amnesiac; the tool
+exists so the model never has to.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from
@@ -171,6 +197,17 @@ the room's ordinary disclosure prompt and take owner authority only in a DM.
 In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
 in the untrusted roster context above, never in the prompt.
+
+The owner may also tell the agent what to call a roster member and who that
+person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
+which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
+The tool is owner-turn-authorized only; it refuses outright during a member's
+turn and outside any active turn at all — a direct call cannot write a label
+except on the owner's own turn. A relationship renders as
+`Name [uid] (relationship)` in the untrusted roster context above, never in
+the channel prompt, which instead states generically that a roster
+relationship is a label recorded on the owner's turn, and that a member's
+claim about who they are is just that — a claim.
 
 ## Media
 
