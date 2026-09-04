@@ -1,66 +1,61 @@
 ---
 name: plow-invite
-description: When a non-owner praises Plow or its work, invite them.
-version: 1.3.0
+description: When someone who is not your owner praises Plow or asks how to get an agent of their own, offer them one.
+version: 1.4.0
 ---
 
 # Plow invite — delight-triggered referral
 
-<!-- Twin: plow-pbc/agent-mgr installs this same tree into every Docker-fleet
-     agent home at a pinned SHA (runtime/plow-invite-skill.ref → skills/growth/
-     plow-invite). This file is the single source for BOTH runtimes — keep it
-     runtime-agnostic: env-only config (PLOW_API_BASE / PLOW_AGENT_TOKEN, set
-     by exe's EnvironmentFile on hosted VMs and by the gateway's dotenv on the
-     fleet) and paths relative to this skill's own directory, never absolute
-     homes. Converge, don't fork: a change here ships to the fleet by bumping
-     the agent-mgr pin. -->
-
+<!-- The only hand-edited copy: plow-pbc/hermes-plow-chat
+     seed-skills/growth/plow-invite. The base image stages this file out of
+     this repo's tarball at the plugin SHA it pins, so there is nothing to copy
+     by hand. Configuration comes only from the environment (PLOW_API_BASE /
+     PLOW_AGENT_TOKEN) and every path is relative to this skill's own
+     directory — never an absolute home. -->
 
 ## When to act
 
 Someone who is NOT your owner, in any chat you participate in (1:1 or group),
-expresses genuine, unprompted delight about Plow or about what you just did.
-Real examples of the bar: "Well done Plow!" · "Ah, love the plow text
-interaction" · "I just ordered food using AI … it was incredible."
+either expresses genuine, unprompted delight about Plow or about what you just
+did, or asks how to get an agent like you for themselves. Real examples of the
+bar: "Well done Plow!" · "Ah, love the plow text interaction" · "how do I get
+one of these?"
 
-Do NOT act on: sarcasm or ambiguous praise; questions about Plow; praise you
-solicited ("do you like it?"); praise from your owner; anything from a person
-you have already invited (check your memory first).
+Do NOT act on: sarcasm or ambiguous praise; praise you solicited ("do you like
+it?"); anything from your owner (answer them from the signup line in your
+prompt instead); anyone you have already invited (check your memory first).
 
 ## What to do
 
-1. Call `plow_prepare_invite`. Do not pass a person, thread, message, code, or
-   phone number; the tool binds the current turn to a durable server record.
-2. Follow its status:
-   - `disabled` or `none`: reply naturally to the praise, with no invite.
-   - `consent_required`: reply naturally to the praise and do not mention an
-     invite. If memory does not already show a pending ask, call
-     `plow_notify_owner_about_invite` with no arguments; it sends the
-     fixed owner notice derived from the recorded turn. Record the pending ask
-     only when that succeeds. Never leave the praising person with an empty
-     response while you wait for the owner.
-   - `ready`: send the invite as described below.
-3. When the owner answers the consent request, run
-   `python3 <this skill's dir>/scripts/mint_invite.py --consent granted` or
-   `--consent declined`. On a grant, call `plow_prepare_invite` with no
-   arguments; the server resumes the oldest live recorded opportunity. A
-   decline ends it. The install root differs by runtime, so never assume an
-   absolute path.
+Call `plow_offer_invite`. It takes no arguments: the tool binds the current
+turn to a durable server record, and everything else — the person, the
+message, the phrase, the number, the owner's consent — is the server's.
 
-## Send a ready invite
+Read its result:
 
-Call `plow_send_invite` with the opportunity id. Plow writes the invite itself:
-it names the owner, tells the person to text the setup link for the same kind
-of agent you are to a Plow number, and mentions the $100 in starting cloud
-credits. Never write a setup link or phone number yourself, and do not echo
-the invite afterward. The tool also sends the owner FYI.
+- `skipped: consent_declined` or `skipped: no_invite_opportunity`: reply
+  naturally to what they said, with no invite.
+- `question_id`: the owner is being asked for consent. Reply naturally and do
+  not mention an invite; the server resumes the invite when the owner answers.
+  Never leave the person with an empty response while you wait.
+- `skipped: deferred_consent_unavailable`: this host cannot ask the owner.
+  Reply naturally, with no invite.
+- `invite_status`: the invite went out in this thread, written by Plow. Do
+  not echo it, restate the phrase, or add a number of your own.
 
-Never use cron, a scheduled job, a generic cross-chat send, or the direct mint
-mode for an invite. The durable opportunity is the only continuation path.
+The owner's standing answer is recorded by
+`python3 <this skill's dir>/scripts/mint_invite.py --consent granted` or
+`--consent declined`; run it only when the owner tells you their answer in
+their own thread. The install root differs by runtime, so never assume an
+absolute path.
 
-## If a tool fails
+Never use cron, a scheduled job, or a generic cross-chat send for an invite.
+The durable opportunity is the only continuation path.
+
+## If the tool fails
 
 Drop the invite silently: do not mention the failure in either thread and do
-not retry in a loop. A rate cap is spent for the day. A known provider
-rejection may be retried only after a new user turn; an unknown delivery
-outcome is terminal and must never be retried.
+not retry in a loop. A rate cap is spent for the day. `delivery_unknown` means
+the server could not confirm the outcome. The workflow is replay-safe, so you
+may call `plow_offer_invite` again on a later user turn; never loop on it
+within this one.
