@@ -1601,10 +1601,20 @@ def _mirror_sent(chat_uid, body):
     amnesia that answered "I didn't give numbered options" to a reply to a
     list this agent had posted. Same mechanism as upstream's cron and
     `hermes send` deliveries (tools/send_message_tool.py); assistant role
-    because the text is genuinely the agent speaking."""
-    from gateway.mirror import mirror_to_session  # in-process with Hermes
-    mirrored = mirror_to_session(PLATFORM_NAME, chat_uid, body,
-                                 source_label=PLATFORM_NAME, role="assistant")
+    because the text is genuinely the agent speaking.
+
+    Best-effort: the send already succeeded, so a mirror failure here must
+    never propagate and turn a delivered message into a reported failure --
+    that would risk a resend and a duplicate. Every caller (this tool and,
+    from Task 3, `_plow_start_group_message`) inherits the guard from here."""
+    try:
+        from gateway.mirror import mirror_to_session  # in-process with Hermes
+        mirrored = mirror_to_session(PLATFORM_NAME, chat_uid, body,
+                                     source_label=PLATFORM_NAME, role="assistant")
+    except Exception as exc:  # noqa: BLE001 - best effort, see docstring
+        log.warning("[plow_chat] message to %s was sent but not mirrored: %s",
+                    chat_uid, exc, exc_info=True)
+        return False
     if not mirrored:
         log.warning("[plow_chat] message to %s was sent but not mirrored: "
                     "no live session owns that chat yet", chat_uid)

@@ -3671,13 +3671,17 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     assert "not your owner" in text
 
 
-def _stub_mirror(monkeypatch: pytest.MonkeyPatch, *, result: bool = True) -> list[dict[str, Any]]:
+def _stub_mirror(
+    monkeypatch: pytest.MonkeyPatch, *, result: bool = True, raises: Exception | None = None
+) -> list[dict[str, Any]]:
     """Install a fake gateway.mirror and return the list of calls it saw."""
     calls: list[dict[str, Any]] = []
     mirror = types.ModuleType("gateway.mirror")
 
     def mirror_to_session(platform: str, chat_id: str, message_text: str, **kw: Any) -> bool:
         calls.append({"platform": platform, "chat_id": chat_id, "text": message_text, **kw})
+        if raises is not None:
+            raise raises
         return result
 
     mirror.mirror_to_session = mirror_to_session  # type: ignore[attr-defined]
@@ -3703,6 +3707,19 @@ def test_mirror_sent_reports_a_missing_target_session_loudly(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_mirror(monkeypatch, result=False)
+    with caplog.at_level(logging.WARNING):
+        assert module._mirror_sent("cht_target", "hello") is False
+    assert "cht_target" in caplog.text and "not mirrored" in caplog.text
+
+
+def test_mirror_sent_survives_a_mirror_exception_without_propagating_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The send it records already succeeded; a broken mirror must report
+    False, never raise -- raising would surface a delivered message as a
+    failed tool call and risk a resend."""
+    module = _load(monkeypatch, tmp_path)
+    _stub_mirror(monkeypatch, raises=RuntimeError("db locked"))
     with caplog.at_level(logging.WARNING):
         assert module._mirror_sent("cht_target", "hello") is False
     assert "cht_target" in caplog.text and "not mirrored" in caplog.text
