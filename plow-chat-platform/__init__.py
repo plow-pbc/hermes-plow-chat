@@ -14,6 +14,7 @@ import logging
 import mimetypes
 import os
 import pathlib
+import re
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
@@ -1616,6 +1617,21 @@ def _lost_answer(exc):
         "error": f"{exc} — the request failed without a response, so the message "
                  f"may or may not have been sent. Do NOT retry; check the thread.",
     })
+
+
+_RECALL_TOKEN = re.compile(r"[a-z0-9]{4,}")
+
+
+def _recall_query(text):
+    """An FTS5 OR-query from the words of the turn's own message.
+
+    The turn text opens with the roster prefix and speaker label, separated
+    from the message by a blank line, so only the last paragraph is read.
+    OR, not FTS5's default AND: a strict conjunction of every word in a
+    sentence matches nothing, which is why session_search's phrase queries
+    return zero sessions for topics the store plainly holds."""
+    words = _RECALL_TOKEN.findall(text.rsplit("\n\n", 1)[-1].lower())
+    return " OR ".join(list(dict.fromkeys(words))[:8])
 
 
 def _mirror_sent(chat_uid, body):

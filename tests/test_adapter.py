@@ -3728,6 +3728,21 @@ def _stub_mirror(
     return calls
 
 
+@pytest.mark.parametrize("text, query", [
+    ("[roster stuff]\n\nSend Camilo a milkshake to the Guerrero address",
+     "send OR camilo OR milkshake OR guerrero OR address"),
+    ("[roster]\n\n1", ""),
+    ("one two two three three three four", "three OR four"),
+    ("a " * 3 + " ".join(f"word{i}" for i in range(12)),
+     " OR ".join(f"word{i}" for i in range(8))),
+])
+def test_recall_query_is_an_or_query_over_the_turns_own_words(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, text: str, query: str
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    assert module._recall_query(text) == query
+
+
 def test_mirror_sent_appends_an_assistant_turn_to_the_target_chat(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
