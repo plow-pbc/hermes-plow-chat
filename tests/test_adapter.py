@@ -291,6 +291,13 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
             "trusted": trusted}
 
 
+def _voiced(module: Any, prompt: str) -> str:
+    """The exact non-solo-DM composition `_collaboration_prompt` applies, so
+    the prompt-matrix tests below don't hand-roll it out of sync with the
+    real code."""
+    return f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {prompt}"
+
+
 def _envelope(
     event_id: str,
     chat_id: str,
@@ -1107,11 +1114,11 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     # owner turn carries the shared-thread rules too — the room is the
     # boundary, not the asker.
     owner_prompt = handled[1]["channel_prompt"]
-    assert owner_prompt == module._VOICE_RULE + module.GROUP_OWNER_CHANNEL_PROMPT
+    assert owner_prompt == _voiced(module, module.GROUP_OWNER_CHANNEL_PROMPT)
     for block in (module._DISCLOSURE, module._NO_RELAY):
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
-    assert member_prompt == module._VOICE_RULE + module.EXTERNAL_CHANNEL_PROMPT
+    assert member_prompt == _voiced(module, module.EXTERNAL_CHANNEL_PROMPT)
     for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
         assert block in member_prompt
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
@@ -1251,7 +1258,7 @@ async def test_named_line_identity_prefixes_every_turn_prompt(
     (event,) = handled
     expected = getattr(module, base)
     if group:
-        expected = module._VOICE_RULE + expected
+        expected = _voiced(module, expected)
     if agent_name:
         expected = f"You are {agent_name}, a Plow assistant; people here address you by that name. {expected}"
     assert event["channel_prompt"] == expected
@@ -1292,8 +1299,9 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
 
     (event,) = handled
     base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
+    relationship_fact = f"{module._RELATIONSHIP_FACT} " if group else ""
     assert event["channel_prompt"] == (
-        f"You are Elm, a Plow assistant; people here address you by that name. {rule}{base}"
+        f"You are Elm, a Plow assistant; people here address you by that name. {rule}{relationship_fact}{base}"
     )
 
 
@@ -1326,7 +1334,7 @@ async def test_trust_selects_the_explicit_prompt_matrix(
 
     expected = getattr(module, prompt_name)
     if group:
-        expected = module._VOICE_RULE + expected
+        expected = _voiced(module, expected)
     assert handled[0]["channel_prompt"] == expected
 
     if trusted:
@@ -1477,14 +1485,19 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # example -- otherwise a leaked relationship would go uncaught below.
     member["display_name"], member["relationship"] = "Abby", "landlord"
     context = module._collaboration_turn_context(chat, member)
-    assert "Abby (landlord)" in context
+    assert "Abby [mem_daniel_cht_a] (landlord)" in context
     prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat)
     assert "Abby" not in prompt
     assert "landlord" not in prompt
-    for prompt in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
-        assert module._RELATIONSHIP_FACT in prompt
-    assert module._RELATIONSHIP_FACT not in module.OWNER_CHANNEL_PROMPT
+    # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
+    # _VOICE_RULE), not baked into the base prompt constants -- assert the
+    # composed prompt a real turn actually gets.
+    for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
+                 module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
+        assert module._RELATIONSHIP_FACT in module._collaboration_prompt(base, chat)
+    # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
+    # the composition a real turn produces -- not this group chat.
+    assert module._RELATIONSHIP_FACT not in module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat())
 
 
 async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
@@ -1509,7 +1522,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
 
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
-    assert handled[0]["channel_prompt"] == module._VOICE_RULE + module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT
+    assert handled[0]["channel_prompt"] == _voiced(module, module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT)
 
 
 async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
@@ -1943,7 +1956,10 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     """A member saying "I'm Sam's wife" cannot become a label: while their turn
     is open the tool cannot write, and neither can a call outside any active
     turn -- the gate fails closed, like plow_start_group_message's trusted
-    branch, not open. The owner saying it, on the owner's own turn, can."""
+    branch, not open. owner=True alone is not proof either -- a member can
+    leave text for the owner's NEXT turn to act on -- so an owner turn whose
+    message doesn't contain the quoted owner_words is refused too; only a
+    quote that is actually a substring of this turn's own message writes."""
     module = _load(monkeypatch, tmp_path)
     record: list[Any] = []
     _live_tool(
@@ -1954,18 +1970,25 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
         },
         record=record,
     )
-    args = {"participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+    args = {"participant_id": "cp_abby", "owner_words": "that's Abby, my wife",
+            "display_name": "Abby", "relationship": "wife"}
 
     outside = json.loads(module._plow_name_contact(dict(args)))
     assert outside["success"] is False and "owner" in outside["error"]
     assert record == []
 
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False, "text": args["owner_words"]})
     refused = json.loads(module._plow_name_contact(dict(args)))
     assert refused["success"] is False and "owner" in refused["error"]
     assert record == []
 
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "text": "just chatting about the weather"})
+    mismatched = json.loads(module._plow_name_contact(dict(args)))
+    assert mismatched["success"] is False and "owner_words" in mismatched["error"]
+    assert record == []
+
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True,
+                             "text": f"Sure -- {args['owner_words']}, been meaning to say."})
     out = json.loads(module._plow_name_contact(dict(args)))
     assert out["success"] is True
     assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
@@ -1979,12 +2002,30 @@ def test_naming_reports_unconfirmed_write_on_network_error(
     same shape as the sibling network tools' broad except Exception."""
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "name_contact", raises=TimeoutError("no response"))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "text": "that's Abby"})
 
-    out = json.loads(module._plow_name_contact({"participant_id": "cp_abby", "display_name": "Abby"}))
+    out = json.loads(module._plow_name_contact(
+        {"participant_id": "cp_abby", "owner_words": "that's Abby", "display_name": "Abby"}))
 
     assert out["success"] is False
     assert "could not confirm the write" in out["error"]
+
+
+async def test_name_contact_percent_encodes_the_participant_id_path_segment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """participant_id is model-supplied and lands in a bearer-authenticated
+    URL path -- percent-encode it as one segment so a value like "../.." walks
+    nothing but its own segment."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    http = _ChatResourceHTTP(_Resp({"uid": "cp_x"}))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    await adapter.name_contact("cht_a", "cp_x/../../etc", {"display_name": "Abby"})
+
+    assert http.calls[0][1] == f"{module.BASE}/v1/chats/cht_a/participants/cp_x%2F..%2F..%2Fetc/contact"
 
 
 def _invite_turn(**overrides: Any) -> dict[str, Any]:
@@ -2081,7 +2122,8 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "no_reply_ok": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False,
+             "text": "member praise that must not cross chats", "no_reply_ok": False,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -2094,7 +2136,8 @@ def test_invite_workflow_reports_delivery_failure(
                 "provider_key": "+17035550123",
             },
             "cp_taylor",
-            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY),
+            _invite_turn(participant_identity="Taylor Injected suffix", triggered_at=mock.ANY,
+                        text="member praise that must not cross chats"),
             id="normalized-name",
         ),
         pytest.param(
@@ -2110,6 +2153,7 @@ def test_invite_workflow_reports_delivery_failure(
                 participant_uid="cp_phone",
                 participant_identity="+17035550124",
                 triggered_at=mock.ANY,
+                text="member praise that must not cross chats",
             ),
             id="phone-fallback",
         ),
@@ -2136,7 +2180,7 @@ async def test_active_turn_retains_only_server_invite_identity(
             user_id=source_uid,
             user_name="attacker-controlled identity",
         ),
-        text="attacker-controlled praise must not cross chats",
+        text="member praise that must not cross chats",
     )
 
     await adapter.on_processing_start(event)
