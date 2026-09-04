@@ -2009,6 +2009,7 @@ def test_tools_register_with_optional_deferred_questions(
     module.register(ctx)
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
+        "plow_send_message",
         "plow_chat_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
@@ -2018,16 +2019,21 @@ def test_tools_register_with_optional_deferred_questions(
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    name_contact_tool = ctx.tools[1]
+    send_message_tool = ctx.tools[1]
+    assert send_message_tool["schema"]["name"] == "plow_send_message"
+    assert send_message_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert send_message_tool["check_fn"]()
+
+    name_contact_tool = ctx.tools[2]
     assert name_contact_tool["schema"]["name"] == "plow_chat_name_contact"
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert name_contact_tool["check_fn"]()
 
-    trust_tool = ctx.tools[2]
+    trust_tool = ctx.tools[3]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[3]
+    invite_tool = ctx.tools[4]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -3700,3 +3706,68 @@ def test_mirror_sent_reports_a_missing_target_session_loudly(
     with caplog.at_level(logging.WARNING):
         assert module._mirror_sent("cht_target", "hello") is False
     assert "cht_target" in caplog.text and "not mirrored" in caplog.text
+
+
+def test_plow_send_message_sends_through_the_live_adapter_and_mirrors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    sent: list[Any] = []
+    _live_tool(module, monkeypatch, "send",
+               result=_SendResult(success=True, message_id="msg_1"), record=sent)
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": " 1. A\n2. B "}))
+    assert out == {"success": True, "chat_id": "cht_other", "message_id": "msg_1", "mirrored": True}
+    assert sent == [("cht_other", "1. A\n2. B")]
+    assert [c["chat_id"] for c in calls] == ["cht_other"]
+
+
+def test_plow_send_message_reports_the_adapter_refusal_and_mirrors_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The adapter's _send_guard is the authority (grant + member-turn
+    confinement); the tool relays its refusal verbatim."""
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send",
+               result=_SendResult(success=False, error="Plow Chat member turn is confined to 'cht_here'"))
+    calls = _stub_mirror(monkeypatch)
+    out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": "hi"}))
+    assert out["success"] is False and "confined" in out["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("args", [{"chat_id": "", "body": "hi"}, {"chat_id": "cht_x", "body": "  "}])
+def test_plow_send_message_requires_chat_id_and_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, args: dict[str, Any]
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    _live_tool(module, monkeypatch, "send", raises=AssertionError("must not send"))
+    out = json.loads(module._plow_send_message(args))
+    assert out["success"] is False and "required" in out["error"]
+
+
+def test_plow_send_message_needs_the_live_gateway(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._live = None
+    out = json.loads(module._plow_send_message({"chat_id": "cht_x", "body": "hi"}))
+    assert out["success"] is False and "not connected" in out["error"]
+
+
+def test_plow_send_message_is_registered_on_the_platform_toolset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    registered: list[dict[str, Any]] = []
+    ctx = SimpleNamespace(
+        register_hook=lambda *a, **k: None,
+        register_platform=lambda **k: None,
+        register_system_prompt_section=lambda *a, **k: None,
+        register_tool=lambda **k: registered.append(k),
+    )
+    module.register(ctx)
+    tool = next(t for t in registered if t["name"] == "plow_send_message")
+    assert tool["toolset"] == module.PLATFORM_NAME
+    assert tool["handler"] is module._plow_send_message
+    assert tool["schema"]["parameters"]["required"] == ["chat_id", "body"]

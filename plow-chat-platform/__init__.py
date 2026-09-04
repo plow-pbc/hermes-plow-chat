@@ -1879,6 +1879,49 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     return {"action": "approve", "message": summary, "rule_key": f"google-send:{digest}"}
 
 
+def _plow_send_message(args, **_kwargs):
+    """Post to another granted chat and record it in that chat's session.
+
+    The adapter's send() is the authority on reach: outside the grant, or a
+    cross-chat send during a member's turn, comes back refused and is
+    relayed as-is. Nothing here is a second gate."""
+    chat_id = (args.get("chat_id") or "").strip()
+    body = (args.get("body") or "").strip()
+    if not chat_id or not body:
+        return json.dumps({"success": False, "error": "chat_id and body are required"})
+    if _live is None:
+        return json.dumps({"success": False,
+                           "error": "the Plow Chat gateway is not connected; nothing was sent"})
+    adapter, loop = _live
+    result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+    if not result.success:
+        return json.dumps({"success": False, "error": result.error})
+    return json.dumps({"success": True, "chat_id": chat_id,
+                       "message_id": result.message_id, "mirrored": _mirror_sent(chat_id, body)})
+
+
+PLOW_SEND_MESSAGE_SCHEMA = {
+    "name": "plow_send_message",
+    "description": (
+        "Post a message into another Plow chat this agent is already in, by its "
+        "cht_ id (the roster and channel list carry the ids). The message is "
+        "recorded in that chat's own history so its next turn remembers what "
+        "you said there. Refused outside the grant and, on a member's turn, "
+        "for any chat but the current one. Your reply to the CURRENT chat "
+        "needs no tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string", "description": "Target chat uid, cht_…"},
+            "body": {"type": "string", "description": "Message text to post."},
+        },
+        "required": ["chat_id", "body"],
+        "additionalProperties": False,
+    },
+}
+
+
 PLOW_START_GROUP_MESSAGE_SCHEMA = {
     "name": "plow_start_group_message",
     "description": (
@@ -2202,6 +2245,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_START_GROUP_MESSAGE_SCHEMA,
         handler=_plow_start_group_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_send_message",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_SEND_MESSAGE_SCHEMA,
+        handler=_plow_send_message,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )
