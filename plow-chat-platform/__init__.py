@@ -1280,15 +1280,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             return False
         return bool(getattr(result, "success", False))
 
-    @staticmethod
-    def _goal_reply_suppressed(turn, chat_id):
-        """Whether this turn owes the thread silence.
-
-        Scoped to the turn's OWN chat: a suppressed turn may still act, and an
-        explicit send to another granted chat is not the reply being gated.
-        """
-        return bool(turn) and turn.get("suppress_reply") and chat_id == turn["chat_uid"]
-
     async def _goal_reply(self, chat_uid, text):
         """A direct answer to `/goal`.
 
@@ -1527,6 +1518,25 @@ class PlowChatAdapter(BasePlatformAdapter):
             return ("unknown", f"judge request failed: {type(exc).__name__}")
         return _goal_parse_verdict(content)
 
+    def _message_guard(self, chat_id):
+        """The one gate every outbound message passes: inside the grant, inside
+        the member turn's chat, and not owed silence. None means go.
+
+        Layered over `_send_guard` rather than beside it, because a send path
+        that picks up the grant checks and quietly misses the silence one is
+        exactly how the status frame kept speaking through a suppressed turn.
+        Silence is scoped to the turn's own chat: a suppressed turn may still
+        act, and an explicit send elsewhere is not the reply being gated.
+        """
+        refused = self._send_guard(chat_id)
+        if refused is not None:
+            return refused
+        turn = self._active_turn.get()
+        if turn and turn.get("suppress_reply") and chat_id == turn["chat_uid"]:
+            log.info("[plow_chat] suppressed an unaddressed peer message for %s", chat_id)
+            return SendResult(success=True)
+        return None
+
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within
         the member turn's chat while one is open. None means go."""
@@ -1538,16 +1548,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
-        refused = self._send_guard(chat_id)
+        refused = self._message_guard(chat_id)
         if refused is not None:
             return refused
         # Fresh session per call: Hermes may invoke send() from a different
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
-        if self._goal_reply_suppressed(turn, chat_id):
-            log.info("[plow_chat] suppressed an unaddressed peer reply for %s", chat_id)
-            return SendResult(success=True)
         if (body == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn's whole answer was "nothing to say" — honor it. Gated
@@ -1729,7 +1736,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         """
         async with aiohttp.ClientSession() as http:
             if await self._verbose_enabled(http):
-                refused = self._send_guard(chat_id)
+                refused = self._message_guard(chat_id)
                 if refused is not None:
                     return refused
                 # A mid-turn status must not eat the "working" signal it rides
@@ -1765,12 +1772,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         so without this it fell to the base adapter's "native file send
         unavailable" notice and the file never left the container.
         """
-        refused = self._send_guard(chat_id)
+        refused = self._message_guard(chat_id)
         if refused is not None:
             return refused
-        if self._goal_reply_suppressed(self._active_turn.get(), chat_id):
-            log.info("[plow_chat] suppressed an unaddressed peer attachment for %s", chat_id)
-            return SendResult(success=True)
         filename = filename or os.path.basename(path)
         with open(path, "rb") as fh:
             data = fh.read()

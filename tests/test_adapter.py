@@ -4677,32 +4677,48 @@ def test_reply_target_prompt_names_the_send_tool(
     assert "plow_send_message" in module.REPLY_TARGET_PROMPT
 
 
-@pytest.mark.parametrize("send_kind", ["text", "attachment"], ids=["text", "attachment"])
-async def test_an_unaddressed_peer_turn_cannot_speak_even_if_the_model_tries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, send_kind: str,
+@pytest.mark.parametrize(
+    ("send_kind", "chat_id", "delivered"),
+    [
+        ("text", "cht_a", False),
+        ("attachment", "cht_a", False),
+        ("status", "cht_a", False),
+        ("text", "cht_b", True),
+    ],
+    ids=["same-chat-text", "same-chat-attachment", "same-chat-verbose-status", "cross-chat-text"],
+)
+async def test_suppression_is_scoped_to_the_turns_own_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    send_kind: str, chat_id: str, delivered: bool,
 ) -> None:
     """The sentinel suppresses only the exact sentinel, so a model that
     verbalises its silence — "(no reply needed)" — posted it anyway. Asking a
-    model not to speak is the failure this whole feature answers; the peer gate
-    cannot rest on it."""
+    model not to speak is the failure this feature answers, so the gate is
+    enforced on every outbound path rather than requested in the prompt.
+
+    Scoped to the turn's own chat: a suppressed turn may still act, and an
+    explicit send elsewhere is a different act than the reply being gated.
+    """
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
+    adapter.chat_uids = frozenset({"cht_a", "cht_b"})
     posted = mock.AsyncMock(return_value=_SendResult(success=True))
     monkeypatch.setattr(adapter, "_post_message", posted)
-    adapter._active_turn.set({"chat_uid": "cht_a", "owner": False,
+    monkeypatch.setattr(adapter, "_verbose_enabled", mock.AsyncMock(return_value=True))
+    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True,
                               "no_reply_ok": True, "suppress_reply": True})
 
-    if send_kind == "text":
-        result = await adapter.send("cht_a", "(no reply needed)")
-    else:
+    if send_kind == "attachment":
         attachment = tmp_path / "note.txt"
         attachment.write_text("unsolicited")
-        result = await adapter._send_attachment("cht_a", str(attachment), caption="here you go")
+        result = await adapter._send_attachment(chat_id, str(attachment), caption="here you go")
+    elif send_kind == "status":
+        result = await adapter.send_or_update_status(chat_id, "working", "still going")
+    else:
+        result = await adapter.send(chat_id, "(no reply needed)")
 
-    assert result.success is True, "the turn is not an error, it is silent"
-    posted.assert_not_awaited()
-
-
+    assert result.success is True, "silence is not an error the gateway should retry"
+    assert posted.await_count == (1 if delivered else 0)
 async def test_a_suppressed_turn_may_still_speak_in_another_granted_chat(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
