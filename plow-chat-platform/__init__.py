@@ -1820,15 +1820,17 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
 
 def _plow_name_contact(args, **_kwargs):
     """Record what the owner calls a roster participant, and who they are to
-    the owner. Owner-sourced only: the tool refuses while a member's own
-    turn is open, so nothing a member says about themselves can become a
-    label -- the same turn state `plow_start_group_message` reads to gate a
-    trusted send.
+    the owner. Owner-sourced only: fails CLOSED, like `plow_start_group_message`'s
+    trusted branch and `plow_set_conversation_trusted` -- both a member's own
+    turn and no active turn at all refuse, so nothing a member says about
+    themselves, and nothing invoked outside a turn, can become a label the
+    roster then presents to the model as the owner's own assertion.
     """
     turn = _ACTIVE_TURN.get()
-    if turn is not None and not turn.get("owner"):
+    if turn is None or not turn.get("owner"):
         return json.dumps({"success": False,
-                           "error": "names come from the owner: this is a member's turn, nothing was recorded"})
+                           "error": "names come from the owner: this requires the owner's "
+                                    "own active turn, nothing was recorded"})
     body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
     if not body:
         return json.dumps({"success": False, "error": "display_name or relationship is required"})

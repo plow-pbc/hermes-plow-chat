@@ -1937,7 +1937,9 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """A member saying "I'm Sam's wife" cannot become a label: while their turn
-    is open the tool cannot write. The owner saying it, on the owner's turn, can."""
+    is open the tool cannot write, and neither can a call outside any active
+    turn -- the gate fails closed, like plow_start_group_message's trusted
+    branch, not open. The owner saying it, on the owner's own turn, can."""
     module = _load(monkeypatch, tmp_path)
     record: list[Any] = []
     _live_tool(
@@ -1949,6 +1951,10 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
         record=record,
     )
     args = {"chat_id": "cht_a", "participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+
+    outside = json.loads(module._plow_name_contact(dict(args)))
+    assert outside["success"] is False and "owner" in outside["error"]
+    assert record == []
 
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": False})
     refused = json.loads(module._plow_name_contact(dict(args)))
