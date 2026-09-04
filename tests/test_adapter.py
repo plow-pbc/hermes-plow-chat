@@ -3772,7 +3772,7 @@ def _stub_hermes_state(monkeypatch: pytest.MonkeyPatch, db: _FakeDb) -> None:
 
 
 _ROWS = [
-    {"id": 1, "session_id": "s_dm", "role": "assistant", "snippet": "three possible addresses",
+    {"id": 1, "session_id": "s_dm", "role": "assistant", "snippet": "three possible\naddresses",
      "timestamp": 1788477294.5, "source": "plow_chat"},
     {"id": 2, "session_id": "s_here", "role": "user", "snippet": "current session noise",
      "timestamp": 1788477300.0, "source": "plow_chat"},
@@ -3783,9 +3783,10 @@ _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "
 
 
 @pytest.mark.parametrize("turn, expected_snippets", [
-    ({"chat_uid": "cht_room", "owner": True, "trusted": False}, ["three possible addresses", "earlier in this room"]),
-    ({"chat_uid": "cht_room", "owner": False, "trusted": True}, ["three possible addresses", "earlier in this room"]),
-    ({"chat_uid": "cht_room", "owner": False, "trusted": False}, ["earlier in this room"]),
+    ({"chat_uid": "cht_room", "owner": True, "dm": True, "trusted": False}, ["three possible addresses", "earlier in this room"]),
+    ({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False}, ["earlier in this room"]),
+    ({"chat_uid": "cht_room", "owner": False, "dm": False, "trusted": True}, ["three possible addresses", "earlier in this room"]),
+    ({"chat_uid": "cht_room", "owner": False, "dm": False, "trusted": False}, ["earlier in this room"]),
 ])
 def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], expected_snippets: list[str]
@@ -3804,6 +3805,24 @@ def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     assert db.calls == [{"query": "where OR addresses", "source_filter": [module.PLATFORM_NAME],
                          "role_filter": ["user", "assistant"], "limit": 30}]
     assert db.closed is True
+    if turn["dm"]:
+        assert text.splitlines()[1] == "- [2026-09-03] assistant: three possible addresses"
+
+
+def test_recall_caps_at_six_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    rows = [
+        {"id": i, "session_id": f"s_other_{i}", "role": "assistant", "snippet": f"snippet {i}",
+         "timestamp": 1788477294.5 + i, "source": "plow_chat"}
+        for i in range(8)
+    ]
+    db = _FakeDb(rows, {})
+    _stub_hermes_state(monkeypatch, db)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "trusted": False})
+    out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
+    assert out["context"].count("- [") == 6
 
 
 def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
@@ -3812,7 +3831,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -3825,7 +3844,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -3836,7 +3855,7 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "trusted": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "trusted": False})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True

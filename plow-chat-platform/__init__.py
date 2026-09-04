@@ -1647,20 +1647,21 @@ def _recall(session_id, user_message, platform, **_kwargs):
     turn's topic, appended to the user message (upstream's seam for per-turn
     recall; never the system prompt, so the prompt cache survives).
 
-    Scope is the room's, not the asker's: an owner turn or a trusted room
-    reaches every chat, the owner's DMs included -- trust means members may
-    have owner material. An untrusted member turn stays inside its own
-    chat's sessions. The current session is never recalled: the model has
-    it. Errors propagate: Hermes isolates and logs a failing pre_llm_call
-    hook and proceeds without recall, so a broken store is visible in the
-    gateway log instead of hidden here."""
+    Scope is the room's, not the asker's: the owner's own DM or a trusted
+    room reaches every chat, the owner's DMs included -- trust means members
+    may have owner material. Any other turn, an owner's turn in an untrusted
+    group included, stays inside its own chat's sessions. The current
+    session is never recalled: the model has it. Errors propagate: Hermes
+    isolates and logs a failing pre_llm_call hook and proceeds without
+    recall, so a broken store is visible in the gateway log instead of
+    hidden here."""
     turn = _ACTIVE_TURN.get()
     if platform != PLATFORM_NAME or turn is None:
         return None
     query = _recall_query(user_message)
     if not query:
         return None
-    everywhere = turn["owner"] or turn["trusted"]
+    everywhere = (turn["owner"] and turn["dm"]) or turn["trusted"]
     from hermes_state import get_shared_session_db, release_or_close
     db = get_shared_session_db()
     try:
@@ -1675,7 +1676,7 @@ def _recall(session_id, user_message, platform, **_kwargs):
                 if session.get("chat_id") != turn["chat_uid"]:
                     continue
             when = datetime.fromtimestamp(row["timestamp"], timezone.utc).strftime("%Y-%m-%d")
-            lines.append(f"- [{when}] {row['role']}: {row['snippet']}")
+            lines.append(f"- [{when}] {row['role']}: {' '.join(row['snippet'].split())}")
             if len(lines) == _RECALL_LIMIT:
                 break
     finally:
