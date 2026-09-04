@@ -1171,7 +1171,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             fired_under = _goal_wake_generation(getattr(event, "message_id", ""))
             if fired_under is not None and fired_under != goal.get("generation"):
                 return
-            generation = goal.get("generation")
             goal["attempts"] = int(goal.get("attempts") or 0) + 1
             _goal_append_history(goal, "thread", getattr(event, "text", "") or "")
             for reply in said:
@@ -1186,22 +1185,21 @@ class PlowChatAdapter(BasePlatformAdapter):
             # that is simply down -- still cannot buy unbounded turns.
             settled = verdict if verdict in GOAL_JUDGE_TERMINAL else _goal_exhaustion(goal)
             _goal_save(chat_uid, goal)
-        if not settled:
-            self._goal_start_wake(chat_uid)
-            return
-        # Stop waking only once the thread has actually been told. A goal that
-        # goes quiet without its announcement landing is the silent settle this
-        # whole feature exists to prevent.
-        if not await self._goal_announce(chat_uid, settled, evidence):
-            log.warning("[plow_chat] goal %s notice undelivered for %s; staying active",
-                        settled, chat_uid)
-            self._goal_start_wake(chat_uid)
-            return
-        async with self._goal_lock(chat_uid):
-            current = _goal_load(chat_uid)
-            if current and current.get("generation") == generation:
-                current["status"] = settled
-                _goal_save(chat_uid, current)
+            if not settled:
+                self._goal_start_wake(chat_uid)
+                return
+            # Announced under the lock, not after it. The record still reads
+            # active until the notice lands, so releasing here would let a
+            # concurrent turn judge the same goal, announce it a second time,
+            # and -- on a differing verdict -- persist a status contradicting
+            # the settlement the thread was already shown.
+            if not await self._goal_announce(chat_uid, settled, evidence):
+                log.warning("[plow_chat] goal %s notice undelivered for %s; staying active",
+                            settled, chat_uid)
+                self._goal_start_wake(chat_uid)
+                return
+            goal["status"] = settled
+            _goal_save(chat_uid, goal)
 
     async def _goal_judge(self, record):
         """Score the goal in a separate model call.

@@ -3836,3 +3836,29 @@ async def test_the_judge_sees_what_the_agent_actually_said(
     transcript = module._goal_judge_prompt(judge.await_args[0][0])
     assert "I booked the campsite for the 14th." in transcript
     assert adapter._goal_said.get("cht_a") is None, "the buffer must not leak into the next turn"
+
+
+async def test_two_turns_racing_a_settlement_announce_it_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The record reads active until the notice lands, so a settle that released
+    the lock to announce would let a second turn judge, announce, and persist a
+    verdict contradicting the one the thread was already shown."""
+    module = _load(monkeypatch, tmp_path)
+    adapter, sent = _active_goal_adapter(module, monkeypatch)
+
+    verdicts = iter([("met", "the booking is confirmed"), ("unachievable", "Daniel declined")])
+
+    async def judge(_record: Any) -> tuple[str, str]:
+        await asyncio.sleep(0)           # yield, so an unlocked version interleaves
+        return next(verdicts, ("not_met", "no progress"))
+
+    monkeypatch.setattr(adapter, "_goal_judge", judge)
+
+    await asyncio.gather(
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn one")),
+        adapter._goal_after_turn("cht_a", SimpleNamespace(text="turn two")),
+    )
+
+    assert sent.await_count == 1, "a goal settles, and says so, exactly once"
+    assert module._goal_load("cht_a")["status"] == "met"
