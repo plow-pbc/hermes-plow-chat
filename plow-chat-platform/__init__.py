@@ -637,17 +637,18 @@ class PlowChatAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
 
-    def _kick_typing(self, chat_uid):
+    def _kick_typing(self, chat_uid, initial_delay=2.0):
         """A message post just cleared the provider-side indicator, so if a
         turn's typing loop is live, restart it — otherwise the indicator stays
         dark until the loop's next 60s tick, or forever once cancelled. The
         grace delay debounces multi-part sends and gives on_processing_complete
-        time to cancel a final-reply restart before it ever posts."""
+        time to cancel a final-reply restart before it ever posts. Sequences use
+        zero grace so their reading pauses keep the indicator active."""
         if chat_uid not in self._typing:
             return
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(
-            self._typing_until_reply(chat_uid, initial_delay=2.0))
+            self._typing_until_reply(chat_uid, initial_delay=initial_delay))
 
     def _set_reach(self, chats):
         next_chats = {chat["uid"]: chat for chat in chats}
@@ -1096,7 +1097,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data = await resp.json(content_type=None)
                 if not isinstance(data.get("uid"), str) or not data["uid"]:
                     raise ValueError("missing message uid")
-            self._kick_typing(chat_uid)
+            self._kick_typing(chat_uid, initial_delay=0.0)
             return data["uid"]
         except _SequenceFailure:
             raise

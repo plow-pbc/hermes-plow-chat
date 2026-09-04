@@ -4144,13 +4144,13 @@ async def test_sequence_stack_order_pause_replaces_gap_and_upload_has_no_bearer(
     delays, kicks = [], []
     async def sleep(seconds): delays.append(seconds)
     monkeypatch.setattr(module.asyncio, 'sleep', sleep)
-    monkeypatch.setattr(adapter, '_kick_typing', kicks.append)
+    monkeypatch.setattr(adapter, '_kick_typing', lambda chat, initial_delay=2.0: kicks.append((chat, initial_delay)))
     result = await adapter.send_sequence({'items': _intro_items()}, turn)
     sends = [k['json'] for method, url, k in http.calls if url.endswith('/messages')]
     assert sends[0] == {'body': 'Before'} and sends[2] == {'body': 'After'}
     assert len(sends[1]['attachment_uids']) == 4
     assert delays == [1.0, 4], 'explicit reading pause must not gain an extra ordinary gap'
-    assert kicks == ['cht_a'] * 3
+    assert kicks == [('cht_a', 0.0)] * 3, 'sequence typing must not wait out the ordinary final-send grace'
     for method, url, kwargs in http.calls:
         assert kwargs['headers'] == ({'X-Cap': 'yes'} if method == 'put' else adapter.auth)
     assert result == {'success': True, 'failure': None, 'completed': [
