@@ -1156,12 +1156,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._goal_stop_wake(chat_uid)
         async with self._goal_lock(chat_uid):
             updated = mutate(_goal_load(chat_uid))
-            if updated is None or not await self._goal_say(chat_uid, notice):
-                return False
-            _goal_save(chat_uid, updated)
-        if restart:
+            if updated is not None and await self._goal_say(chat_uid, notice):
+                _goal_save(chat_uid, updated)
+                if restart:
+                    self._goal_start_wake(chat_uid)
+                return True
+            record = _goal_load(chat_uid)
+        # We stopped the pacing, so we owe it back. Whoever asked for the
+        # transition cannot be the one to remember this -- that is precisely
+        # how a failed `/goal` notice stranded an open goal with no task to
+        # re-fire it and no way to announce its own expiry.
+        if record and record.get("status") == GOAL_ACTIVE:
             self._goal_start_wake(chat_uid)
-        return True
+        return False
 
     def _goal_start_wake(self, chat_uid):
         """One pacing task per chat. A second would double the wake rate every
@@ -1286,10 +1293,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if current and current.get("status") == GOAL_ACTIVE
                 and current.get("generation") == generation else None):
             return
-        if _goal_active(_goal_load(chat_uid)):
-            log.warning("[plow_chat] goal %s notice undelivered for %s; staying active",
-                        settled, chat_uid)
-            self._goal_start_wake(chat_uid)
+        log.warning("[plow_chat] goal %s notice undelivered or already closed for %s",
+                    settled, chat_uid)
 
     async def _goal_judge(self, record):
         """Score the goal in a separate model call.

@@ -4006,3 +4006,25 @@ async def test_a_goal_that_expired_while_the_container_was_down_is_resumed_to_an
     await adapter.connect()
 
     assert started == ["cht_a"], "an expired goal must still be resumed to say so"
+
+
+@pytest.mark.parametrize("command", ["/goal book the campsite", "/goal clear"], ids=["set", "clear"])
+async def test_a_failed_goal_notice_never_strands_an_open_goal_unpaced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str,
+) -> None:
+    """The transition stops the pacing before it speaks, so when the notice does
+    not land it owes that pacing back. Left stopped, an open goal has no task to
+    re-fire it and no way to announce its own expiry — quiet, which is the one
+    outcome this feature exists to rule out."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    module._goal_save("cht_a", module._goal_new("the standing goal"))
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
+    started: list[str] = []
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
+
+    with contextlib.suppress(RuntimeError):        # `set` raises so the command is not checkpointed
+        await adapter._goal_command("cht_a", command, "owner", module._goal_load("cht_a"))
+
+    assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE, "nothing was written"
+    assert started == ["cht_a"], "and the pacing it stopped was handed back"
