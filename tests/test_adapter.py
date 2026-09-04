@@ -3379,3 +3379,7 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
+    # The Mac carries owner authority, so the routing rule must defer to the
+    # chat's trust boundary: a non-owner turn cannot direct owner-Mac work.
+    assert "only your owner directs work on the Mac" in text
+    assert "not your owner" in text
