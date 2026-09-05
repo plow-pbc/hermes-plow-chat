@@ -1816,6 +1816,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if not isinstance(data.get("uid"), str) or not data["uid"]:
                     raise ValueError("missing message uid")
             self._kick_typing(chat_uid, initial_delay=0.0)
+            # A sequence is a send path that reaches the thread, so it owes the
+            # goal transcript what it delivered. Without this the judge scores a
+            # turn whose text and photos it cannot see, spends an attempt, and
+            # can announce exhaustion for work the owner already received.
+            self._goal_note_reply(chat_uid, (payload.get("body") or "").strip()
+                                  or f"(sent {len(payload.get('attachment_uids') or ())} photos)")
             return data["uid"]
         except _SequenceFailure:
             raise
@@ -2972,7 +2978,7 @@ def _sequence_plan(args):
                 byte_size += len(assets[asset_id][2])
                 if photo_count > 16 or byte_size > 32 * 1024 * 1024:
                     raise ValueError("sequence exceeds photo or byte budget")
-            plan.append({"type": kind, "asset_ids": list(ids), "photos": photos})
+            plan.append({"type": kind, "photos": photos})
         elif kind == "pause" and set(item) == {"type", "seconds"}:
             seconds = item["seconds"]
             if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 <= seconds <= 15:
@@ -2984,8 +2990,10 @@ def _sequence_plan(args):
         if kind != "pause" and previous not in (None, "pause"):
             delay += SEQUENCE_INTERVAL
         previous = kind
-    if text_size > 24000 or photo_count > 16 or byte_size > 32 * 1024 * 1024 or delay > SEQUENCE_MAX_DELAY:
-        raise ValueError("sequence exceeds total text, photo, byte or delay budget")
+    # Photos and bytes are already refused at the increment that crosses the
+    # budget, so only the two totals nothing checks incrementally remain.
+    if text_size > 24000 or delay > SEQUENCE_MAX_DELAY:
+        raise ValueError("sequence exceeds total text or delay budget")
     if not any(i["type"] != "pause" for i in plan):
         raise ValueError("sequence must deliver something")
     return plan

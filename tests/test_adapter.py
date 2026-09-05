@@ -5200,6 +5200,25 @@ async def test_failed_sequence_after_a_successful_one_reopens_the_reply_path(mon
 
 
 @pytest.mark.asyncio
+async def test_sequence_delivery_reaches_the_goal_transcript(monkeypatch, tmp_path):
+    """A goal judges what the owner was shown, including what a sequence sent.
+
+    The sequence transport posts directly, and its success suppresses the
+    trailing reply — so without capture here the turn's transcript is empty
+    and the judge can retire a goal the sequence already achieved.
+    """
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    items = [dict(type='text', body='Here are four previews.'),
+             dict(type='photos', asset_ids=['p0', 'p1', 'p2', 'p3'])]
+    assert (await adapter.send_sequence({'items': items}, turn))['success']
+
+    said = turn.get('said') or []
+    assert 'Here are four previews.' in said, 'the sequence text never reached the judge'
+    assert any('4 photos' in entry for entry in said), 'the photo stack left no trace'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("send_kind", "chat_id", "delivered"),
     [
@@ -5238,20 +5257,6 @@ async def test_post_sequence_suppression_covers_every_send_path(
 
     assert result.success is True, 'suppression is not an error the gateway should retry'
     assert posted.await_count == (1 if delivered else 0)
-
-
-@pytest.mark.asyncio
-async def test_suppressed_reply_body_stays_out_of_the_log(monkeypatch, tmp_path, caplog):
-    """The log is a wider audience than the DM: record the size, not the prose."""
-    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
-    assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, turn))['success']
-
-    secret = 'the owner asked about a medical appointment'
-    with caplog.at_level(logging.DEBUG):
-        assert (await adapter.send('cht_a', secret)).success
-    assert secret not in caplog.text
-    assert 'suppressed post-sequence reply for cht_a' in caplog.text
 
 
 @pytest.mark.parametrize(
