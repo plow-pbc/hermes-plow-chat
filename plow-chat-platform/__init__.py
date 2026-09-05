@@ -11,10 +11,12 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import pathlib
 import re
+import stat
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -903,6 +905,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._goal_paced = False              # pacing runs only inside a live socket session
         self._active_turn = _ACTIVE_TURN
+        self._sequence_turns = {}
+        self._sequence_locks = {}
+        self._sequences = {}
 
     def _checkpoint_path(self, chat_uid):
         if chat_uid == self._configured_home_chat_uid:
@@ -950,17 +955,18 @@ class PlowChatAdapter(BasePlatformAdapter):
         if task:
             task.cancel()
 
-    def _kick_typing(self, chat_uid):
+    def _kick_typing(self, chat_uid, initial_delay=2.0):
         """A message post just cleared the provider-side indicator, so if a
         turn's typing loop is live, restart it — otherwise the indicator stays
         dark until the loop's next 60s tick, or forever once cancelled. The
         grace delay debounces multi-part sends and gives on_processing_complete
-        time to cancel a final-reply restart before it ever posts."""
+        time to cancel a final-reply restart before it ever posts. Sequences use
+        zero grace so their reading pauses keep the indicator active."""
         if chat_uid not in self._typing:
             return
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(
-            self._typing_until_reply(chat_uid, initial_delay=2.0))
+            self._typing_until_reply(chat_uid, initial_delay=initial_delay))
 
     def _set_reach(self, chats):
         next_chats = {chat["uid"]: chat for chat in chats}
@@ -1110,6 +1116,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._inbound.clear()
         for chat_uid in tuple(self._typing):
             self._cancel_typing(chat_uid)
+        for task in tuple(self._sequences):
+            task.cancel()
+        self._sequence_turns.clear()
         self._goal_pause_wakes()
         self._mark_disconnected()
 
@@ -1159,6 +1168,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                         "triggered_at": datetime.now(timezone.utc).isoformat(),
                     })
         self._active_turn.set(turn)
+        # Keyed by the turn's identity, not its chat: a goal wake and a real
+        # inbound turn can both be live on one chat, and a single slot per chat
+        # means the later start silently strips the earlier turn of the
+        # ownership its running sequence is still checking. The dict holds the
+        # turn itself, so the id stays unique for as long as it is a key.
+        self._sequence_turns[id(turn)] = turn
 
     async def on_processing_complete(self, event, outcome):
         chat_uid = event.source.chat_id
@@ -1168,6 +1183,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
+        # This turn's ownership and this turn's tasks: a completion that
+        # reached for the chat's entry instead would retire whichever turn
+        # started last and cancel the sequence it still has in flight.
+        if turn is not None:
+            self._sequence_turns.pop(id(turn), None)
+        for task, owner in tuple(self._sequences.items()):
+            if owner is turn:
+                task.cancel()
         # The final reply's kick may have re-raised the indicator after the
         # reply cleared it; a start left alone lingers up to ~90s, so clear
         # it. Short timeout: this rides the gateway's turn-completion path,
@@ -1551,6 +1574,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         if turn and turn.get("suppress_reply") and chat_id == turn["chat_uid"]:
             log.info("[plow_chat] suppressed an unaddressed peer message for %s", chat_id)
             return SendResult(success=True)
+        # A completed sequence already delivered this turn's reply, so the
+        # trailing prose the model adds after it is the same duplicate the
+        # peer gate above exists to stop. Keyed on the sequence's own turn
+        # rather than the chat, so it lifts the moment that turn ends.
+        if (turn and turn.get("sequence_completed") and id(turn) in self._sequence_turns
+                and chat_id == turn["chat_uid"]):
+            log.debug("[plow_chat] suppressed post-sequence reply for %s", chat_id)
+            return SendResult(success=True)
         return None
 
     def _send_guard(self, chat_id):
@@ -1777,6 +1808,128 @@ class PlowChatAdapter(BasePlatformAdapter):
         # final reply, on_processing_complete cancels the restart and stops it.
         self._kick_typing(chat_id)
         return SendResult(success=True, message_id=data.get("uid"))
+
+    def _sequence_guard(self, turn):
+        chat_uid = turn.get("chat_uid")
+        if (id(turn) not in self._sequence_turns or not turn.get("owner")
+                or not turn.get("dm") or not _owner_dm(self._chats.get(chat_uid, {}))
+                or self._send_guard(chat_uid) is not None):
+            raise ValueError("sequence requires the current solo owner DM within the grant")
+
+    async def _sequence_post(self, http, chat_uid, payload):
+        try:
+            async with http.post(f"{BASE}/v1/chats/{chat_uid}/messages", json=payload, headers=self.auth) as resp:
+                if resp.status >= 400:
+                    status = "delivery_unknown" if resp.status >= 500 or resp.status == 408 else "failed"
+                    raise _SequenceFailure(status, f"message POST HTTP {resp.status}", http_status=resp.status)
+                data = await resp.json(content_type=None)
+                if not isinstance(data.get("uid"), str) or not data["uid"]:
+                    raise ValueError("missing message uid")
+            self._kick_typing(chat_uid, initial_delay=0.0)
+            # A sequence is a send path that reaches the thread, so it owes the
+            # goal transcript what it delivered. Without this the judge scores a
+            # turn whose text and photos it cannot see, spends an attempt, and
+            # can announce exhaustion for work the owner already received.
+            self._goal_note_reply(chat_uid, (payload.get("body") or "").strip()
+                                  or f"(sent {len(payload.get('attachment_uids') or ())} photos)")
+            return data["uid"]
+        except _SequenceFailure:
+            raise
+        except Exception as exc:
+            raise _SequenceFailure("delivery_unknown", f"message POST {type(exc).__name__}") from exc
+
+    async def _declare_and_upload(self, http, chat_uid, photo):
+        """Declare with the bearer; upload immutable validated bytes with capability headers only."""
+        filename, content_type, data = photo
+        try:
+            async with http.post(f"{BASE}/v1/chats/{chat_uid}/attachments",
+                                 json={"filename": filename, "content_type": content_type, "size_bytes": len(data)},
+                                 headers=self.auth) as resp:
+                resp.raise_for_status()
+                declared = await resp.json(content_type=None)
+            async with http.put(declared["upload_url"], data=data, headers=declared["upload_headers"]) as resp:
+                resp.raise_for_status()
+            return declared["uid"]
+        except Exception as exc:
+            # Uploads alone cannot deliver a chat message; no fallback sends on failure.
+            raise _SequenceFailure("failed", f"attachment upload {type(exc).__name__}") from exc
+
+    async def _post_photo_stack(self, http, chat_uid, photos, progress):
+        uids = [await self._declare_and_upload(http, chat_uid, photo) for photo in photos]
+        progress["posting"] = True
+        try:
+            uid = await self._sequence_post(http, chat_uid, {"body": "", "attachment_uids": uids})
+            return [uid]
+        except _SequenceFailure as exc:
+            if exc.http_status != 422 or len(uids) == 1:
+                raise
+        # Only an explicit validation rejection can degrade to individual photos.
+        # Reuse declarations; stop at the first failure and retain prior receipts.
+        for index, uid in enumerate(uids):
+            progress["photo_index"] = index
+            try:
+                message_id = await self._sequence_post(http, chat_uid, {"body": "", "attachment_uids": [uid]})
+            except _SequenceFailure as exc:
+                exc.message_ids = list(progress["message_ids"])
+                exc.photo_index = index
+                raise
+            progress["message_ids"].append(message_id)
+        return list(progress["message_ids"])
+
+    async def send_sequence(self, args, turn, receipt=None):
+        receipt = receipt if receipt is not None else _sequence_receipt()
+        task = asyncio.current_task()
+        self._sequences[task] = turn
+        position, progress = 0, {"posting": False, "message_ids": []}
+        try:
+            self._sequence_guard(turn)
+            plan = _sequence_plan(args)
+            chat_uid = turn["chat_uid"]
+            async with asyncio.timeout(SEQUENCE_TIMEOUT):
+                async with self._sequence_locks.setdefault(chat_uid, asyncio.Lock()):
+                    await self._refresh_current_chat(chat_uid)
+                    self._sequence_guard(turn)
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
+                        previous = None
+                        for position, item in enumerate(plan):
+                            receipt["position"] = position
+                            progress = {"posting": False, "message_ids": []}
+                            self._sequence_guard(turn)
+                            kind = item["type"]
+                            if kind == "pause":
+                                await asyncio.sleep(item["seconds"])
+                                ids = []
+                            else:
+                                if previous not in (None, "pause"):
+                                    await asyncio.sleep(SEQUENCE_INTERVAL)
+                                self._sequence_guard(turn)
+                                if kind == "text":
+                                    progress["posting"] = True
+                                    ids = [await self._sequence_post(http, chat_uid, {"body": item["body"]})]
+                                else:
+                                    ids = await self._post_photo_stack(http, chat_uid, item["photos"], progress)
+                            receipt["completed"].append({"index": position, "type": kind, "message_ids": ids})
+                            previous = kind
+            receipt["success"] = True
+        except _SequenceFailure as exc:
+            receipt["failure"] = {"index": position, "status": exc.status, "error": str(exc),
+                                  "message_ids": exc.message_ids, "photo_index": exc.photo_index}
+        except (Exception, asyncio.CancelledError) as exc:
+            receipt["failure"] = {"index": position,
+                "status": "delivery_unknown" if progress["posting"] else "failed" if receipt["completed"] else "rejected",
+                "error": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
+                "message_ids": progress["message_ids"], "photo_index": progress.get("photo_index")}
+        finally:
+            self._sequences.pop(task, None)
+        receipt.pop("position", None)
+        # The flag tracks this turn's latest sequence, not "any sequence ever
+        # succeeded": a failed, rejected or delivery-unknown run has to reopen
+        # the ordinary reply path so the model's recovery text still reaches
+        # the owner after a partial delivery.
+        turn["sequence_completed"] = receipt["success"]
+        if not receipt["success"]:
+            receipt["instruction"] = "Do not replay the sequence; inspect chat history before sending remaining items."
+        return receipt
 
     async def _send_attachment(self, chat_id, path, *, caption=None, filename=None):
         """Declare, upload, send — the Plow media contract, in that order.
@@ -2733,6 +2886,187 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     return {"action": "approve", "message": summary, "rule_key": f"google-send:{digest}"}
 
 
+SEQUENCE_ASSET_ROOT = pathlib.Path("/srv/plow-assets")
+SEQUENCE_ASSET_OWNER = 0
+SEQUENCE_MAX_ITEMS = 24
+SEQUENCE_MAX_DELAY = 60.0
+SEQUENCE_TIMEOUT = 180.0
+SEQUENCE_INTERVAL = 1.0
+_SEQUENCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+
+
+def _sequence_stat(path, directory=False):
+    info = path.lstat()
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(info.st_mode) or info.st_uid != SEQUENCE_ASSET_OWNER or info.st_mode & 0o022:
+        raise ValueError("sequence assets must be root-owned, non-writable regular files in protected directories")
+    return info
+
+
+def _sequence_file(relative, limit):
+    root = SEQUENCE_ASSET_ROOT
+    parts = pathlib.PurePosixPath(relative)
+    if not isinstance(relative, str) or not relative or parts.is_absolute() or any(
+            p in {".", ".."} for p in relative.split("/")) or "\\" in relative or "\0" in relative:
+        raise ValueError("asset paths must stay inside the asset directory")
+    # Check parents too: an unwritable file in a replaceable directory is not protected.
+    for directory in reversed((root, *root.parents)):
+        _sequence_stat(directory, directory=True)
+    path = root
+    for part in parts.parts[:-1]:
+        path /= part
+        _sequence_stat(path, directory=True)
+    path /= parts.name
+    info = _sequence_stat(path)
+    if info.st_size > limit:
+        raise ValueError("sequence asset is too large")
+    with path.open("rb") as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("sequence asset is too large")
+    return path.name, data
+
+
+def _sequence_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate manifest key")
+        result[key] = value
+    return result
+
+
+def _sequence_plan(args):
+    """Resolve the entire bounded request to immutable bytes before any delivery."""
+    if not isinstance(args, dict) or set(args) != {"items"}:
+        raise ValueError("only items is accepted; destination comes from the active owner DM")
+    items = args["items"]
+    if not isinstance(items, list) or not 1 <= len(items) <= SEQUENCE_MAX_ITEMS:
+        raise ValueError("items must contain 1 to 24 entries")
+    plan, manifest, assets = [], None, {}
+    delay = text_size = photo_count = byte_size = 0
+    previous = None
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("each item must be an object")
+        kind = item.get("type")
+        if kind == "text" and set(item) == {"type", "body"}:
+            body = item["body"]
+            if not isinstance(body, str) or not body.strip() or len(body) > 4000:
+                raise ValueError("text body must contain 1 to 4000 characters")
+            text_size += len(body)
+            plan.append({"type": kind, "body": body})
+        elif kind == "photos" and set(item) == {"type", "asset_ids"}:
+            ids = item["asset_ids"]
+            if not isinstance(ids, list) or not 1 <= len(ids) <= 4 or any(
+                    not isinstance(i, str) or not _SEQUENCE_ID.fullmatch(i) for i in ids):
+                raise ValueError("photos requires 1 to 4 asset IDs, never paths")
+            if manifest is None:
+                _, raw = _sequence_file("manifest.json", 65536)
+                manifest = json.loads(raw, object_pairs_hook=_sequence_object)
+                if (not isinstance(manifest, dict) or set(manifest) != {"version", "assets"}
+                        or type(manifest["version"]) is not int or manifest["version"] != 1
+                        or not isinstance(manifest["assets"], dict)):
+                    raise ValueError("unsupported asset manifest")
+            photos = []
+            for asset_id in ids:
+                if asset_id not in assets:
+                    relative = manifest["assets"].get(asset_id)
+                    if not isinstance(relative, str):
+                        raise ValueError("unknown asset ID")
+                    filename, data = _sequence_file(relative, 8 * 1024 * 1024)
+                    content_type = mimetypes.guess_type(filename)[0]
+                    signatures = {"image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                                  "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+                                  "image/gif": data[:6] in (b"GIF87a", b"GIF89a"),
+                                  "image/webp": data[:4] == b"RIFF" and data[8:12] == b"WEBP"}
+                    if not signatures.get(content_type):
+                        raise ValueError("asset must be a PNG, JPEG, GIF or WebP image")
+                    assets[asset_id] = (filename, content_type, data)
+                photos.append(assets[asset_id])
+                photo_count += 1
+                byte_size += len(assets[asset_id][2])
+                if photo_count > 16 or byte_size > 32 * 1024 * 1024:
+                    raise ValueError("sequence exceeds photo or byte budget")
+            plan.append({"type": kind, "photos": photos})
+        elif kind == "pause" and set(item) == {"type", "seconds"}:
+            seconds = item["seconds"]
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 <= seconds <= 15:
+                raise ValueError("pause seconds must be a finite number from 0 to 15")
+            delay += seconds
+            plan.append({"type": kind, "seconds": seconds})
+        else:
+            raise ValueError("unknown item type or fields")
+        if kind != "pause" and previous not in (None, "pause"):
+            delay += SEQUENCE_INTERVAL
+        previous = kind
+    # Photos and bytes are already refused at the increment that crosses the
+    # budget, so only the two totals nothing checks incrementally remain.
+    if text_size > 24000 or delay > SEQUENCE_MAX_DELAY:
+        raise ValueError("sequence exceeds total text or delay budget")
+    if not any(i["type"] != "pause" for i in plan):
+        raise ValueError("sequence must deliver something")
+    return plan
+
+
+class _SequenceFailure(Exception):
+    def __init__(self, status, error, *, http_status=None, message_ids=(), photo_index=None):
+        super().__init__(error)
+        self.status, self.http_status = status, http_status
+        self.message_ids, self.photo_index = list(message_ids), photo_index
+
+
+def _sequence_receipt():
+    return {"success": False, "completed": [], "failure": None}
+
+
+def _plow_send_sequence(args, **_kwargs):
+    turn = _ACTIVE_TURN.get()
+    receipt = _sequence_receipt()
+    if not turn or not turn.get("owner") or not turn.get("dm") or _live is None:
+        receipt["failure"] = {"index": 0, "status": "rejected", "error": "requires a connected active owner DM"}
+        return json.dumps(receipt)
+    adapter, loop = _live
+    future = asyncio.run_coroutine_threadsafe(adapter.send_sequence(args, turn, receipt), loop)
+    try:
+        return json.dumps(future.result(timeout=SEQUENCE_TIMEOUT + 10))
+    except Exception as exc:
+        future.cancel()
+        # The operation has its own shorter deadline. If even its loop cannot
+        # answer, cancel it and never suggest replaying an unconfirmed POST.
+        return json.dumps({"success": False, "completed": list(receipt["completed"]),
+                           "failure": {"index": receipt.get("position", 0),
+                                       "status": "delivery_unknown", "error": type(exc).__name__},
+                           "instruction": "Do not replay the sequence; inspect chat history first."})
+
+
+PLOW_SEND_SEQUENCE_SCHEMA = {
+    "name": "plow_send_sequence",
+    "description": (
+        "Deliver an ordered sequence in THIS active solo owner DM. No target or file paths. "
+        "All items and root-owned /srv/plow-assets/manifest.json assets are validated before sending. "
+        "Text/photos have a 1-second gap; explicit pauses replace that gap. Up to 24 items, "
+        "24,000 text characters, 16 photos and 60 total delay seconds. Receipt completed entries "
+        "carry zero-based indices and message_ids; failure identifies the first failed or "
+        "delivery_unknown position, including confirmed photo fallback IDs. Never replay the whole "
+        "sequence after failure. On success the copy is already delivered: do not repeat it in your final reply."
+    ),
+    "parameters": {
+        "type": "object", "additionalProperties": False, "required": ["items"],
+        "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 24,
+            "items": {"oneOf": [
+                {"type": "object", "additionalProperties": False, "required": ["type", "body"],
+                 "properties": {"type": {"const": "text"}, "body": {"type": "string", "minLength": 1, "maxLength": 4000}}},
+                {"type": "object", "additionalProperties": False, "required": ["type", "asset_ids"],
+                 "properties": {"type": {"const": "photos"}, "asset_ids": {"type": "array", "minItems": 1, "maxItems": 4,
+                    "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}}}},
+                {"type": "object", "additionalProperties": False, "required": ["type", "seconds"],
+                 "properties": {"type": {"const": "pause"}, "seconds": {"type": "number", "minimum": 0, "maximum": 15}}},
+            ]}}},
+    },
+}
+
+
 def _plow_send_message(args, **_kwargs):
     """Post to another granted chat and record it in that chat's session.
 
@@ -3135,6 +3469,11 @@ def register(ctx):
         handler=_plow_offer_invite,
         check_fn=check_requirements,
         requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
+    )
+    ctx.register_tool(
+        name="plow_send_sequence", toolset=PLATFORM_NAME,
+        schema=PLOW_SEND_SEQUENCE_SCHEMA, handler=_plow_send_sequence,
+        check_fn=check_requirements, requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
     )
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("pre_llm_call", _recall)

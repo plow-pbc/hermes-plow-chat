@@ -2016,6 +2016,7 @@ def test_tools_register_with_optional_deferred_questions(
         "plow_chat_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
+        "plow_send_sequence",
     ]
     tool = ctx.tools[0]
     assert tool["schema"]["name"] == "plow_start_group_message"
@@ -4859,6 +4860,442 @@ def test_reply_target_prompt_names_the_send_tool(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     assert "plow_send_message" in module.REPLY_TARGET_PROMPT
+
+# Sequences run through a separate transport; ordinary send/media tests above
+# continue exercising their original paths.
+def _sequence_fixture(monkeypatch, tmp_path):
+    import os
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._chats['cht_a']['participants'] = [dict(type='member', role='owner', uid='owner')]
+    turn = dict(chat_uid='cht_a', owner=True, dm=True)
+    module._ACTIVE_TURN.set(turn)
+    adapter._sequence_turns[id(turn)] = turn
+    root = tmp_path / 'assets'
+    root.mkdir(mode=0o755)
+    for i in range(4):
+        (root / f'{i}.png').write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+    (root / 'manifest.json').write_text(json.dumps({'version': 1, 'assets': {f'p{i}': f'{i}.png' for i in range(4)}}))
+    monkeypatch.setattr(module, 'SEQUENCE_ASSET_ROOT', root)
+    monkeypatch.setattr(module, 'SEQUENCE_ASSET_OWNER', os.getuid())
+    check = module._sequence_stat
+    # The test runner owns its temp directory; simulate the protected /srv
+    # ancestry, while exercising real lstat checks for the manifest and assets.
+    def protected_parent(path, directory=False):
+        if path == root or root in path.parents:
+            return check(path, directory)
+        return None
+    monkeypatch.setattr(module, '_sequence_stat', protected_parent)
+    http = _SequenceHTTP()
+    monkeypatch.setattr(module.aiohttp, 'ClientSession', lambda **kw: http)
+    return module, adapter, turn, root, http
+
+
+class _SequenceHTTP:
+    def __init__(self):
+        self.calls = []
+        self.responses = []
+        self.posts = 0
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *exc): pass
+
+    def post(self, url, **kwargs):
+        self.calls.append(('post', url, kwargs))
+        if url.endswith('/attachments'):
+            return _Resp(dict(uid=f'att_{len(self.calls)}', upload_url='https://upload.invalid/cap', upload_headers={'X-Cap': 'yes'}))
+        self.posts += 1
+        response = self.responses.pop(0) if self.responses else _Resp({'uid': f'msg_{self.posts}'})
+        if isinstance(response, Exception): raise response
+        return response
+
+    def put(self, url, **kwargs):
+        self.calls.append(('put', url, kwargs))
+        return _Resp({})
+
+
+def _intro_items():
+    return [dict(type='text', body='Before'), dict(type='photos', asset_ids=['p0', 'p1', 'p2', 'p3']),
+            dict(type='pause', seconds=4), dict(type='text', body='After')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad', [
+    {'type': 'text', 'body': ' '}, {'type': 'text', 'body': 'x' * 4001},
+    {'type': 'text', 'body': 'ok', 'chat_id': 'cht_other'},
+    {'type': 'photos', 'asset_ids': ['../secret']}, {'type': 'photos', 'asset_ids': ['/etc/passwd']},
+    {'type': 'photos', 'asset_ids': ['missing']}, {'type': 'photos', 'asset_ids': ['p0'] * 5},
+    {'type': 'pause', 'seconds': True}, {'type': 'pause', 'seconds': float('nan')},
+    {'type': 'pause', 'seconds': float('inf')}, {'type': 'pause', 'seconds': -1},
+    {'type': 'pause', 'seconds': 16}, {'type': 'unknown'},
+])
+async def test_sequence_rejects_the_whole_request_before_any_send(monkeypatch, tmp_path, bad):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    result = await adapter.send_sequence({'items': [dict(type='text', body='must not send'), bad]}, turn)
+    assert not result['success'] and result['failure']['status'] == 'rejected'
+    assert result['completed'] == [] and http.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('items', [[], [dict(type='pause', seconds=1)],
+    [dict(type='text', body='x')] * 25, [dict(type='pause', seconds=15)] * 5 + [dict(type='text', body='x')],
+    [dict(type='text', body='x' * 4000)] * 7, [dict(type='photos', asset_ids=['p0'] * 4)] * 5])
+async def test_sequence_rejects_aggregate_limits(monkeypatch, tmp_path, items):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    assert not (await adapter.send_sequence({'items': items}, turn))['success']
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['writable', 'symlink', 'escape', 'absolute', 'wrong_type', 'manifest_writable', 'directory_writable'])
+async def test_sequence_refuses_unprotected_or_escaped_assets(monkeypatch, tmp_path, change):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    asset = root / '0.png'
+    if change == 'writable': asset.chmod(0o666)
+    elif change == 'symlink':
+        asset.unlink(); asset.symlink_to(root / '1.png')
+    elif change == 'wrong_type': asset.write_bytes(b'private text')
+    elif change == 'manifest_writable': (root / 'manifest.json').chmod(0o666)
+    elif change == 'directory_writable': root.chmod(0o777)
+    else:
+        path = '../outside.png' if change == 'escape' else str(root / '1.png')
+        (root / 'manifest.json').write_text(json.dumps({'version': 1, 'assets': {'p0': path}}))
+    result = await adapter.send_sequence({'items': [dict(type='text', body='before'), dict(type='photos', asset_ids=['p0'])]}, turn)
+    assert not result['success'] and not http.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('forbidden', ['none', 'member', 'group', 'peer', 'no_owner', 'grant', 'ended'])
+async def test_sequence_requires_a_live_solo_owner_turn(monkeypatch, tmp_path, forbidden):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    if forbidden == 'none':
+        module._ACTIVE_TURN.set(None)
+        assert json.loads(module._plow_send_sequence({'items': _intro_items()}))['failure']['status'] == 'rejected'
+        return
+    if forbidden == 'member': turn['owner'] = False
+    elif forbidden == 'group': turn['dm'] = False
+    elif forbidden == 'peer': adapter._chats['cht_a']['participants'].append(dict(type='agent', relationship='peer'))
+    elif forbidden == 'no_owner': adapter._chats['cht_a']['participants'][0]['role'] = 'member'
+    elif forbidden == 'grant': adapter.chat_uids = frozenset()
+    elif forbidden == 'ended': adapter._sequence_turns.clear()
+    assert not (await adapter.send_sequence({'items': _intro_items()}, turn))['success']
+    assert not http.calls
+
+
+@pytest.mark.asyncio
+async def test_sequence_stack_order_pause_replaces_gap_and_upload_has_no_bearer(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    delays, kicks = [], []
+    async def sleep(seconds): delays.append(seconds)
+    monkeypatch.setattr(module.asyncio, 'sleep', sleep)
+    monkeypatch.setattr(adapter, '_kick_typing', lambda chat, initial_delay=2.0: kicks.append((chat, initial_delay)))
+    result = await adapter.send_sequence({'items': _intro_items()}, turn)
+    sends = [k['json'] for method, url, k in http.calls if url.endswith('/messages')]
+    assert sends[0] == {'body': 'Before'} and sends[2] == {'body': 'After'}
+    assert len(sends[1]['attachment_uids']) == 4
+    assert delays == [1.0, 4], 'explicit reading pause must not gain an extra ordinary gap'
+    assert kicks == [('cht_a', 0.0)] * 3, 'sequence typing must not wait out the ordinary final-send grace'
+    for method, url, kwargs in http.calls:
+        assert kwargs['headers'] == ({'X-Cap': 'yes'} if method == 'put' else adapter.auth)
+    assert result == {'success': True, 'failure': None, 'completed': [
+        {'index': 0, 'type': 'text', 'message_ids': ['msg_1']},
+        {'index': 1, 'type': 'photos', 'message_ids': ['msg_2']},
+        {'index': 2, 'type': 'pause', 'message_ids': []},
+        {'index': 3, 'type': 'text', 'message_ids': ['msg_3']}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('response,status', [(_Resp({}, 500), 'delivery_unknown'),
+    (_Resp({}, 408), 'delivery_unknown'), (TimeoutError(), 'delivery_unknown'),
+    (_Resp({}), 'delivery_unknown'), (_Resp({}, 403), 'failed')])
+async def test_sequence_never_falls_back_after_uncertain_stack_or_other_rejection(monkeypatch, tmp_path, response, status):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    http.responses = [_Resp({'uid': 'first'}), response]
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    result = await adapter.send_sequence({'items': _intro_items()}, turn)
+    assert result['completed'][0]['message_ids'] == ['first']
+    assert result['failure']['index'] == 1 and result['failure']['status'] == status
+    assert http.posts == 2
+
+
+@pytest.mark.asyncio
+async def test_sequence_definite_stack_rejection_preserves_partial_fallback_receipt(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    http.responses = [_Resp({}, 422), _Resp({'uid': 'photo0'}), TimeoutError()]
+    result = await adapter.send_sequence({'items': [dict(type='photos', asset_ids=['p0','p1','p2','p3']), dict(type='text', body='not sent')]}, turn)
+    assert result['failure']['status'] == 'delivery_unknown'
+    assert result['failure']['message_ids'] == ['photo0'] and result['failure']['photo_index'] == 1
+    assert http.posts == 3
+    assert sum(url.endswith('/attachments') for _, url, _ in http.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_sequence_parallel_calls_cannot_interleave(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    requests = [{'items': [dict(type='text', body=n+'1'), dict(type='pause', seconds=0), dict(type='text', body=n+'2')]} for n in ('a','b')]
+    results = await asyncio.gather(*(adapter.send_sequence(a, turn) for a in requests))
+    assert all(r['success'] for r in results)
+    assert [k['json']['body'] for _, url, k in http.calls] == ['a1', 'a2', 'b1', 'b2']
+
+
+@pytest.mark.asyncio
+async def test_sequence_disconnect_cancels_pause_without_sending_the_tail(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    sleeping = asyncio.Event()
+    async def pause(seconds):
+        sleeping.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(module.asyncio, 'sleep', pause)
+    task = asyncio.create_task(adapter.send_sequence({'items': [dict(type='text',body='first'),dict(type='pause',seconds=4),dict(type='text',body='tail')]}, turn))
+    await sleeping.wait()
+    await adapter.disconnect()
+    result = await task
+    assert result['failure']['index'] == 1 and result['failure']['status'] == 'failed'
+    assert http.posts == 1 and not adapter._sequences
+
+
+@pytest.mark.asyncio
+async def test_sequence_deadline_during_post_reports_unknown_and_cancels_tail(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_TIMEOUT', 0.01)
+    entered = []
+    async def hanging(*args):
+        entered.append(True)
+        await asyncio.Event().wait()
+    monkeypatch.setattr(adapter, '_sequence_post', hanging)
+    result = await adapter.send_sequence({'items': [dict(type='text',body='first'),dict(type='text',body='tail')]}, turn)
+    assert entered == [True]
+    assert result['failure']['index'] == 0 and result['failure']['status'] == 'delivery_unknown'
+    assert not adapter._sequences
+
+@pytest.mark.asyncio
+async def test_sequence_fallback_success_keeps_photo_order_and_upload_failure_never_posts(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    http.responses = [_Resp({}, 422)]
+    result = await adapter.send_sequence({'items': [dict(type='photos', asset_ids=['p0','p1','p2','p3'])]}, turn)
+    assert result['success'] and result['completed'][0]['message_ids'] == ['msg_2','msg_3','msg_4','msg_5']
+    payloads = [k['json']['attachment_uids'] for _, u, k in http.calls if u.endswith('/messages')]
+    assert payloads[0] == [v[0] for v in payloads[1:]]
+    http.calls.clear(); http.posts = 0
+    monkeypatch.setattr(http, 'put', lambda *a, **k: _Resp({}, 500))
+    failed = await adapter.send_sequence({'items': [dict(type='photos',asset_ids=['p0'])]}, turn)
+    assert failed['failure']['status'] == 'failed' and http.posts == 0
+
+
+def test_sequence_manifest_and_files_require_root_ownership(monkeypatch, tmp_path):
+    module = _load(monkeypatch, tmp_path)
+    path = tmp_path / 'asset.png'
+    path.write_bytes(b'\x89PNG\r\n\x1a\n')
+    monkeypatch.setattr(module, 'SEQUENCE_ASSET_OWNER', path.stat().st_uid + 1)
+    with pytest.raises(ValueError, match='root-owned'):
+        module._sequence_stat(path)
+
+
+@pytest.mark.asyncio
+async def test_sequence_no_target_override_and_no_post_after_turn_completion(monkeypatch, tmp_path):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    args = {'items': [dict(type='text', body='test')], 'chat_id': 'cht_b'}
+    assert not (await adapter.send_sequence(args, turn))['success'] and http.posts == 0
+    await adapter.on_processing_complete(SimpleNamespace(source=SimpleNamespace(chat_id='cht_a')), None)
+    assert not (await adapter.send_sequence({'items': args['items']}, turn))['success']
+    assert not any(url.endswith('/messages') for _, url, _ in http.calls)
+
+
+def test_sequence_handler_registers_and_runs_on_the_adapter_loop(monkeypatch, tmp_path):
+    import threading
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    ctx = _ToolContext(); module.register(ctx)
+    tool = next(t for t in ctx.tools if t['name'] == 'plow_send_sequence')
+    assert tool['schema'] is module.PLOW_SEND_SEQUENCE_SCHEMA
+    assert tool['schema']['parameters']['additionalProperties'] is False
+    loop = asyncio.new_event_loop()
+    worker = threading.Thread(target=loop.run_forever)
+    worker.start()
+    monkeypatch.setattr(module, '_live', (adapter, loop))
+    try:
+        result = json.loads(tool['handler']({'items': [dict(type='text', body='from tool')]}))
+        assert result['success'] and result['completed'][0]['message_ids'] == ['msg_1']
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        worker.join()
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(monkeypatch, tmp_path, caplog):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    receipt = await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn)
+    assert receipt['success']
+    tail = 'Sequence delivered successfully. Deferring the owner write to next turn.\n\nNO_REPLY'
+    with caplog.at_level('DEBUG'):
+        assert (await adapter.send('cht_a', tail)).success
+    assert http.posts == 1, 'successful sequence must suppress even a substantive final process note'
+    assert tail not in caplog.text, 'the suppressed body is owner prose, not log material'
+    assert 'suppressed post-sequence reply for cht_a' in caplog.text
+
+    adapter.chat_uids = adapter.chat_uids | {'cht_b'}
+    mirrored = []
+    monkeypatch.setattr(module, '_mirror_sent', lambda *args: mirrored.append(args))
+    assert (await adapter.send('cht_b', 'Other chat')).success
+    assert mirrored == [('cht_b', 'Other chat')]
+    assert http.posts == 2
+
+    event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'))
+    await adapter.on_processing_complete(event, None)
+    assert not adapter._sequence_turns
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Between turns')).success
+    next_turn = dict(chat_uid='cht_a', owner=True, dm=True)
+    adapter._active_turn.set(next_turn)
+    adapter._sequence_turns[id(next_turn)] = next_turn
+    assert (await adapter.send('cht_a', 'Next turn')).success
+    assert http.posts == posts + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['rejected', 'failed', 'delivery_unknown'])
+async def test_unsuccessful_sequence_preserves_final_reply(monkeypatch, tmp_path, status):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    if status == 'rejected':
+        items = [dict(type='photos', asset_ids=['missing'])]
+    else:
+        items = [dict(type='text', body='Opening'), dict(type='text', body='City?')]
+        http.responses = [_Resp({'uid': 'opening'}), _Resp({}, status=400 if status == 'failed' else 500)]
+        monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    receipt = await adapter.send_sequence({'items': items}, turn)
+    assert not receipt['success']
+    assert receipt['failure']['status'] == status
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Text fallback')).success
+    assert http.posts == posts + 1
+    assert http.calls[-1][2]['json'] == {'body': 'Text fallback'}
+
+
+@pytest.mark.asyncio
+async def test_failed_sequence_after_a_successful_one_reopens_the_reply_path(monkeypatch, tmp_path):
+    """A partial delivery must not silence the recovery text.
+
+    Suppression tracks the turn's latest sequence. When an earlier sequence in
+    the same turn succeeded and a later one fails, the owner still needs the
+    model's explanation of what did and did not arrive.
+    """
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+
+    first = await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, turn)
+    assert first['success']
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Trailing prose')).success
+    assert http.posts == posts, 'a completed sequence still suppresses trailing prose'
+
+    http.responses = [_Resp({}, status=400)]
+    second = await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn)
+    assert not second['success']
+
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Only the opening arrived.')).success
+    assert http.posts == posts + 1
+    assert http.calls[-1][2]['json'] == {'body': 'Only the opening arrived.'}
+
+
+@pytest.mark.asyncio
+async def test_sequence_delivery_reaches_the_goal_transcript(monkeypatch, tmp_path):
+    """A goal judges what the owner was shown, including what a sequence sent.
+
+    The sequence transport posts directly, and its success suppresses the
+    trailing reply — so without capture here the turn's transcript is empty
+    and the judge can retire a goal the sequence already achieved.
+    """
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    items = [dict(type='text', body='Here are four previews.'),
+             dict(type='photos', asset_ids=['p0', 'p1', 'p2', 'p3'])]
+    assert (await adapter.send_sequence({'items': items}, turn))['success']
+
+    said = turn.get('said') or []
+    assert 'Here are four previews.' in said, 'the sequence text never reached the judge'
+    assert any('4 photos' in entry for entry in said), 'the photo stack left no trace'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('send_kind', ['attachment', 'status'])
+async def test_post_sequence_suppression_covers_attachments_and_status(
+        monkeypatch, tmp_path, send_kind):
+    """The two paths the live-turn test cannot reach through send().
+
+    Same-chat text, cross-chat text and turn lifetime are already covered
+    there; these are the leaves that kept speaking after a delivered
+    sequence because the gate lived inside send() rather than the guard.
+    """
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    monkeypatch.setattr(adapter, '_verbose_enabled', mock.AsyncMock(return_value=True))
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, turn))['success']
+
+    posted = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, '_post_message', posted)
+    if send_kind == 'attachment':
+        attachment = tmp_path / 'note.txt'
+        attachment.write_text('trailing')
+        result = await adapter._send_attachment('cht_a', str(attachment), caption='and one more thing')
+    else:
+        result = await adapter.send_or_update_status('cht_a', 'working', 'still going')
+
+    assert result.success is True, 'suppression is not an error the gateway should retry'
+    assert posted.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_later_turn_start_does_not_strip_the_running_turn(monkeypatch, tmp_path):
+    """Both live same-chat turns keep their own ownership.
+
+    A goal wake starting mid-introduction used to take the chat's only
+    ownership slot, so the running turn's next item was refused by its own
+    guard and its completed-sequence suppression stopped matching.
+    """
+    module, adapter, first, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, first))['success']
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm'),
+        channel_prompt='', message_id='', text='')
+    await adapter.on_processing_start(event)
+    second = adapter._active_turn.get()
+    assert second is not first, 'the fixture should have produced a distinct second turn'
+
+    module._ACTIVE_TURN.set(first)
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Trailing prose')).success
+    assert http.posts == posts, "the running turn lost its suppression when a second turn started"
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Tail')]}, first))['success'], \
+        "the running turn was refused by its own guard"
+
+
+@pytest.mark.asyncio
+async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, tmp_path):
+    """A goal wake and an inbound turn can be live on one chat at once.
+
+    The completion of the older turn must not evict the newer turn's
+    ownership or cancel the sequence it still has in flight.
+    """
+    module, adapter, first, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    second = dict(chat_uid='cht_a', owner=True, dm=True)
+    adapter._sequence_turns[id(second)] = second
+    running = asyncio.get_running_loop().create_future()
+    task = asyncio.ensure_future(running)
+    adapter._sequences[task] = second
+
+    monkeypatch.setattr(adapter, '_cancel_typing', lambda *a, **k: None)
+    monkeypatch.setattr(adapter, '_goal_after_turn', mock.AsyncMock())
+    module._ACTIVE_TURN.set(first)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'), message_id='', text='')
+    await adapter.on_processing_complete(event, None)
+
+    assert adapter._sequence_turns.get(id(second)) is second, "the older turn evicted its successor"
+    assert not task.cancelled(), "the older turn cancelled its successor's sequence"
+    task.cancel()
 
 
 @pytest.mark.parametrize(
