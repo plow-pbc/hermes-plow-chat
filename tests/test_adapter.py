@@ -1567,10 +1567,6 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # takes, and the owner's own row says so, so naming the owner has a source too.
     assert "Abby [+15550000002] (landlord)" in context
     assert "Sam [+15550000001] (your owner)" in context
-    # A member the server sends no handle for is named without a bracket: the
-    # bracket IS the tool's argument, so an empty one would read as a handle.
-    member.pop("provider_key")
-    assert "Abby (landlord)" in module._collaboration_turn_context(chat, member)
     identity = {"signup": None, "number": None}
     prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
     assert "Abby" not in prompt

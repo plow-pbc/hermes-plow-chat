@@ -234,11 +234,8 @@ def _collaboration_turn_context(chat, sender):
         # argument has a roster value to be filled from -- the owner's own row
         # included, since naming their handle writes their account name.
         name = p.get("display_name") or p.get("uid")
-        # No handle, no bracket: the bracket is the tool's argument, so an
-        # absent one must read as "you cannot name this person", never as a
-        # `None` the model would send as a handle.
-        handle = p.get("provider_key")
-        label = f"{name} [{handle}]" if handle else str(name)
+        handle = p["provider_key"]
+        label = f"{name} [{handle}]"
         if p.get("relationship"):
             label = f"{label} ({p['relationship']})"
         return f"{label} (your owner)" if p.get("role") == "owner" else label
@@ -2053,10 +2050,7 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def name_contact(self, handle, body):
         """PUT the owner's name/relationship for one handle in their contact book.
 
-        Keyed by handle, not by chat: one book covers everyone the owner can
-        name, in a granted chat or not, so there is no chat to run
-        `_send_guard` against -- the caller's owner-turn check is the whole
-        gate.
+        No `_send_guard`: no chat to scope to; the owner-turn check is the gate.
 
         Same non-2xx convention as `start_group_thread`: read the body once,
         raise `_PlowSendError(status, text)` past 400 so the tool's own
@@ -3181,13 +3175,8 @@ def _plow_name_contact(args, **_kwargs):
     only ever be written by a call made on the owner's own turn. The turn is
     read for that authority alone; the write itself is not chat-scoped.
 
-    Ruled, so it is not re-argued: the handle is deliberately NOT validated
-    against any roster. Naming someone met in another thread, or the owner
-    themselves, is the feature -- a roster check would refuse exactly the
-    calls this tool exists for. The owner's own turn is the whole trust
-    boundary, and it is the same one that already lets
-    `plow_start_group_message` text an arbitrary handle, which is the larger
-    authority of the two.
+    The handle is not roster-scoped: any handle the owner names is written.
+    The owner's own turn is the whole trust boundary.
     """
     turn = _ACTIVE_TURN.get()
     if turn is None or not turn.get("owner"):
