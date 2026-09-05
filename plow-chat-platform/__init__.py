@@ -1168,7 +1168,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                         "triggered_at": datetime.now(timezone.utc).isoformat(),
                     })
         self._active_turn.set(turn)
-        self._sequence_turns[chat_uid] = turn
+        # Keyed by the turn's identity, not its chat: a goal wake and a real
+        # inbound turn can both be live on one chat, and a single slot per chat
+        # means the later start silently strips the earlier turn of the
+        # ownership its running sequence is still checking. The dict holds the
+        # turn itself, so the id stays unique for as long as it is a key.
+        self._sequence_turns[id(turn)] = turn
 
     async def on_processing_complete(self, event, outcome):
         chat_uid = event.source.chat_id
@@ -1178,12 +1183,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
-        # Ownership and cancellation both key off THIS turn, never the chat's
-        # current entry: two turns for one chat overlap, so a completion that
-        # popped by chat would evict its successor's ownership and cancel the
-        # sequence that successor still has in flight.
-        if self._sequence_turns.get(chat_uid) is turn:
-            del self._sequence_turns[chat_uid]
+        # This turn's ownership and this turn's tasks: a completion that
+        # reached for the chat's entry instead would retire whichever turn
+        # started last and cancel the sequence it still has in flight.
+        if turn is not None:
+            self._sequence_turns.pop(id(turn), None)
         for task, owner in tuple(self._sequences.items()):
             if owner is turn:
                 task.cancel()
@@ -1574,7 +1578,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         # trailing prose the model adds after it is the same duplicate the
         # peer gate above exists to stop. Keyed on the sequence's own turn
         # rather than the chat, so it lifts the moment that turn ends.
-        if turn and turn.get("sequence_completed") and self._sequence_turns.get(chat_id) is turn:
+        if (turn and turn.get("sequence_completed") and id(turn) in self._sequence_turns
+                and chat_id == turn["chat_uid"]):
             log.debug("[plow_chat] suppressed post-sequence reply for %s", chat_id)
             return SendResult(success=True)
         return None
@@ -1806,7 +1811,7 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     def _sequence_guard(self, turn):
         chat_uid = turn.get("chat_uid")
-        if (self._sequence_turns.get(chat_uid) is not turn or not turn.get("owner")
+        if (id(turn) not in self._sequence_turns or not turn.get("owner")
                 or not turn.get("dm") or not _owner_dm(self._chats.get(chat_uid, {}))
                 or self._send_guard(chat_uid) is not None):
             raise ValueError("sequence requires the current solo owner DM within the grant")

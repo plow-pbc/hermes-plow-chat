@@ -4870,7 +4870,7 @@ def _sequence_fixture(monkeypatch, tmp_path):
     adapter._chats['cht_a']['participants'] = [dict(type='member', role='owner', uid='owner')]
     turn = dict(chat_uid='cht_a', owner=True, dm=True)
     module._ACTIVE_TURN.set(turn)
-    adapter._sequence_turns['cht_a'] = turn
+    adapter._sequence_turns[id(turn)] = turn
     root = tmp_path / 'assets'
     root.mkdir(mode=0o755)
     for i in range(4):
@@ -5148,7 +5148,7 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
     assert (await adapter.send('cht_a', 'Between turns')).success
     next_turn = dict(chat_uid='cht_a', owner=True, dm=True)
     adapter._active_turn.set(next_turn)
-    adapter._sequence_turns['cht_a'] = next_turn
+    adapter._sequence_turns[id(next_turn)] = next_turn
     assert (await adapter.send('cht_a', 'Next turn')).success
     assert http.posts == posts + 2
 
@@ -5247,6 +5247,33 @@ async def test_post_sequence_suppression_covers_attachments_and_status(
 
 
 @pytest.mark.asyncio
+async def test_a_later_turn_start_does_not_strip_the_running_turn(monkeypatch, tmp_path):
+    """Both live same-chat turns keep their own ownership.
+
+    A goal wake starting mid-introduction used to take the chat's only
+    ownership slot, so the running turn's next item was refused by its own
+    guard and its completed-sequence suppression stopped matching.
+    """
+    module, adapter, first, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, first))['success']
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm'),
+        channel_prompt='', message_id='', text='')
+    await adapter.on_processing_start(event)
+    second = adapter._active_turn.get()
+    assert second is not first, 'the fixture should have produced a distinct second turn'
+
+    module._ACTIVE_TURN.set(first)
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Trailing prose')).success
+    assert http.posts == posts, "the running turn lost its suppression when a second turn started"
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Tail')]}, first))['success'], \
+        "the running turn was refused by its own guard"
+
+
+@pytest.mark.asyncio
 async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, tmp_path):
     """A goal wake and an inbound turn can be live on one chat at once.
 
@@ -5255,7 +5282,7 @@ async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, 
     """
     module, adapter, first, root, http = _sequence_fixture(monkeypatch, tmp_path)
     second = dict(chat_uid='cht_a', owner=True, dm=True)
-    adapter._sequence_turns['cht_a'] = second
+    adapter._sequence_turns[id(second)] = second
     running = asyncio.get_running_loop().create_future()
     task = asyncio.ensure_future(running)
     adapter._sequences[task] = second
@@ -5266,7 +5293,7 @@ async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, 
     event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'), message_id='', text='')
     await adapter.on_processing_complete(event, None)
 
-    assert adapter._sequence_turns.get('cht_a') is second, "the older turn evicted its successor"
+    assert adapter._sequence_turns.get(id(second)) is second, "the older turn evicted its successor"
     assert not task.cancelled(), "the older turn cancelled its successor's sequence"
     task.cancel()
 
