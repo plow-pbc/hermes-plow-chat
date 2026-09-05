@@ -825,10 +825,22 @@ def _with_identity(prompt, name, identity):
     return f"{who} {_plow_facts(identity)} {prompt}"
 
 
+def _one_line(text):
+    """A person-supplied name, made safe to interpolate.
+
+    Whitespace collapses to single spaces -- a newline in a name opens a line
+    that reads like a fresh instruction, which matters most where the name
+    lands in system authority -- and the result is capped, so no one name can
+    crowd out the prompt it sits in. Empty is empty; each caller owns its own
+    fallback.
+    """
+    return " ".join(str(text or "").split())[:100]
+
+
 def _participant_identity(participant):
     """Choose a one-line server identity: meaningful name, then full handle."""
     handle = str(participant.get("provider_key") or "").strip()
-    display = " ".join(str(participant.get("display_name") or "").split())[:100]
+    display = _one_line(participant.get("display_name"))
     return display if display and display != handle else handle
 
 # The connected adapter and the loop its listener task runs on. The group-message
@@ -1098,14 +1110,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                 profile = await resp.json(content_type=None)
             referred = (profile or {}).get("referred_by")
             if referred:
-                # The inviter chose this name, and it lands in a system-authority
-                # prompt -- so it goes through _participant_identity's own
-                # collapse-and-cap, which is what keeps a newline from opening a
-                # second line that reads like a second instruction. An anonymous
-                # inviter is still an inviter; the product name is what makes the
-                # sentence mean anything, so it is required.
-                name = " ".join(str(referred.get("display_name") or "").split())[:100]
-                self._referred_by = (name or "someone", referred["provider_display_name"])
+                # The inviter chose this name and it lands in system authority,
+                # so it goes through the same _one_line a roster name does. An
+                # anonymous inviter is still an inviter; the product name is
+                # what makes the sentence mean anything, so it is required.
+                self._referred_by = (_one_line(referred.get("display_name")) or "someone",
+                                     referred["provider_display_name"])
         except Exception as exc:             # noqa: BLE001 - never worth failing the connect
             log.info("[plow_chat] referrer read failed: %s: %s", type(exc).__name__, exc)
 

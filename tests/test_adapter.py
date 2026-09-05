@@ -2230,6 +2230,35 @@ def test_the_contact_book_reads_on_the_owners_turn_and_on_no_turn_but_never_a_me
     assert record == ([()] if read else []), "a refusal must not reach Plow at all"
 
 
+@pytest.mark.parametrize(
+    ("status", "declines"),
+    [
+        pytest.param(200, False, id="rows-as-the-server-wrote-them"),
+        pytest.param(500, True, id="a-failed-read-is-not-an-empty-book"),
+    ],
+)
+async def test_contacts_gets_the_book_and_a_failed_read_declines_rather_than_reading_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int, declines: bool,
+) -> None:
+    """An empty book is a claim -- that the owner has no name and nobody has
+    been named -- so a failed read must not be able to make it. It raises the
+    same `_PlowSendError` the write path does, which is what the tool catches."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    book = [{"provider_key": "+15550000001", "display_name": "Sam", "relationship": None, "role": "owner"}]
+    http = _ChatResourceHTTP(_Resp(book, status=status))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    if declines:
+        with pytest.raises(module._PlowSendError):
+            await adapter.contacts()
+    else:
+        assert await adapter.contacts() == book
+    assert http.calls[0][0] == "get"
+    assert http.calls[0][1] == f"{module.BASE}/v1/contacts"
+    assert http.calls[0][2]["headers"] == adapter.auth
+
+
 async def test_name_contact_puts_to_the_handle_keyed_route_and_encodes_the_segment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
