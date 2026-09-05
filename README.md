@@ -27,8 +27,9 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
 > `agent-mgr` SHA advance), and
-> `PATCH /v1/chats/{chat_uid}/participants/{participant_uid}/contact`
-> (`plow_chat_name_contact` — [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
+> `PUT /v1/contacts/{handle}` (`plow_name_contact` — the handle-keyed contact
+> book, superseding the per-participant contact route of
+> [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
 > "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
@@ -252,16 +253,41 @@ In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
 in the untrusted roster context above, never in the prompt.
 
-The owner may also tell the agent what to call a roster member and who that
-person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
-which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
-The tool is owner-turn-authorized only; it refuses outright during a member's
-turn and outside any active turn at all — a direct call cannot write a label
-except on the owner's own turn. A relationship renders as
-`Name [uid] (relationship)` in the untrusted roster context above, never in
+The owner may also tell the agent what to call a person and who that person is
+to the owner — `wife`, `landlord` — through `plow_name_contact`, which `PUT`s
+`/v1/contacts/{handle}`. The book is keyed by handle, not by chat, so one name
+follows the person into every thread they are in; naming the owner's own handle
+sets their account name, and a relationship on their own handle is refused. The
+tool is owner-turn-authorized only; it refuses outright during a member's turn
+and outside any active turn at all — a direct call cannot write a label except
+on the owner's own turn. A relationship renders as
+`Name [handle] (relationship)` in the untrusted roster context above — where
+the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
-claim about who they are is just that — a claim.
+claim about who they are is just that — a claim. Every roster-bearing prompt
+also tells the agent that a row still showing a bare handle — its owner's
+included — is a name to ask for once and record with the tool, never one to
+guess out of mail, calendar or memory. `plow_contacts` reads the book back,
+owner's row first, for the turns that have no roster at all — a Hermes-cron
+turn carries no chat, and this is where its owner's own name comes from; it
+reads on the owner's turn and on no turn, and is refused on a member's. An
+owner turn needs no such read: the chat resource every one of them already
+re-reads carries the owner as a participant — name, handle and role — in a solo
+DM as much as in a group. That is what the channel prompt names them from:
+`Your owner is Sam [+1…].`, or, while they are still unnamed, the same ask with
+their handle already filled in, since a solo DM and a goal wake have no roster
+for the paragraph above to gate on. A name they change lands on their very next
+turn, with nothing cached and nothing else to fetch.
+
+Who invited the owner is read once per process start, from
+`GET /v1/auth/profile` on connect. That name the inviter chose for themselves,
+so it is never a prompt sentence: it arrives on the owner's turn as one more
+untrusted block in front of the text, beside the roster — `[Untrusted account
+data; … Your owner was invited by Sam (Life Assistant).]`, or `someone` where
+the inviter has no name of their own. A failed read leaves it unset and the
+agent connects anyway; a member's turn carries neither this nor the owner's
+own name.
 
 ## Media
 
