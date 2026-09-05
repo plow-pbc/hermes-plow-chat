@@ -1588,9 +1588,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         await self._refresh_current_chat(chat_uid)
         chat = await self.get_chat_info(chat_uid)
         owner_dm = _owner_dm(self._chats[chat_uid])
-        # Goal line outermost, then the untrusted blocks, then the turn -- the
-        # order `_deliver` builds and `_recall_query` reads, so the two paths
-        # cannot drift into stripping different things off the same shape.
+        # Goal line outermost, then the untrusted blocks, then the turn: the
+        # order `_deliver` builds, so the two paths that assemble a turn stay
+        # one shape rather than two.
         referrer = (f"{_referrer_block(self._referred_by)}\n\n"
                     if owner_dm and self._referred_by else "")
         event = MessageEvent(
