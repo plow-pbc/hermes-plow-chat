@@ -5219,28 +5219,17 @@ async def test_sequence_delivery_reaches_the_goal_transcript(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("send_kind", "chat_id", "delivered"),
-    [
-        ("text", "cht_a", False),
-        ("attachment", "cht_a", False),
-        ("status", "cht_a", False),
-        ("text", "cht_b", True),
-    ],
-    ids=["same-chat-text", "same-chat-attachment", "same-chat-verbose-status", "cross-chat-text"],
-)
-async def test_post_sequence_suppression_covers_every_send_path(
-        monkeypatch, tmp_path, send_kind, chat_id, delivered):
-    """One gate, every outbound path — the lesson the peer gate already paid for.
+@pytest.mark.parametrize('send_kind', ['attachment', 'status'])
+async def test_post_sequence_suppression_covers_attachments_and_status(
+        monkeypatch, tmp_path, send_kind):
+    """The two paths the live-turn test cannot reach through send().
 
-    A completed sequence delivered the owner's copy, so a trailing status
-    frame or MEDIA send is the same duplicate as trailing text. Only a send
-    to a different granted chat is a different act.
+    Same-chat text, cross-chat text and turn lifetime are already covered
+    there; these are the leaves that kept speaking after a delivered
+    sequence because the gate lived inside send() rather than the guard.
     """
     module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
-    adapter.chat_uids = adapter.chat_uids | {'cht_b'}
-    monkeypatch.setattr(module, '_mirror_sent', lambda *args: None)
     monkeypatch.setattr(adapter, '_verbose_enabled', mock.AsyncMock(return_value=True))
     assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, turn))['success']
 
@@ -5249,14 +5238,37 @@ async def test_post_sequence_suppression_covers_every_send_path(
     if send_kind == 'attachment':
         attachment = tmp_path / 'note.txt'
         attachment.write_text('trailing')
-        result = await adapter._send_attachment(chat_id, str(attachment), caption='and one more thing')
-    elif send_kind == 'status':
-        result = await adapter.send_or_update_status(chat_id, 'working', 'still going')
+        result = await adapter._send_attachment('cht_a', str(attachment), caption='and one more thing')
     else:
-        result = await adapter.send(chat_id, 'And one more thing.')
+        result = await adapter.send_or_update_status('cht_a', 'working', 'still going')
 
     assert result.success is True, 'suppression is not an error the gateway should retry'
-    assert posted.await_count == (1 if delivered else 0)
+    assert posted.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, tmp_path):
+    """A goal wake and an inbound turn can be live on one chat at once.
+
+    The completion of the older turn must not evict the newer turn's
+    ownership or cancel the sequence it still has in flight.
+    """
+    module, adapter, first, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    second = dict(chat_uid='cht_a', owner=True, dm=True)
+    adapter._sequence_turns['cht_a'] = second
+    running = asyncio.get_running_loop().create_future()
+    task = asyncio.ensure_future(running)
+    adapter._sequences[task] = second
+
+    monkeypatch.setattr(adapter, '_cancel_typing', lambda *a, **k: None)
+    monkeypatch.setattr(adapter, '_goal_after_turn', mock.AsyncMock())
+    module._ACTIVE_TURN.set(first)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'), message_id='', text='')
+    await adapter.on_processing_complete(event, None)
+
+    assert adapter._sequence_turns.get('cht_a') is second, "the older turn evicted its successor"
+    assert not task.cancelled(), "the older turn cancelled its successor's sequence"
+    task.cancel()
 
 
 @pytest.mark.parametrize(

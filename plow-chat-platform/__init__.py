@@ -1178,7 +1178,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
-        turn = self._sequence_turns.pop(chat_uid, None)
+        # Ownership and cancellation both key off THIS turn, never the chat's
+        # current entry: two turns for one chat overlap, so a completion that
+        # popped by chat would evict its successor's ownership and cancel the
+        # sequence that successor still has in flight.
+        if self._sequence_turns.get(chat_uid) is turn:
+            del self._sequence_turns[chat_uid]
         for task, owner in tuple(self._sequences.items()):
             if owner is turn:
                 task.cancel()
