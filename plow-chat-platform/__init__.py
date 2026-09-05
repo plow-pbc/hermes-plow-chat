@@ -537,6 +537,28 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
+def _owner_identity(chat):
+    """The owner's name and handle, off the chat every owner turn refreshes.
+
+    The chat resource carries its owner as a participant -- name, handle and
+    role -- in a solo DM as much as a group, even though a DM renders no roster
+    BLOCK. So there is nothing to fetch: the turn already re-read the one
+    resource that answers this, and a name the owner changes lands on their
+    very next turn with no cache and no second request.
+
+    No default on the `next`: `role == "owner"` is how this turn was chosen in
+    the first place, so a chat that then has no owner participant is a broken
+    contract, not a case to render around.
+    """
+    owner = next(p for p in chat.get("participants") or []
+                 if p.get("type") == "member" and p.get("role") == "owner")
+    # `_participant_identity` already answers "named, or still a bare handle?"
+    # -- it hands back the handle itself when there is no meaningful name.
+    handle = _one_line(owner.get("provider_key"))
+    name = _participant_identity(owner)
+    return (None if name == handle else name, handle)
+
+
 def _owner_fact(owner):
     """What an owner turn is told about its own owner.
 
@@ -554,7 +576,7 @@ def _owner_fact(owner):
             f"plow_name_contact(handle={handle}). {_NEVER_GUESS}")
 
 
-def _channel_prompt(chat, role, roster, identity, owner):
+def _channel_prompt(chat, role, roster, identity):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
@@ -571,13 +593,13 @@ def _channel_prompt(chat, role, roster, identity, owner):
         else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
         else OWNER_CHANNEL_PROMPT
     )
-    if role == "owner" and owner:
+    if role == "owner":
         # A fact about the owner's own account, so it rides their turn in every
-        # room and no member's anywhere. Appended here, from the caller's own
-        # read, because the prompt constants stay constants. The name in it is
-        # the owner's own; the INVITER's name is theirs, so it arrives as turn
-        # data instead -- see _referrer_block.
-        prompt = f"{prompt} {_owner_fact(owner)}"
+        # room and no member's anywhere. Read off the roster this turn already
+        # refreshed, because the prompt constants stay constants. The name in
+        # it is the owner's own; the INVITER's name is theirs, so it arrives as
+        # turn data instead -- see _referrer_block.
+        prompt = f"{prompt} {_owner_fact(_owner_identity(roster))}"
     return _collaboration_prompt(prompt, roster, identity)
 
 
@@ -1153,25 +1175,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:             # noqa: BLE001 - never worth failing the connect
             log.info("[plow_chat] referrer read failed: %s: %s", type(exc).__name__, exc)
 
-    async def _read_owner(self):
-        """Who the owner is, for the rooms with no roster to say so.
-
-        The contact book is the only source: a solo DM and a goal wake carry no
-        roster, and the owner's own row is the one the server puts first. Read
-        for the turn that is about to say it and returned, never held: the
-        owner can name themselves mid-conversation, and one GET per owner turn
-        is what makes that land on the very next turn with no cache to keep in
-        sync. A failed read says nothing this turn rather than repeating a
-        stale answer, and never costs the turn.
-        """
-        try:
-            owner = (await self.contacts())[0]
-            return (_one_line(owner.get("display_name")) or None,
-                    _one_line(owner["provider_key"]))
-        except Exception as exc:             # noqa: BLE001 - the turn goes on without it
-            log.info("[plow_chat] owner read failed: %s: %s", type(exc).__name__, exc)
-            return None
-
     async def _persist_home(self):
         """Declare the home channel used for cron and default delivery."""
         chat = await self.get_chat_info(self.home_chat_uid)
@@ -1205,8 +1208,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             await self._refresh_reach(http)
             # Who invited the owner never changes, so it is read once per
             # process start rather than on every reconnect, and may not fail
-            # the connect. Who the owner IS can change mid-conversation, so it
-            # is not read here at all -- see _read_owner.
+            # the connect. Who the owner IS comes off the chat resource each
+            # turn refreshes -- see _owner_identity -- so it is not read here.
             if not is_reconnect:
                 await self._read_referrer(http)
         # Declare the home channel, so the customer is never asked /sethome.
@@ -1603,8 +1606,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[chat_uid], self._identity,
-                                           await self._read_owner() if owner_dm else None) + _SILENCE_OPTION,
+                                           self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
@@ -2625,8 +2627,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{_referrer_block(self._referred_by)}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster, self._identity,
-                                         await self._read_owner() if role == "owner" else None)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so

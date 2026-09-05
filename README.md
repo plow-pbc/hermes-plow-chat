@@ -271,12 +271,14 @@ included — is a name to ask for once and record with the tool, never one to
 guess out of mail, calendar or memory. `plow_contacts` reads the book back,
 owner's row first, for the turns that have no roster at all — a Hermes-cron
 turn carries no chat, and this is where its owner's own name comes from; it
-reads on the owner's turn and on no turn, and is refused on a member's. The
-owner's own row is read again for each owner turn — never cached, so naming
-them lands on the very next turn — and named in the channel prompt:
+reads on the owner's turn and on no turn, and is refused on a member's. An
+owner turn needs no such read: the chat resource every one of them already
+re-reads carries the owner as a participant — name, handle and role — in a solo
+DM as much as in a group. That is what the channel prompt names them from:
 `Your owner is Sam [+1…].`, or, while they are still unnamed, the same ask with
 their handle already filled in, since a solo DM and a goal wake have no roster
-for the paragraph above to gate on. A read that fails says nothing that turn.
+for the paragraph above to gate on. A name they change lands on their very next
+turn, with nothing cached and nothing else to fetch.
 
 Who invited the owner is read once per process start, from
 `GET /v1/auth/profile` on connect. That name the inviter chose for themselves,
