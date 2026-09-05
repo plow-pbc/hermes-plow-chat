@@ -336,7 +336,16 @@ Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 The P
 ## Ordered owner-DM delivery
 
 `plow_send_sequence` sends a bounded sequence to the active turn's solo owner
-DM. It accepts no destination or file path. Example tool arguments:
+DM. It accepts no destination or file path.
+
+Owners can call it only once the base image bumps its plugin pin: a deployed
+agent runs the plugin baked into its image, not this repository, so landing the
+tool here does not by itself put it in front of anyone. Bumping the pin is a
+post-merge step — it names a merge commit, which does not exist while the change
+is still under review — and rebuilding and re-pinning the blessed image follows
+it.
+
+Example tool arguments:
 
 ```json
 {"items":[{"type":"text","body":"Here are the previews."},{"type":"photos","asset_ids":["preview_a","preview_b","preview_c","preview_d"]},{"type":"pause","seconds":4},{"type":"text","body":"What do you think?"}]}
