@@ -293,10 +293,12 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
     participants = [
         {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
         if agent_name else {"type": "agent"},
-        {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner"},
+        {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner",
+         "provider_key": "+15550000001"},
     ]
     if group:
-        participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member"})
+        participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
+                             "provider_key": "+15550000002"})
     return {"uid": uid, "display_name": name, "participants": participants,
             "trusted": trusted}
 
@@ -366,8 +368,10 @@ def _collaboration_chat() -> dict[str, Any]:
                 "represents_participant_uid": "mem_daniel_cht_a",
                 "line": {"uid": "ln_ash", "display_name": "Ash"},
             },
-            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner"},
-            {"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member"},
+            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner",
+             "provider_key": "+15550000001"},
+            {"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member",
+             "provider_key": "+15550000002"},
         ],
     }
 
@@ -383,7 +387,8 @@ def _dm_chat() -> dict[str, Any]:
                 "represents_participant_uid": "mem_sam_cht_a",
                 "line": {"uid": "ln_elm", "display_name": "Elm"},
             },
-            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner"},
+            {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner",
+             "provider_key": "+15550000001"},
         ],
     }
 
@@ -392,7 +397,8 @@ def _human_group_chat() -> dict[str, Any]:
     """A group of humans with one agent in it: no peer, but a real roster."""
     chat = _dm_chat()
     chat["participants"].append(
-        {"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member"}
+        {"type": "member", "uid": "mem_daniel_cht_a", "display_name": "Daniel", "role": "member",
+         "provider_key": "+15550000002"}
     )
     return chat
 
@@ -1557,7 +1563,14 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # example -- otherwise a leaked relationship would go uncaught below.
     member["display_name"], member["relationship"] = "Abby", "landlord"
     context = module._collaboration_turn_context(chat, member)
-    assert "Abby [mem_daniel_cht_a] (landlord)" in context
+    # The handle, not the uid: it is what plow_name_contact's `handle` argument
+    # takes, and the owner's own row says so, so naming the owner has a source too.
+    assert "Abby [+15550000002] (landlord)" in context
+    assert "Sam [+15550000001] (your owner)" in context
+    # A member the server sends no handle for is named without a bracket: the
+    # bracket IS the tool's argument, so an empty one would read as a handle.
+    member.pop("provider_key")
+    assert "Abby (landlord)" in module._collaboration_turn_context(chat, member)
     identity = {"signup": None, "number": None}
     prompt = module._collaboration_prompt(module.EXTERNAL_CHANNEL_PROMPT, chat, identity)
     assert "Abby" not in prompt
@@ -2013,7 +2026,7 @@ def test_tools_register_with_optional_deferred_questions(
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
         "plow_send_message",
-        "plow_chat_name_contact",
+        "plow_name_contact",
         "plow_set_conversation_trusted",
         "plow_offer_invite",
         "plow_send_sequence",
@@ -2032,7 +2045,8 @@ def test_tools_register_with_optional_deferred_questions(
     assert send_message_tool["check_fn"]()
 
     name_contact_tool = ctx.tools[2]
-    assert name_contact_tool["schema"]["name"] == "plow_chat_name_contact"
+    assert name_contact_tool["schema"]["name"] == "plow_name_contact"
+    assert name_contact_tool["schema"]["parameters"]["required"] == ["handle"]
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert name_contact_tool["check_fn"]()
 
@@ -2088,13 +2102,13 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     record: list[Any] = []
     _live_tool(
         module, monkeypatch, "name_contact",
-        result=lambda chat_id, participant_id, body: {
-            "uid": participant_id, "display_name": body.get("display_name"),
+        result=lambda handle, body: {
+            "handle": handle, "display_name": body.get("display_name"),
             "relationship": body.get("relationship"),
         },
         record=record,
     )
-    args = {"participant_id": "cp_abby", "display_name": "Abby", "relationship": "wife"}
+    args = {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}
 
     outside = json.loads(module._plow_name_contact(dict(args)))
     assert outside["success"] is False and "owner" in outside["error"]
@@ -2108,7 +2122,8 @@ def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_name_contact(dict(args)))
     assert out["success"] is True
-    assert record == [("cht_a", "cp_abby", {"display_name": "Abby", "relationship": "wife"})]
+    # No chat id rides along: the contact book is keyed by handle, not by room.
+    assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
 
 
 @pytest.mark.parametrize(
@@ -2123,7 +2138,7 @@ def test_naming_reports_unconfirmed_write_on_network_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int | None, expected: str,
 ) -> None:
     """A timeout, a dropped connection, or a 5xx all say nothing about whether
-    the PATCH landed, so none reads back as an ordinary, retry-worthy failure --
+    the PUT landed, so none reads back as an ordinary, retry-worthy failure --
     only a 4xx is Plow itself definitively declining."""
     module = _load(monkeypatch, tmp_path)
     raises = TimeoutError("no response") if status is None else module._PlowSendError(status, "detail")
@@ -2131,28 +2146,27 @@ def test_naming_reports_unconfirmed_write_on_network_error(
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
 
     out = json.loads(module._plow_name_contact(
-        {"participant_id": "cp_abby", "display_name": "Abby"}))
+        {"handle": "+15550000002", "display_name": "Abby"}))
 
     assert out["success"] is False
     assert expected in out["error"]
 
 
-async def test_name_contact_percent_encodes_the_participant_id_path_segment(
+async def test_name_contact_puts_to_the_handle_keyed_route_and_encodes_the_segment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """participant_id is model-supplied and lands in a bearer-authenticated
-    URL path -- percent-encode it as one segment so a value like "../.." walks
-    nothing but its own segment."""
+    """The handle is model-supplied and lands in a bearer-authenticated URL
+    path -- percent-encode it as one segment so a value like "../.." walks
+    nothing but its own segment, and so a "+" survives as itself."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a")])
-    http = _ChatResourceHTTP(_Resp({"uid": "cp_x"}))
+    http = _ChatResourceHTTP(_Resp({"handle": "+15550000002"}))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
-    await adapter.name_contact("cht_a", "cp_x/../../etc", {"display_name": "Abby"})
+    await adapter.name_contact("+15550000002/../../etc", {"display_name": "Abby"})
 
-    assert http.calls[0][0] == "patch"
-    assert http.calls[0][1] == f"{module.BASE}/v1/chats/cht_a/participants/cp_x%2F..%2F..%2Fetc/contact"
+    assert http.calls[0][0] == "put"
+    assert http.calls[0][1] == f"{module.BASE}/v1/contacts/%2B15550000002%2F..%2F..%2Fetc"
 
 
 def _invite_turn(**overrides: Any) -> dict[str, Any]:

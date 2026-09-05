@@ -230,11 +230,18 @@ def _collaboration_turn_context(chat, sender):
     if _is_solo_dm(chat):
         return ""
     def _human_label(p):
-        # The uid rides alongside the name so plow_chat_name_contact's
-        # participant_id argument has a roster value to be filled from.
+        # The handle rides alongside the name so plow_name_contact's `handle`
+        # argument has a roster value to be filled from -- the owner's own row
+        # included, since naming their handle writes their account name.
         name = p.get("display_name") or p.get("uid")
-        label = f"{name} [{p['uid']}]"
-        return f"{label} ({p['relationship']})" if p.get("relationship") else label
+        # No handle, no bracket: the bracket is the tool's argument, so an
+        # absent one must read as "you cannot name this person", never as a
+        # `None` the model would send as a handle.
+        handle = p.get("provider_key")
+        label = f"{name} [{handle}]" if handle else str(name)
+        if p.get("relationship"):
+            label = f"{label} ({p['relationship']})"
+        return f"{label} (your owner)" if p.get("role") == "owner" else label
 
     humans = [_human_label(p) for p in participants if p.get("type") == "member"]
     mappings = []
@@ -2043,8 +2050,13 @@ class PlowChatAdapter(BasePlatformAdapter):
                 data["adoption"] = f"adopted-unanchored: {type(exc).__name__}"
         return data
 
-    async def name_contact(self, chat_id, participant_id, body):
-        """PATCH the owner's name/relationship for one roster participant.
+    async def name_contact(self, handle, body):
+        """PUT the owner's name/relationship for one handle in their contact book.
+
+        Keyed by handle, not by chat: one book covers everyone the owner can
+        name, in a granted chat or not, so there is no chat to run
+        `_send_guard` against -- the caller's owner-turn check is the whole
+        gate.
 
         Same non-2xx convention as `start_group_thread`: read the body once,
         raise `_PlowSendError(status, text)` past 400 so the tool's own
@@ -2052,13 +2064,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         `resp.raise_for_status()` -- that raises aiohttp's own exception for
         anything but 401, which the tool does not catch.
         """
-        refused = self._send_guard(chat_id)
-        if refused is not None:
-            raise _PlowSendError(403, refused.error)
-        segment = urllib.parse.quote(participant_id, safe="")
+        segment = urllib.parse.quote(handle, safe="")
         async with aiohttp.ClientSession() as http:
-            async with http.patch(f"{BASE}/v1/chats/{chat_id}/participants/{segment}/contact",
-                                  json=body, headers=self.auth) as resp:
+            async with http.put(f"{BASE}/v1/contacts/{segment}",
+                                json=body, headers=self.auth) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
@@ -3162,31 +3171,40 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
 
 
 def _plow_name_contact(args, **_kwargs):
-    """Record what the owner calls a roster participant, and who they are to
-    the owner. Owner-turn-authorized only: fails CLOSED, like `plow_start_group_message`'s
+    """Record what the owner calls a person, and who they are to the owner.
+
+    Keyed by handle, so the owner's contact book reaches anyone they can name --
+    a member of this chat, someone in another thread, or the owner themselves.
+    Owner-turn-authorized only: fails CLOSED, like `plow_start_group_message`'s
     trusted branch and `plow_set_conversation_trusted` -- both a member's own
     turn and no active turn at all refuse a direct write here, so a label can
-    only ever be written by a call made on the owner's own turn. The chat
-    is the open owner turn's own `chat_uid`, the same source
-    `plow_set_conversation_trusted` reads -- this tool only ever names someone
-    in the chat whose owner turn is open, so there is no model-supplied
-    chat_id to trust or validate.
+    only ever be written by a call made on the owner's own turn. The turn is
+    read for that authority alone; the write itself is not chat-scoped.
+
+    Ruled, so it is not re-argued: the handle is deliberately NOT validated
+    against any roster. Naming someone met in another thread, or the owner
+    themselves, is the feature -- a roster check would refuse exactly the
+    calls this tool exists for. The owner's own turn is the whole trust
+    boundary, and it is the same one that already lets
+    `plow_start_group_message` text an arbitrary handle, which is the larger
+    authority of the two.
     """
     turn = _ACTIVE_TURN.get()
     if turn is None or not turn.get("owner"):
         return json.dumps({"success": False,
                            "error": "names come from the owner: this requires the owner's "
                                     "own active turn, nothing was recorded"})
+    handle = str(args.get("handle") or "").strip()
     body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
-    if not body:
-        return json.dumps({"success": False, "error": "display_name or relationship is required"})
+    if not handle or not body:
+        return json.dumps({"success": False,
+                           "error": "a handle, and display_name or relationship, are required"})
     if _live is None:
         return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected; nothing was recorded"})
     adapter, loop = _live
     try:
         data = asyncio.run_coroutine_threadsafe(
-            adapter.name_contact(turn["chat_uid"], args.get("participant_id") or "", body),
-            loop).result(timeout=30)
+            adapter.name_contact(handle, body), loop).result(timeout=30)
     except _PlowSendError as exc:
         if exc.status >= 500:
             return json.dumps({
@@ -3206,23 +3224,27 @@ def _plow_name_contact(args, **_kwargs):
 
 
 PLOW_NAME_CONTACT_SCHEMA = {
-    "name": "plow_chat_name_contact",
+    "name": "plow_name_contact",
     "description": (
-        "Record what your owner calls a member of THIS chat, and who that person "
-        "is to your owner (e.g. \"wife\", \"landlord\") -- call it only when your "
-        "owner tells you so, on the owner's own turn. Owner-turn-authorized only: "
-        "the tool refuses on a member's turn and outside any active turn. Use the "
-        "participant uid from the roster, shown as name [uid]. Omit "
-        "display_name/relationship to leave it; pass \"\" to clear it."
+        "Record what your owner calls a person, and who that person is to your "
+        "owner (e.g. \"wife\", \"landlord\") -- call it only when your owner tells "
+        "you so, on the owner's own turn. Owner-turn-authorized only: the tool "
+        "refuses on a member's turn and outside any active turn. People are keyed "
+        "by handle, so this reaches anyone your owner can name, in this chat or "
+        "not; the roster shows each person as name [handle]. Your owner's own "
+        "handle takes a display_name -- that is their account name -- but not a "
+        "relationship. Omit display_name/relationship to leave it; pass \"\" to "
+        "clear it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "participant_id": {"type": "string", "description": "The member's roster uid (cp_...)."},
+            "handle": {"type": "string",
+                       "description": "The person's handle, as shown in the roster (a phone number, +1...)."},
             "display_name": {"type": "string"},
             "relationship": {"type": "string"},
         },
-        "required": ["participant_id"],
+        "required": ["handle"],
         "additionalProperties": False,
     },
 }
@@ -3447,7 +3469,7 @@ def register(ctx):
         requires_env=["PLOW_AGENT_TOKEN"],
     )
     ctx.register_tool(
-        name="plow_chat_name_contact",
+        name="plow_name_contact",
         toolset=PLATFORM_NAME,
         schema=PLOW_NAME_CONTACT_SCHEMA,
         handler=_plow_name_contact,

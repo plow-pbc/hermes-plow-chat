@@ -27,8 +27,9 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
 > `agent-mgr` SHA advance), and
-> `PATCH /v1/chats/{chat_uid}/participants/{participant_uid}/contact`
-> (`plow_chat_name_contact` — [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
+> `PUT /v1/contacts/{handle}` (`plow_name_contact` — the handle-keyed contact
+> book, superseding the per-participant contact route of
+> [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
 > "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
@@ -252,13 +253,16 @@ In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
 in the untrusted roster context above, never in the prompt.
 
-The owner may also tell the agent what to call a roster member and who that
-person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
-which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
-The tool is owner-turn-authorized only; it refuses outright during a member's
-turn and outside any active turn at all — a direct call cannot write a label
-except on the owner's own turn. A relationship renders as
-`Name [uid] (relationship)` in the untrusted roster context above, never in
+The owner may also tell the agent what to call a person and who that person is
+to the owner — `wife`, `landlord` — through `plow_name_contact`, which `PUT`s
+`/v1/contacts/{handle}`. The book is keyed by handle, not by chat, so one name
+follows the person into every thread they are in; naming the owner's own handle
+sets their account name, and a relationship on their own handle is refused. The
+tool is owner-turn-authorized only; it refuses outright during a member's turn
+and outside any active turn at all — a direct call cannot write a label except
+on the owner's own turn. A relationship renders as
+`Name [handle] (relationship)` in the untrusted roster context above — where
+the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
 claim about who they are is just that — a claim.
