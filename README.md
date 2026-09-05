@@ -378,5 +378,6 @@ Successful tool delivery already sent the copy: the adapter suppresses subsequen
 text replies to that chat for the rest of the active turn, logging the chat and
 the suppressed length but never the body. Suppression tracks the turn's latest
 sequence, so a failed, rejected, or delivery-unknown sequence — including one
-that follows a successful sequence in the same turn — reopens the reply path. Other chats, later turns, and `MEDIA:` delivery retain their ordinary
+that follows a successful sequence in the same turn — reopens the reply path. Suppression runs in the one guard every outbound message passes, so it covers
+text, `MEDIA:` delivery and verbose status frames alike. Other chats and later turns retain their ordinary
 behavior. The tool does not interpret in-band markers.

@@ -1565,6 +1565,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         if turn and turn.get("suppress_reply") and chat_id == turn["chat_uid"]:
             log.info("[plow_chat] suppressed an unaddressed peer message for %s", chat_id)
             return SendResult(success=True)
+        # A completed sequence already delivered this turn's reply, so the
+        # trailing prose the model adds after it is the same duplicate the
+        # peer gate above exists to stop. Keyed on the sequence's own turn
+        # rather than the chat, so it lifts the moment that turn ends.
+        if turn and turn.get("sequence_completed") and self._sequence_turns.get(chat_id) is turn:
+            log.debug("[plow_chat] suppressed post-sequence reply for %s", chat_id)
+            return SendResult(success=True)
         return None
 
     def _send_guard(self, chat_id):
@@ -1585,14 +1592,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
-        if (turn is not None and turn.get("sequence_completed")
-                and self._sequence_turns.get(chat_id) is turn):
-            # A completed sequence already delivered this turn's reply. Keep
-            # the model's trailing prose off the wire until this turn ends.
-            # Chat only, never the body: a suppressed reply is ordinary
-            # owner-facing prose, and the log is a wider audience than the DM.
-            log.debug("[plow_chat] suppressed post-sequence reply for %s (%d chars)", chat_id, len(content))
-            return SendResult(success=True)
         if (body == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn's whole answer was "nothing to say" — honor it. Gated

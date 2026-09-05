@@ -5200,6 +5200,47 @@ async def test_failed_sequence_after_a_successful_one_reopens_the_reply_path(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("send_kind", "chat_id", "delivered"),
+    [
+        ("text", "cht_a", False),
+        ("attachment", "cht_a", False),
+        ("status", "cht_a", False),
+        ("text", "cht_b", True),
+    ],
+    ids=["same-chat-text", "same-chat-attachment", "same-chat-verbose-status", "cross-chat-text"],
+)
+async def test_post_sequence_suppression_covers_every_send_path(
+        monkeypatch, tmp_path, send_kind, chat_id, delivered):
+    """One gate, every outbound path — the lesson the peer gate already paid for.
+
+    A completed sequence delivered the owner's copy, so a trailing status
+    frame or MEDIA send is the same duplicate as trailing text. Only a send
+    to a different granted chat is a different act.
+    """
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    adapter.chat_uids = adapter.chat_uids | {'cht_b'}
+    monkeypatch.setattr(module, '_mirror_sent', lambda *args: None)
+    monkeypatch.setattr(adapter, '_verbose_enabled', mock.AsyncMock(return_value=True))
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Opening')]}, turn))['success']
+
+    posted = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, '_post_message', posted)
+    if send_kind == 'attachment':
+        attachment = tmp_path / 'note.txt'
+        attachment.write_text('trailing')
+        result = await adapter._send_attachment(chat_id, str(attachment), caption='and one more thing')
+    elif send_kind == 'status':
+        result = await adapter.send_or_update_status(chat_id, 'working', 'still going')
+    else:
+        result = await adapter.send(chat_id, 'And one more thing.')
+
+    assert result.success is True, 'suppression is not an error the gateway should retry'
+    assert posted.await_count == (1 if delivered else 0)
+
+
+@pytest.mark.asyncio
 async def test_suppressed_reply_body_stays_out_of_the_log(monkeypatch, tmp_path, caplog):
     """The log is a wider audience than the DM: record the size, not the prose."""
     module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
