@@ -1,21 +1,23 @@
-# Seed skills — public mirror
+# Seed skills
 
-`plow-pbc/agent-mgr` pins every artifact it installs to a repo + SHA in its
-`runtime/stack.json`. These two skills used to be pinned to `plow-pbc/plow`,
-which is private, so any restore run by someone outside the org died on a
-GitHub 404 before the agent came up. They live here so that an anonymous
-clone can complete a restore.
+The two skills every Plow agent is seeded with. **This directory is the
+canonical copy, and the only one anyone edits by hand.**
 
-Verbatim copies, no edits, taken from `plow-pbc/plow` at commit
-`68ebea369d5daa1a6be987e4152f0a15009f4800`:
+| skill |
+| --- |
+| `growth/plow-invite` |
+| `productivity/google-workspace` |
 
-| here | in `plow-pbc/plow` |
-| --- | --- |
-| `growth/plow-invite` | `cloud-agents/hermes/image/seed/skills/growth/plow-invite` |
-| `productivity/google-workspace` | `cloud-agents/hermes/image/seed/skills/productivity/google-workspace` |
+[`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+the base image every hosted Plow agent boots, stages both of these out of this
+repository's tarball at the `PLOW_CHAT_PLUGIN_SHA` it already pins — the same
+commit it fetches `plow-chat-platform/` from. Nothing is copied by hand, and it
+tracks no copy of its own: bumping that one pin moves the plugin and the skills
+that describe it together, so a skill can never name a tool the plugin at that
+commit does not register.
 
-`plow-invite/SKILL.md` says "converge, don't fork" — that still holds, and
-these copies are the reason it now needs saying out loud. The hosted-agent
-image still bakes from `plow-pbc/plow`. Change a skill there first, copy the
-result here, then bump the SHA in `agent-mgr`'s `runtime/stack.json`. Editing
-only this copy silently splits the two runtimes.
+`tests/test_seed_skills.py` holds every `plow_*` tool a skill names to the set
+this plugin registers, excepting the Latch relay MCP server's own tools by
+name. `plow-pbc/agent-mgr` (deprecated) still pins these paths by SHA in its
+`runtime/stack.json`. The former source under `plow-pbc/plow`
+`cloud-agents/hermes/` no longer exists.

@@ -1,3 +1,5 @@
+# Copyright 2026 The Plow Collective, Inc
+# SPDX-License-Identifier: Apache-2.0
 name: plow-chat-platform
 label: Plow Chat
 kind: platform
@@ -30,5 +32,10 @@ optional_env:
   - name: PLOW_CHAT_AGENT_NAME
     description: "Override this line's persona name in text the model sees (roster mappings, collaboration prompt). Does not change the server-assigned line name or the iMessage contact card."
     prompt: "Agent display name override"
+    secret: false
+    password: false
+  - name: PLOW_MCP_URL
+    description: "Mac relay MCP URL; plow-init exports it when the account has a Mac. When set, the plugin adds the Latch routing section to the system prompt"
+    prompt: "Plow Mac relay URL"
     secret: false
     password: false

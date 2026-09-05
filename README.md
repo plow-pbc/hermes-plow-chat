@@ -23,17 +23,58 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
-> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`, and
+> `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
-> `agent-mgr` SHA advance). Hermes hosts
+> `agent-mgr` SHA advance), and
+> `PATCH /v1/chats/{chat_uid}/participants/{participant_uid}/contact`
+> (`plow_chat_name_contact` — [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
+> "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
 > then land the `agent-mgr` support above, and only then bump
 > `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
 > available fails loudly instead of silently skipping delivery.
 
+## Where changes go
+
+This repo is one of several that assemble a Plow agent. The map of which repo
+owns what is in
+[`plow-hermes-agent` README § The repos](https://github.com/plow-pbc/plow-hermes-agent#the-repos);
+read it before a change that touches a neighbour. The test is **who else would
+have to change if this fact changed** — if the answer is a sibling, the change
+belongs there; this repo only follows, by bumping its pin if it holds one.
+
+Not here:
+
+- The `plow-gog` argv grammar, and what a Latch tool says about itself —
+  [`plow-pbc/latch`](https://github.com/plow-pbc/latch) vendors the binary,
+  pins its version, and owns the only bump checklist.
+- Per-chat state the owner sets or clears — trust, contact labels, anything
+  keyed by a `cht_` id — [`plow-pbc/plow`](https://github.com/plow-pbc/plow).
+  A file written under `$HERMES_HOME` instead is invisible to the dashboard
+  and to support.
+- Boot, `plow-init`, the gateway config seed, and the base persona —
+  [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+  which pins this plugin rather than being configured by it.
+
+Examples:
+
+- Adheres: #61 deleted `_invite_message_template` — the `$100 in cloud credits`
+  line and the activation-code placeholders — so plow composes the whole invite,
+  net −32 LOC: https://github.com/plow-pbc/hermes-plow-chat/pull/61
+- Violates: #64 put ~110 lines of `plow-gog` verb tables, flag parsing and an
+  explicit re-implementation of latch's `isHelpInvocation` in this plugin — a
+  second copy latch's pin-bump checklist does not know about:
+  https://github.com/plow-pbc/hermes-plow-chat/pull/64
+
 ## Who consumes this
+
+[`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
+the base image every hosted Plow agent boots, pins one commit of this repo as
+`PLOW_CHAT_PLUGIN_SHA` in its Dockerfile and fetches `plow-chat-platform/` at
+build time. That is the production consumer. The Docker fleet below is the
+deprecated one.
 
 [`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
 repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
@@ -65,6 +106,7 @@ URL in git.
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
 | `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
+| `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
 Diagnostic chatter — agent status frames, 💾 background-review posts, ⚠️
 turn-stop warnings — is dropped unless the credential's
@@ -108,6 +150,51 @@ chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
 older API the per-message refresh fails loudly and the chat waits for retry
 rather than guessing a trust state.
 
+### Speaking in another chat
+
+Hermes keeps one session per chat, and this adapter drops the echo of the
+agent's own sends. So a message the agent posts to chat B from a turn in chat
+A is invisible to chat B's next turn unless it is recorded there. The
+`plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
+through the adapter's `send()` like every other outbound message (the grant
+and member-turn confinement apply exactly as for a reply). Recording lives in
+that same `send()`: when a turn's message lands in a chat other than the
+turn's own, the adapter mirrors the text into that chat's session as an
+assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
+for cron and `hermes send` deliveries — on the delivery's own coroutine, so a
+caller that stopped waiting cannot strand a delivered message unrecorded. A
+chat's session is born on its first inbound message, so a chat that has never
+spoken has nowhere to record to: the adapter logs a warning and that chat
+will not remember the send. A thread `plow_start_group_message` created is
+in that state; one it resumed is handled like any other cross-chat send,
+which records the opener only where a session already exists (a thread
+resumed before anyone replied has none, and logs the same warning). Posting
+to the Plow API directly from a
+script bypasses all of this and leaves the target chat amnesiac; the tool
+exists so the model never has to.
+
+### Recall from other chats
+
+Hermes keeps one session per chat, so a turn in one chat knows nothing of the
+others unless told. On every Plow Chat turn the plugin's `pre_llm_call` hook
+runs an OR-query built from the message's own words over the Hermes session
+store and appends up to six dated one-line snippets from other sessions to the
+turn (upstream's seam for per-turn recall: the user message, never the system
+prompt). The room is the boundary, not the asker: the home chat (the owner's
+own DM) and a trusted room recall from every chat, the owner's DMs included —
+that is what trust means here. Every other turn, an owner's turn in an
+untrusted group included, recalls only from its own chat's earlier sessions.
+The current session is never recalled. Snippets are labelled as data, not
+instructions, the same way the roster is. A failing store is not caught
+here: Hermes isolates and logs a failing hook and the turn proceeds without
+recall, so the failure is visible in the gateway log instead of hidden.
+Recall is a filter over the store's thirty best matches across all chats, so
+in a busy install a room-scoped turn can find nothing even when its own chat
+holds matches; that ceiling is deliberate until it is felt. Hermes stamps
+injected context onto the turn's wire copy and replays it for the life of
+the session, so a snippet recalled once stays in that session's context
+afterwards.
+
 ### What a group thread is called
 
 The home chat is always `Plow Chat`. Every other granted thread is named from
@@ -135,10 +222,46 @@ collaboration context on every turn. This lets Elm distinguish “Hey Ash” fro
 an instruction to Elm without parsing names or inventing a second router.
 
 Peer-agent messages are real inbound turns and remain visible in the same group
-as every human message. Only this line's own outbound echo is ignored. The
-prompt asks agents to contribute when addressed or useful and to avoid empty
-acknowledgements, reciprocal delegation, impersonation, and repetition; it
-adds no hidden coordination channel or loop state.
+as every human message. Only this line's own outbound echo is ignored. What a
+peer message does *not* do, absent a goal (below), is draw a reply: unless it
+names this agent, the turn carries a do-not-reply prompt. The reply is
+suppressed, never the read — an agent blind to its peer loses the thread and
+then talks past its own human. Prompt prose alone did not hold: the agent that
+had the anti-acknowledgement paragraph still produced three rounds of "agreed,
+nothing to add".
+
+### Thread goals
+
+`/goal <text>` puts this thread's agent on a task it works toward on its own;
+`/goal` reports status and `/goal clear` stops it. Only the chat's owner can set
+or clear one, and both are announced in the thread — in a group that
+announcement is the consent artifact, showing the other household what this
+agent was told to pursue before it pursues it.
+
+A goal is bounded on three independent axes: a TTL, an attempt budget, and a
+separate judge that may rule it met or unreachable. The budget and the clock are
+the adapter's, never the judge's, so a judge stuck on "not met" — or simply
+unreachable — cannot buy unbounded turns. Every settlement is announced, and a
+notice that fails to deliver leaves the goal running rather than letting it go
+quiet.
+
+An active goal is what unlocks replying to peer agents. Scheduled wakes carry
+the room's ordinary disclosure prompt and take owner authority only in a DM.
+
+In a shared thread the prompt tells the agent to speak as itself and refer to
+the human it represents by name, never as "I" or "me" — the name itself stays
+in the untrusted roster context above, never in the prompt.
+
+The owner may also tell the agent what to call a roster member and who that
+person is to the owner — `wife`, `landlord` — through `plow_chat_name_contact`,
+which `PATCH`es `/v1/chats/{chat_uid}/participants/{participant_uid}/contact`.
+The tool is owner-turn-authorized only; it refuses outright during a member's
+turn and outside any active turn at all — a direct call cannot write a label
+except on the owner's own turn. A relationship renders as
+`Name [uid] (relationship)` in the untrusted roster context above, never in
+the channel prompt, which instead states generically that a roster
+relationship is a label recorded on the owner's turn, and that a member's
+claim about who they are is just that — a claim.
 
 ## Media
 
@@ -203,3 +326,67 @@ What changed on the way over: the `ref/` layout is gone, and with it the ~30-lin
 root shim that existed only to bridge it. The adapter sits where Hermes loads it,
 so an agent's installed plugin no longer carries a `ref/hermes-plugin/plow_chat/`
 directory inside its home.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 The Plow Collective, Inc.
+
+"Plow" and the Plow logo are trademarks of The Plow Collective, Inc. The license grants no trademark rights.
+
+## Ordered owner-DM delivery
+
+`plow_send_sequence` sends a bounded sequence to the active turn's solo owner
+DM. It accepts no destination or file path.
+
+Owners can call it only once the base image bumps its plugin pin: a deployed
+agent runs the plugin baked into its image, not this repository, so landing the
+tool here does not by itself put it in front of anyone. Bumping the pin is a
+post-merge step — it names a merge commit, which does not exist while the change
+is still under review — and rebuilding and re-pinning the blessed image follows
+it.
+
+Example tool arguments:
+
+```json
+{"items":[{"type":"text","body":"Here are the previews."},{"type":"photos","asset_ids":["preview_a","preview_b","preview_c","preview_d"]},{"type":"pause","seconds":4},{"type":"text","body":"What do you think?"}]}
+```
+
+The variant image supplies `/srv/plow-assets/manifest.json`:
+
+```json
+{"version":1,"assets":{"preview_a":"preview-a.png","preview_b":"preview-b.png","preview_c":"preview-c.png","preview_d":"preview-d.png"}}
+```
+
+The manifest, image files and directories through `/` must be root-owned and
+not group/world writable. Symlinks and paths outside the asset directory are
+refused. Supported images are PNG, JPEG, GIF and WebP, at most 8 MiB each. The
+plugin validates and reads every selected asset before any delivery. Assets
+are variant-owned; this plugin ships no manifest or life-specific IDs.
+
+Limits: 24 items, 4 photos per item, 16 photos / 32 MiB total, 4,000 characters
+per text / 24,000 total, and 60 seconds of total pacing. Pauses accept finite
+numbers from 0 to 15 seconds. Adjacent deliveries have a one-second gap; an
+explicit pause replaces that gap, including a zero-second pause. Operations
+serialize per chat and have a 180-second deadline, including queueing. Ending
+the turn or disconnecting cancels its outstanding sequences. Existing turn
+typing continues through pauses and is rearmed by delivered messages.
+
+The receipt contains `success`, `completed`, and `failure`. Every completed item
+has its zero-based `index`, `type`, and `message_ids` (empty for a pause). A
+failure names the first unresolved `index`, a `status` (`rejected`, `failed`, or
+`delivery_unknown`) and an error. When a four-photo stack is explicitly
+rejected with HTTP 422, the tool may send individual photos using the existing
+uploads. If that fallback stops partway, `failure.message_ids` preserves the
+confirmed sends and `failure.photo_index` identifies the unresolved photo.
+Timeouts, 5xx responses and malformed successful POST responses are delivery
+unknown: they never trigger fallback or automatic replay. Inspect chat history
+before sending any remaining items; never replay the entire sequence blindly.
+
+Tool arguments and receipts stay in the agent's ordinary tool-call history.
+Successful tool delivery already sent the copy: the adapter suppresses subsequent
+text replies to that chat for the rest of the active turn, logging the chat and
+the suppressed length but never the body. Suppression tracks the turn's latest
+sequence, so a failed, rejected, or delivery-unknown sequence — including one
+that follows a successful sequence in the same turn — reopens the reply path. Suppression runs in the one guard every outbound message passes, so it covers
+text, `MEDIA:` delivery and verbose status frames alike. Other chats and later turns retain their ordinary
+behavior. The tool does not interpret in-band markers.
