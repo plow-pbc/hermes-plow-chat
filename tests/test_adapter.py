@@ -2279,31 +2279,45 @@ async def test_contacts_gets_the_book_and_a_failed_read_declines_rather_than_rea
     assert http.calls[0][2]["headers"] == adapter.auth
 
 
+@pytest.mark.parametrize(
+    "started",
+    [
+        pytest.param((None, "+15550000001"), id="the-boot-read-had-the-handle"),
+        pytest.param(None, id="a-failed-boot-read-is-repaired-by-naming"),
+    ],
+)
 async def test_name_contact_encodes_the_segment_and_renames_the_owner_in_process(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    started: tuple[str | None, str] | None,
 ) -> None:
     """The handle is model-supplied and lands in a bearer-authenticated URL
     path -- percent-encode it as one segment so a value like "../.." walks
     nothing but its own segment, and so a "+" survives as itself.
 
     And naming the owner is the one write that changes what every later owner
-    turn is told, so the held fact follows the write: the prompt stops asking
-    for a name the owner has just given, without waiting for a restart."""
+    turn is told, so the held fact follows the write rather than waiting for a
+    restart to stop asking. WHICH person was named is the server's answer, not
+    a string compare: the model types the handle as the roster spelled it while
+    the book keys on a canonical form, so a respelled number -- or a case-folded
+    Apple ID -- would leave the agent asking for a name it had just recorded."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    http = _ChatResourceHTTP(_Resp({"handle": "+15550000002"}))
+    adapter._owner = started
+    http = _ChatResourceHTTP(_Resp({"provider_key": "+15550000002", "display_name": "Abby",
+                                    "role": "member"}))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     await adapter.name_contact("+15550000002/../../etc", {"display_name": "Abby"})
 
     assert http.calls[0][0] == "put"
     assert http.calls[0][1] == f"{module.BASE}/v1/contacts/%2B15550000002%2F..%2F..%2Fetc"
+    assert adapter._owner == started, "naming somebody else is not naming the owner"
 
-    adapter._owner = (None, "+15550000001")
-    await adapter.name_contact("+15550000002", {"display_name": "Abby"})
-    assert adapter._owner == (None, "+15550000001"), "naming somebody else is not naming the owner"
+    # A handle the model typed the way the roster showed it, answered with the
+    # canonical spelling -- which is the one the prompt must carry.
+    http.response = _Resp({"provider_key": "+15550000001", "display_name": "Sam", "role": "owner"})
+    await adapter.name_contact("(555) 000-0001", {"display_name": "Sam"})
 
-    await adapter.name_contact("+15550000001", {"display_name": "Sam"})
     prompt = module._channel_prompt({"type": "dm", "trusted": False}, "owner", _dm_chat(),
                                     adapter._identity, None, adapter._owner)
     assert _OWNER_NAMED in prompt
