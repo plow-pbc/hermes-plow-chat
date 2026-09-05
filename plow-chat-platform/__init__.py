@@ -521,12 +521,14 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
-def _channel_prompt(chat, role, roster, identity, referred_by=None):
+def _channel_prompt(chat, role, roster, identity, referred_by):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
     disclosure posture as a spoken turn -- and the same identity facts -- and a
-    second copy of this selection is how a wake ends up with neither.
+    second copy of this selection is how a wake ends up with neither. Every
+    argument is required for that reason: a default would let a third caller
+    drop a fact silently, which is the failure this function exists to prevent.
     """
     prompt = (
         (TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT if role != "owner"
@@ -1096,10 +1098,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 profile = await resp.json(content_type=None)
             referred = (profile or {}).get("referred_by")
             if referred:
-                # An anonymous inviter is still an inviter: the product name is
-                # what makes the sentence mean anything, so it is required.
-                self._referred_by = (referred.get("display_name") or "someone",
-                                     referred["provider_display_name"])
+                # The inviter chose this name, and it lands in a system-authority
+                # prompt -- so it goes through _participant_identity's own
+                # collapse-and-cap, which is what keeps a newline from opening a
+                # second line that reads like a second instruction. An anonymous
+                # inviter is still an inviter; the product name is what makes the
+                # sentence mean anything, so it is required.
+                name = " ".join(str(referred.get("display_name") or "").split())[:100]
+                self._referred_by = (name or "someone", referred["provider_display_name"])
         except Exception as exc:             # noqa: BLE001 - never worth failing the connect
             log.info("[plow_chat] referrer read failed: %s: %s", type(exc).__name__, exc)
 
@@ -2111,6 +2117,20 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
                 return json.loads(text or "{}")
+
+    async def contacts(self):
+        """GET the owner's whole contact book, owner's own row first.
+
+        The read half of `name_contact`, and it shares that method's non-2xx
+        convention for the same reason: the tool catches `_PlowSendError`, not
+        aiohttp's own.
+        """
+        async with (aiohttp.ClientSession() as http,
+                    http.get(f"{BASE}/v1/contacts", headers=self.auth) as resp):
+            text = await resp.text()
+            if resp.status >= 400:
+                raise _PlowSendError(resp.status, text)
+            return json.loads(text or "[]")
 
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
@@ -3284,6 +3304,50 @@ PLOW_NAME_CONTACT_SCHEMA = {
 }
 
 
+def _plow_contacts(_args, **_kwargs):
+    """Read the owner's contact book -- the only source of names off a roster.
+
+    A roster reaches the model on an inbound burst and nowhere else, so a
+    scheduled Hermes-cron turn has no roster at all and cannot even name its
+    own owner. This is where that name comes from.
+
+    Authorization is the mirror of `_plow_name_contact`'s, not a copy: writing
+    a label needs the owner's own turn and fails closed on no turn, because a
+    turn-less write has nobody to have asked. A READ has a turn-less caller
+    that is legitimate -- cron is exactly it -- so the gate is narrower: only
+    a member's own open turn is refused, since that is the one context where
+    somebody else's words are steering the agent.
+    """
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn.get("owner"):
+        return json.dumps({"success": False,
+                           "error": "your owner's contact book is not readable on a member's turn"})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
+    adapter, loop = _live
+    try:
+        contacts = asyncio.run_coroutine_threadsafe(adapter.contacts(), loop).result(timeout=30)
+    except _PlowSendError as exc:
+        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty book
+        return json.dumps({"success": False,
+                           "error": f"could not read the contact book ({type(exc).__name__})"})
+    return json.dumps({"success": True, "contacts": contacts})
+
+
+PLOW_CONTACTS_SCHEMA = {
+    "name": "plow_contacts",
+    "description": (
+        "Read your owner's contact book: everyone they have named, keyed by "
+        "handle, with each person's relationship to them -- your owner's own "
+        "row first. Call it when you have no roster to read: a scheduled or "
+        "cron turn carries no chat, so this is where your owner's own name "
+        "comes from. Refused on a member's turn."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+
 def _plow_set_conversation_trusted(args, **_kwargs):
     """Set trust for the active conversation on an explicit owner request."""
     value = args.get("trusted")
@@ -3507,6 +3571,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_NAME_CONTACT_SCHEMA,
         handler=_plow_name_contact,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_contacts",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_CONTACTS_SCHEMA,
+        handler=_plow_contacts,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )
