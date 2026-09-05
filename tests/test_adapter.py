@@ -307,7 +307,7 @@ def _voiced(module: Any, prompt: str) -> str:
     """The exact non-solo-DM composition `_collaboration_prompt` applies, so
     the prompt-matrix tests below don't hand-roll it out of sync with the
     real code."""
-    return f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {prompt}"
+    return f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {module._NAME_FACT} {prompt}"
 
 
 def _envelope(
@@ -1367,14 +1367,14 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
 
     (event,) = handled
     base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
-    relationship_fact = f"{module._RELATIONSHIP_FACT} " if group else ""
+    roster_facts = f"{module._RELATIONSHIP_FACT} {module._NAME_FACT} " if group else ""
     # Composed through _with_identity rather than re-spelling the prefix: the
     # identity-and-facts text is pinned once, by the prefix test above. What
-    # this test owns is the voice rule and relationship fact -- present in a
+    # this test owns is the voice rule and the roster facts -- present in a
     # shared thread, absent in a solo DM, with the base prompt unchanged
     # either way.
     assert event["channel_prompt"] == module._with_identity(
-        f"{rule}{relationship_fact}{base}", "Elm", adapter._identity)
+        f"{rule}{roster_facts}{base}", "Elm", adapter._identity)
 
 
 @pytest.mark.parametrize(
@@ -1416,6 +1416,41 @@ async def test_trust_selects_the_explicit_prompt_matrix(
         assert "everyone" in prompt
         for secret in ("credentials", "authentication secrets", "raw tokens", "payment-card"):
             assert secret in prompt
+
+
+@pytest.mark.parametrize(
+    ("group", "role", "referred_by", "said"),
+    [
+        pytest.param(False, "owner", ("Sam", "Life Assistant"), True, id="owner-dm"),
+        pytest.param(True, "owner", ("Sam", "Life Assistant"), True, id="owner-in-group"),
+        pytest.param(True, "member", ("Sam", "Life Assistant"), False, id="member-never-hears-it"),
+        pytest.param(False, "owner", None, False, id="unreferred-owner-hears-nothing"),
+    ],
+)
+async def test_the_owner_turn_says_who_invited_them(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    group: bool,
+    role: str,
+    referred_by: tuple[str, str] | None,
+    said: bool,
+) -> None:
+    """Someone handed this agent to its owner, and the agent had no idea. Who
+    invited them is a fact about their own account, so it rides the owner's
+    channel prompt in every room -- and never a member's turn, where whose
+    invite this was is another household's business."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._referred_by = referred_by
+    adapter._set_reach([_chat("cht_a", group=group)])
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+
+    await adapter._on_frame(_envelope("evt_ref", "cht_a", "msg_ref", role=role), object())
+    await _settle(adapter)
+
+    said_it = "Your owner was invited by Sam (Life Assistant)." in handled[0]["channel_prompt"]
+    assert said_it is said
 
 
 async def test_collaboration_context_names_self_peers_and_current_human_speaker(
@@ -1576,11 +1611,18 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # composed prompt a real turn actually gets.
     for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
                  module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
-        assert module._RELATIONSHIP_FACT in module._collaboration_prompt(base, chat, identity)
+        composed = module._collaboration_prompt(base, chat, identity)
+        assert module._RELATIONSHIP_FACT in composed
+        # A bare handle is a hole in the same roster, so the instruction to
+        # fill it rides the same gate: ask, once, and record it -- rather than
+        # inventing a name out of the owner's mail or calendar.
+        assert "ask their name once" in composed
+        assert "plow_name_contact" in composed
     # OWNER_CHANNEL_PROMPT is only ever selected for a solo DM turn, so that's
     # the composition a real turn produces -- not this group chat.
-    assert module._RELATIONSHIP_FACT not in module._collaboration_prompt(
-        module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity)
+    solo = module._collaboration_prompt(module.OWNER_CHANNEL_PROMPT, _dm_chat(), identity)
+    assert module._RELATIONSHIP_FACT not in solo
+    assert module._NAME_FACT not in solo
 
 
 async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection(
@@ -3041,6 +3083,49 @@ async def test_connect_publishes_the_live_adapter_and_disconnect_retires_it(
     assert module._live is None
     assert server.cancelled() or server.cancelling()
     assert not adapter._inbound
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "expected"),
+    [
+        pytest.param(200, {"referred_by": {"display_name": "Sam", "provider_display_name": "Life Assistant"}},
+                     ("Sam", "Life Assistant"), id="named-referrer"),
+        pytest.param(200, {"referred_by": {"display_name": None, "provider_display_name": "Life Assistant"}},
+                     ("someone", "Life Assistant"), id="referrer-with-no-name-of-their-own"),
+        pytest.param(200, {"referred_by": None}, None, id="nobody-invited-them"),
+        pytest.param(500, {}, None, id="a-500-still-connects"),
+    ],
+)
+async def test_connect_reads_who_invited_the_owner_once_and_comes_up_without_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    status: int, payload: dict[str, Any], expected: tuple[str, str] | None,
+) -> None:
+    """The referrer is a boot-time fact, so it is read on the first connect and
+    then held. A failed read is not worth an agent that will not come up: it
+    leaves the fact unset and connects anyway, and a reconnect does not re-ask."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    profile_reads: list[dict[str, str]] = []
+
+    class _ProfileHTTP(_HTTP):
+        def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+            if url.endswith("/v1/auth/profile"):
+                profile_reads.append(headers)
+                return _Resp(payload, status=status)
+            if url.endswith("/v1/agents/cloud/me"):
+                return _Resp({"line": {"uid": "ln_x", "provider_key": NUMBER}, "signup": SIGNUP})
+            return _Resp({"object": "list", "data": [_chat("cht_a")], "has_more": False})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _ProfileHTTP())
+
+    async def listen_once() -> None: ...
+
+    monkeypatch.setattr(adapter, "_listen", listen_once)
+
+    assert await adapter.connect() is True
+    assert adapter._referred_by == expected
+    await adapter.connect(is_reconnect=True)
+    assert profile_reads == [adapter.auth], "one read per process start, on the granted credential"
 
 
 async def test_tool_call_before_the_first_anchor_pass_finds_the_gateway_not_connected(

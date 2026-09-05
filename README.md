@@ -265,7 +265,16 @@ on the owner's own turn. A relationship renders as
 the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
-claim about who they are is just that — a claim.
+claim about who they are is just that — a claim. Every roster-bearing prompt
+also tells the agent that a row still showing a bare handle — its owner's
+included — is a name to ask for once and record with the tool, never one to
+guess out of mail, calendar or memory.
+
+Who invited the owner is read once per process start, from
+`GET /v1/auth/profile` on connect, and appended to the owner's channel prompt
+in every room — `Your owner was invited by Sam (Life Assistant).`, or
+`someone` where the inviter has no name of their own. A failed read leaves it
+unset and the agent connects anyway; a member's turn never carries it.
 
 ## Media
 
