@@ -521,7 +521,24 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
-def _channel_prompt(chat, role, roster, identity, referred_by):
+def _owner_fact(owner):
+    """What an owner turn is told about its own owner.
+
+    A roster block reaches the model on an inbound burst and nowhere else, so
+    the owner's own DM -- the room onboarding actually happens in -- and every
+    goal wake have no source at all for who their owner is. _NAME_FACT does not
+    reach them either: it is gated on there being a roster to read. This is
+    that source, and when the name is still missing it carries the ask, with
+    the handle already filled in so there is nothing left to guess.
+    """
+    name, handle = owner
+    if name:
+        return f"Your owner is {name} [{handle}]."
+    return (f"Your owner [{handle}] has not given their name yet: ask once and record it with "
+            f"plow_name_contact(handle={handle}). Never guess a name from mail, calendar, or memory.")
+
+
+def _channel_prompt(chat, role, roster, identity, referred_by, owner):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
@@ -538,12 +555,15 @@ def _channel_prompt(chat, role, roster, identity, referred_by):
         else GROUP_OWNER_CHANNEL_PROMPT if chat["type"] != "dm"
         else OWNER_CHANNEL_PROMPT
     )
-    if role == "owner" and referred_by:
-        # Who invited the owner is a fact about the owner's own account, so it
-        # rides their turn in every room and no member's anywhere -- whose
-        # invite this was is another household's business. Appended here, from
-        # the instance, because the prompt constants stay constants.
-        prompt = f"{prompt} Your owner was invited by {referred_by[0]} ({referred_by[1]})."
+    if role == "owner":
+        # Both are facts about the owner's own account, so they ride their turn
+        # in every room and no member's anywhere -- who the owner is, and whose
+        # invite brought them, are not another household's business. Appended
+        # here, from the instance, because the prompt constants stay constants.
+        if owner:
+            prompt = f"{prompt} {_owner_fact(owner)}"
+        if referred_by:
+            prompt = f"{prompt} Your owner was invited by {referred_by[0]} ({referred_by[1]})."
     return _collaboration_prompt(prompt, roster, identity)
 
 
@@ -911,6 +931,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
         self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
+        self._owner = None                  # (name or None, handle) of the owner, see _read_owner
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
         self._chats = {
@@ -1119,6 +1140,23 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:             # noqa: BLE001 - never worth failing the connect
             log.info("[plow_chat] referrer read failed: %s: %s", type(exc).__name__, exc)
 
+    async def _read_owner(self):
+        """Who the owner is, for the rooms with no roster to say so.
+
+        The contact book is the only source: a solo DM and a goal wake carry no
+        roster, and the owner's row is the one the server puts first. Fail-soft
+        like the referrer read -- an agent that cannot name its owner still has
+        to come up, and the prompt it builds without this just says nothing.
+        """
+        try:
+            owner = next((row for row in await self.contacts() or []
+                          if row.get("role") == "owner"), None)
+            if owner:
+                self._owner = (_one_line(owner.get("display_name")) or None,
+                               owner["provider_key"])
+        except Exception as exc:             # noqa: BLE001 - never worth failing the connect
+            log.info("[plow_chat] owner read failed: %s: %s", type(exc).__name__, exc)
+
     async def _persist_home(self):
         """Declare the home channel used for cron and default delivery."""
         chat = await self.get_chat_info(self.home_chat_uid)
@@ -1150,10 +1188,12 @@ class PlowChatAdapter(BasePlatformAdapter):
                 pass
         async with aiohttp.ClientSession() as http:
             await self._refresh_reach(http)
-            # Who invited the owner never changes, so it is read once per
-            # process start rather than on every reconnect.
+            # Two boot-time facts about the owner -- who invited them, and who
+            # they are -- read once per process start rather than on every
+            # reconnect. Neither may fail the connect.
             if not is_reconnect:
                 await self._read_referrer(http)
+                await self._read_owner()
         # Declare the home channel, so the customer is never asked /sethome.
         # config.yaml is the canonical store /sethome itself writes, and the
         # cron scheduler reads it back via config.get_home_channel(). The home
@@ -1544,7 +1584,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
                                            self._chats[chat_uid], self._identity,
-                                           self._referred_by) + _SILENCE_OPTION,
+                                           self._referred_by, self._owner) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
@@ -2126,7 +2166,15 @@ class PlowChatAdapter(BasePlatformAdapter):
                 text = await resp.text()
                 if resp.status >= 400:
                     raise _PlowSendError(resp.status, text)
-                return json.loads(text or "{}")
+                data = json.loads(text or "{}")
+        # Naming the owner is the one write that changes what every later owner
+        # turn is told, so the held fact follows it in-process -- otherwise the
+        # prompt keeps asking for a name already recorded, until a restart.
+        # Handles compare stripped and exact: that is the only normalisation
+        # this file has ever applied to one (_participant_identity, recipients).
+        if self._owner and "display_name" in body and handle.strip() == self._owner[1].strip():
+            self._owner = (_one_line(body["display_name"]) or None, self._owner[1])
+        return data
 
     async def contacts(self):
         """GET the owner's whole contact book, owner's own row first.
@@ -2560,7 +2608,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{turn_context}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster, self._identity, self._referred_by)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity,
+                                         self._referred_by, self._owner)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
