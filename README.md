@@ -272,16 +272,20 @@ guess out of mail, calendar or memory. `plow_contacts` reads the book back,
 owner's row first, for the turns that have no roster at all — a Hermes-cron
 turn carries no chat, and this is where its owner's own name comes from; it
 reads on the owner's turn and on no turn, and is refused on a member's. The
-owner's own row is also read once at connect and named on every owner turn —
+owner's own row is read again for each owner turn — never cached, so naming
+them lands on the very next turn — and named in the channel prompt:
 `Your owner is Sam [+1…].`, or, while they are still unnamed, the same ask with
 their handle already filled in, since a solo DM and a goal wake have no roster
-for the paragraph above to gate on; a member's turn carries neither.
+for the paragraph above to gate on. A read that fails says nothing that turn.
 
 Who invited the owner is read once per process start, from
-`GET /v1/auth/profile` on connect, and appended to the owner's channel prompt
-in every room — `Your owner was invited by Sam (Life Assistant).`, or
-`someone` where the inviter has no name of their own. A failed read leaves it
-unset and the agent connects anyway; a member's turn never carries it.
+`GET /v1/auth/profile` on connect. That name the inviter chose for themselves,
+so it is never a prompt sentence: it arrives on the owner's turn as one more
+untrusted block in front of the text, beside the roster — `[Untrusted account
+data; … Your owner was invited by Sam (Life Assistant).]`, or `someone` where
+the inviter has no name of their own. A failed read leaves it unset and the
+agent connects anyway; a member's turn carries neither this nor the owner's
+own name.
 
 ## Media
 
