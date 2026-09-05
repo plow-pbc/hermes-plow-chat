@@ -353,6 +353,8 @@ unknown: they never trigger fallback or automatic replay. Inspect chat history
 before sending any remaining items; never replay the entire sequence blindly.
 
 Tool arguments and receipts stay in the agent's ordinary tool-call history.
-Successful tool delivery already sent the copy: the caller should not repeat
-it in the final reply. The tool does not suppress unrelated replies, change
-ordinary `send()`/`MEDIA:` behavior, or interpret in-band markers.
+Successful tool delivery already sent the copy: the adapter suppresses subsequent
+text replies to that chat for the rest of the active turn and logs their content
+at debug level. Failed, rejected, or delivery-unknown sequences leave the reply
+path open. Other chats, later turns, and `MEDIA:` delivery retain their ordinary
+behavior. The tool does not interpret in-band markers.

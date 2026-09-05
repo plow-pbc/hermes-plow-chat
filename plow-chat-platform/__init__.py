@@ -881,6 +881,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
+        if (turn is not None and turn.get("sequence_completed")
+                and self._sequence_turns.get(chat_id) is turn):
+            # A completed sequence already delivered this turn's reply. Keep
+            # the model's trailing prose off the wire until this turn ends.
+            log.debug("[plow_chat] suppressed post-sequence reply for %s: %s", chat_id, content)
+            return SendResult(success=True)
         if (body == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn's whole answer was "nothing to say" — honor it. Gated
@@ -1177,6 +1183,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                             receipt["completed"].append({"index": position, "type": kind, "message_ids": ids})
                             previous = kind
             receipt["success"] = True
+            turn["sequence_completed"] = True
         except _SequenceFailure as exc:
             receipt["failure"] = {"index": position, "status": exc.status, "error": str(exc),
                                   "message_ids": exc.message_ids, "photo_index": exc.photo_index}

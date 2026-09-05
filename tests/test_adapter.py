@@ -4276,3 +4276,52 @@ def test_sequence_handler_registers_and_runs_on_the_adapter_loop(monkeypatch, tm
         loop.call_soon_threadsafe(loop.stop)
         worker.join()
         loop.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(monkeypatch, tmp_path, caplog):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    receipt = await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn)
+    assert receipt['success']
+    tail = 'Sequence delivered successfully. Deferring the owner write to next turn.\n\nNO_REPLY'
+    with caplog.at_level('DEBUG'):
+        assert (await adapter.send('cht_a', tail)).success
+    assert http.posts == 1, 'successful sequence must suppress even a substantive final process note'
+    assert tail in caplog.text
+
+    adapter.chat_uids = adapter.chat_uids | {'cht_b'}
+    mirrored = []
+    monkeypatch.setattr(module, '_mirror_sent', lambda *args: mirrored.append(args))
+    assert (await adapter.send('cht_b', 'Other chat')).success
+    assert mirrored == [('cht_b', 'Other chat')]
+    assert http.posts == 2
+
+    event = SimpleNamespace(source=SimpleNamespace(chat_id='cht_a'))
+    await adapter.on_processing_complete(event, None)
+    assert not adapter._sequence_turns
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Between turns')).success
+    next_turn = dict(chat_uid='cht_a', owner=True, dm=True)
+    adapter._active_turn.set(next_turn)
+    adapter._sequence_turns['cht_a'] = next_turn
+    assert (await adapter.send('cht_a', 'Next turn')).success
+    assert http.posts == posts + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ['rejected', 'failed', 'delivery_unknown'])
+async def test_unsuccessful_sequence_preserves_final_reply(monkeypatch, tmp_path, status):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    if status == 'rejected':
+        items = [dict(type='photos', asset_ids=['missing'])]
+    else:
+        items = [dict(type='text', body='Opening'), dict(type='text', body='City?')]
+        http.responses = [_Resp({'uid': 'opening'}), _Resp({}, status=400 if status == 'failed' else 500)]
+        monkeypatch.setattr(module, 'SEQUENCE_INTERVAL', 0)
+    receipt = await adapter.send_sequence({'items': items}, turn)
+    assert not receipt['success']
+    assert receipt['failure']['status'] == status
+    posts = http.posts
+    assert (await adapter.send('cht_a', 'Text fallback')).success
+    assert http.posts == posts + 1
+    assert http.calls[-1][2]['json'] == {'body': 'Text fallback'}
