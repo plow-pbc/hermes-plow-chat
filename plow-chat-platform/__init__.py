@@ -1222,8 +1222,10 @@ class PlowChatAdapter(BasePlatformAdapter):
                 await self._read_referrer(http)
                 # Before the first turn, not after it: the knob is read at turn
                 # start, so a boot that waited would narrate its way through
-                # one whole turn before going quiet.
-                self._sync_interim_display(await self._verbose_enabled(http))
+                # one whole turn before going quiet. Through the same defensive
+                # read the turn boundary uses -- a preferences endpoint that
+                # blinks must cost one chattier turn, never the connect.
+                self._sync_interim_display(await self._read_verbose())
         # Declare the home channel, so the customer is never asked /sethome.
         # config.yaml is the canonical store /sethome itself writes, and the
         # cron scheduler reads it back via config.get_home_channel(). The home

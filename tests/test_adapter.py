@@ -5701,6 +5701,40 @@ async def test_the_knob_is_pointed_before_the_first_turn_not_after_it(
     assert _written_interim(module) is False
 
 
+@pytest.mark.parametrize(
+    "preferences",
+    [RuntimeError("preferences unavailable"), {"verbose_output_enabled": False}],
+    ids=["endpoint-blinked", "endpoint-answered"],
+)
+async def test_connect_survives_a_preferences_endpoint_that_blinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    preferences: Any,
+) -> None:
+    """A display preference must never be able to cost the connect. Read
+    unguarded here, a blinking preferences endpoint would take down the boot
+    of an agent that had nothing wrong with it -- strictly worse than the
+    chattier thread this whole change exists to fix -- so it degrades to
+    quiet, exactly as the turn boundary does."""
+    module = _load(monkeypatch, tmp_path)
+    module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
+        {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
+    http = _PreferenceHTTP(preferences)
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    monkeypatch.setattr(adapter, "_refresh_reach", _noop_async)
+    monkeypatch.setattr(adapter, "_read_referrer", _noop_async)
+    monkeypatch.setattr(adapter, "_listen", _noop_async)
+    reached: list[str] = []
+    monkeypatch.setattr(adapter, "_declare_home",
+                        lambda *a, **k: reached.append("home"), raising=False)
+
+    with contextlib.suppress(Exception):
+        await adapter.connect()
+
+    # Quiet either way, and the connect got past the read to keep going.
+    assert _written_interim(module) is False
+
+
 async def test_a_preference_the_plugin_cannot_read_leaves_the_turn_alone(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
