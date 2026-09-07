@@ -128,10 +128,22 @@ That key is static config and knows nothing of a per-credential preference, so
 the plugin points it at the live answer: on connect, and at each turn boundary,
 `verbose_output_enabled` is read and written into `config.yaml` when it differs.
 Quiet keeps the working-out inside the turn and lets only the answer reach the
-room; verbose restores the running commentary. Hermes reads the key on the turn
-*after* the write, so a toggle flipped mid-conversation lands on the next
-message — and the connect-time write is what keeps the first turn after a boot
-from narrating.
+room; verbose restores the running commentary.
+
+**The write lands on the turn it runs on, not the next one.** Hermes awaits the
+`on_processing_start` hook immediately before the message handler
+(`gateway/platforms/base.py`), and resolves the turn's display config further
+down inside `_run_agent_inner` — so the write precedes the read, and the
+mtime-keyed raw-yaml cache the loader shares is invalidated by the atomic
+replace. A toggle flipped between turns applies to the very next message. The
+connect-time write covers the deliveries that never run that hook: a cron
+producer reaches the agent through the gateway's own handler rather than this
+adapter's inbound path.
+
+The staged file carries the config's own mode across the replace. `agent-mgr`
+installs it 0600 and it is 0640 on the fleet, so a temp file created under the
+usual 022 umask would otherwise widen the whole gateway config to
+world-readable on every write.
 
 Writing a gateway key from here is deliberate. The base image owns the config
 *seed* — the static default every agent boots with; what reaches the room on a

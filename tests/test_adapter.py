@@ -5625,15 +5625,6 @@ async def test_recall_searches_what_was_said_not_the_rendered_prompt(
     assert query.split(" OR ")[0] in expected.lower()
 
 
-def _bodies(http: Any) -> list[str]:
-    """The message bodies that reached the thread, in order.
-
-    A turn's completion also posts the typing stop, and these tests are about
-    what the room can read.
-    """
-    return [payload["body"] for url, payload in http.posts if url.endswith("/messages")]
-
-
 def _turn_event(module: Any) -> Any:
     """An owner turn in cht_a whose prompt advertises the sentinel."""
     return SimpleNamespace(
@@ -5678,29 +5669,6 @@ async def test_a_turn_points_hermes_interim_knob_at_the_credential(
     assert config["display"]["platforms"]["plow_chat"]["tool_progress"] == "off"
 
 
-async def test_the_knob_is_pointed_before_the_first_turn_not_after_it(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """The key is read at the start of a turn, so a sync that waited for one
-    would let the turn right after a boot narrate its way through before going
-    quiet -- the loudest turn of the day, every deploy."""
-    module = _load(monkeypatch, tmp_path)
-    module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
-        {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
-    http = _PreferenceHTTP({"verbose_output_enabled": False})
-    adapter = _verbose_adapter(module, http, monkeypatch)
-    monkeypatch.setattr(adapter, "_refresh_reach", _noop_async)
-    monkeypatch.setattr(adapter, "_read_referrer", _noop_async)
-    monkeypatch.setattr(adapter, "_declare_home", _noop_async, raising=False)
-    monkeypatch.setattr(adapter, "_listen", _noop_async)
-
-    with contextlib.suppress(Exception):
-        await adapter.connect()
-
-    assert _written_interim(module) is False
-
-
 @pytest.mark.parametrize(
     "preferences",
     [RuntimeError("preferences unavailable"), {"verbose_output_enabled": False}],
@@ -5711,11 +5679,14 @@ async def test_connect_survives_a_preferences_endpoint_that_blinks(
     tmp_path: pathlib.Path,
     preferences: Any,
 ) -> None:
-    """A display preference must never be able to cost the connect. Read
+    """Connect covers the deliveries that never run the turn hook -- a cron
+    producer reaches the agent through the gateway's own handler, not this
+    adapter's inbound path -- so the knob is already pointed before one fires.
+
+    And a display preference must never be able to cost the connect: read
     unguarded here, a blinking preferences endpoint would take down the boot
-    of an agent that had nothing wrong with it -- strictly worse than the
-    chattier thread this whole change exists to fix -- so it degrades to
-    quiet, exactly as the turn boundary does."""
+    of an agent that had nothing wrong with it, which is strictly worse than
+    the chattier thread this whole change exists to fix."""
     module = _load(monkeypatch, tmp_path)
     module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
         {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
@@ -5724,9 +5695,6 @@ async def test_connect_survives_a_preferences_endpoint_that_blinks(
     monkeypatch.setattr(adapter, "_refresh_reach", _noop_async)
     monkeypatch.setattr(adapter, "_read_referrer", _noop_async)
     monkeypatch.setattr(adapter, "_listen", _noop_async)
-    reached: list[str] = []
-    monkeypatch.setattr(adapter, "_declare_home",
-                        lambda *a, **k: reached.append("home"), raising=False)
 
     with contextlib.suppress(Exception):
         await adapter.connect()
@@ -5773,3 +5741,29 @@ async def test_an_unwritable_gateway_config_does_not_fail_the_turn(
     await adapter.on_processing_start(event)
     assert adapter._active_turn.get()["chat_uid"] == "cht_a"
     await adapter.on_processing_complete(event, None)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640], ids=["agent-mgr-default", "on-the-fleet"])
+async def test_the_config_keeps_its_own_mode_across_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    mode: int,
+) -> None:
+    """agent-mgr installs this config through an atomic_write that defaults to
+    0600, and it is 0640 on the fleet. A staged file created under the usual
+    022 umask lands 0644, so replacing without carrying the mode across would
+    quietly make an agent's whole gateway config world-readable -- every time
+    the owner flipped the toggle."""
+    module = _load(monkeypatch, tmp_path)
+    module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
+        {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
+    module.GATEWAY_CONFIG.chmod(mode)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    event = _turn_event(module)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, None)
+
+    assert _written_interim(module) is False, "the write has to have happened"
+    assert module.GATEWAY_CONFIG.stat().st_mode & 0o777 == mode

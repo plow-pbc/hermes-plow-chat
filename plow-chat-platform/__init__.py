@@ -71,6 +71,7 @@ GOALS_DIR = _STATE_ROOT / "plow_chat_goals"
 # live answer and the runtime's own switch meet.
 GATEWAY_CONFIG = _STATE_ROOT / "config.yaml"
 INTERIM_KEY = "interim_assistant_messages"
+VERBOSE_READ_TIMEOUT = 5
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
 
@@ -1220,10 +1221,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # turn refreshes -- see _owner_identity -- so it is not read here.
             if not is_reconnect:
                 await self._read_referrer(http)
-                # Before the first turn, not after it: the knob is read at turn
-                # start, so a boot that waited would narrate its way through
-                # one whole turn before going quiet. Through the same defensive
-                # read the turn boundary uses -- a preferences endpoint that
+                # Covers the deliveries that never run the turn hook -- a cron
+                # producer reaches the agent through the gateway's own handler,
+                # not this adapter's inbound path. Through the same defensive
+                # read the turn boundary uses: a preferences endpoint that
                 # blinks must cost one chattier turn, never the connect.
                 self._sync_interim_display(await self._read_verbose())
         # Declare the home channel, so the customer is never asked /sethome.
@@ -1807,8 +1808,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             # is a turn that cannot start.
             tmp = GATEWAY_CONFIG.with_suffix(".plow-chat-tmp")
             tmp.write_text(yaml.safe_dump(config, sort_keys=False))
+            # The replacement carries the file's own mode, not the umask's:
+            # agent-mgr installs this config 0600 (atomic_write's default) and
+            # it is 0640 on the fleet, so a fresh 0644 temp file would widen
+            # it to world-readable on every write.
+            tmp.chmod(GATEWAY_CONFIG.stat().st_mode & 0o777)
             tmp.replace(GATEWAY_CONFIG)
-            log.info("[plow_chat] set %s=%s for the next turn", INTERIM_KEY, verbose)
+            log.info("[plow_chat] set %s=%s for this turn", INTERIM_KEY, verbose)
         except Exception as exc:                # noqa: BLE001 - best effort
             log.warning("[plow_chat] could not sync %s: %s", INTERIM_KEY, exc)
 
@@ -1823,7 +1829,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         stranger's errand narration in front of a room.
         """
         try:
-            async with aiohttp.ClientSession() as http:
+            # Bounded: this runs before the turn is published, so an
+            # unbounded read would hold every inbound message for aiohttp's
+            # five-minute default -- the delay the quiet fallback exists to
+            # prevent, arriving as a stall instead of a chattier thread.
+            async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=VERBOSE_READ_TIMEOUT)) as http:
                 return await self._verbose_enabled(http)
         except Exception as exc:                # noqa: BLE001 - best effort
             log.debug("[plow_chat] verbose preference: %s", exc)
