@@ -159,8 +159,9 @@ whole gateway configuration at the umask's 0644 for the length of every write.
 Writing a gateway key from here is deliberate. The base image owns the config
 *seed* — the static default every agent boots with; what reaches the room on a
 given turn is this plugin's concern, and this key is the only lever the runtime
-offers for it. A failed read or an unwritable config is logged and dropped: the
-worst case is a chattier thread, never a dropped turn.
+offers for it. A failed read or an unwritable config is logged and dropped: the thread
+retains its last-synced verbosity until a later successful read, and the turn
+is never dropped.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
