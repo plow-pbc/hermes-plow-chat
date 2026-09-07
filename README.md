@@ -130,20 +130,31 @@ the plugin points it at the live answer: on connect, and at each turn boundary,
 Quiet keeps the working-out inside the turn and lets only the answer reach the
 room; verbose restores the running commentary.
 
-**The write lands on the turn it runs on, not the next one.** Hermes awaits the
-`on_processing_start` hook immediately before the message handler
-(`gateway/platforms/base.py`), and resolves the turn's display config further
-down inside `_run_agent_inner` — so the write precedes the read, and the
-mtime-keyed raw-yaml cache the loader shares is invalidated by the atomic
-replace. A toggle flipped between turns applies to the very next message. The
-connect-time write covers the deliveries that never run that hook: a cron
-producer reaches the agent through the gateway's own handler rather than this
-adapter's inbound path.
+**On an inbound turn the write lands on the turn it runs on, not the next
+one.** Hermes awaits the `on_processing_start` hook immediately before the
+message handler (`gateway/platforms/base.py`), and resolves the turn's display
+config further down inside `_run_agent_inner` — so the write precedes the read,
+and the mtime-keyed raw-yaml cache the loader shares is invalidated by the
+atomic replace. A toggle flipped between turns applies to the very next
+message.
 
-The staged file carries the config's own mode across the replace. `agent-mgr`
-installs it 0600 and it is 0640 on the fleet, so a temp file created under the
-usual 022 umask would otherwise widen the whole gateway config to
-world-readable on every write.
+**A cron delivery is the exception, and reads the last synced value.** A cron
+producer reaches the agent through the gateway's own handler rather than this
+adapter's inbound path, so it never runs that hook. Every connect —
+*reconnects included* — re-syncs, which is what bounds how stale that value can
+get; a toggle flipped between an inbound turn and a cron run reaches the cron
+run only once something has re-synced.
+
+A failed preference read changes nothing at all. It resolves to *unknown*
+rather than to quiet, so a blinking preferences endpoint cannot flip a setting
+the owner chose in either direction — it leaves whatever was last written and
+the turn proceeds.
+
+The staged file is created at the config's own mode before any content is
+written, following the `mkstemp` + `fchmod` ordering `agent-mgr`'s own
+`atomic_write` uses on this same file. `agent-mgr` installs it 0600 and the
+fleet runs it 0640, so writing first and restricting after would expose the
+whole gateway configuration at the umask's 0644 for the length of every write.
 
 Writing a gateway key from here is deliberate. The base image owns the config
 *seed* — the static default every agent boots with; what reaches the room on a

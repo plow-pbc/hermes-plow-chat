@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import stat
+import tempfile
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1221,12 +1222,14 @@ class PlowChatAdapter(BasePlatformAdapter):
             # turn refreshes -- see _owner_identity -- so it is not read here.
             if not is_reconnect:
                 await self._read_referrer(http)
-                # Covers the deliveries that never run the turn hook -- a cron
-                # producer reaches the agent through the gateway's own handler,
-                # not this adapter's inbound path. Through the same defensive
-                # read the turn boundary uses: a preferences endpoint that
-                # blinks must cost one chattier turn, never the connect.
-                self._sync_interim_display(await self._read_verbose())
+            # Every connect, reconnects included -- unlike the referrer above,
+            # this one CHANGES. A cron producer reaches the agent through the
+            # gateway's own handler rather than this adapter's inbound path, so
+            # it never runs the turn hook and reads whatever was last synced;
+            # re-syncing on each reconnect is what keeps that value fresh.
+            # Through the same defensive read the turn boundary uses: a
+            # preferences endpoint that blinks must cost the connect nothing.
+            self._sync_interim_display(await self._read_verbose())
         # Declare the home channel, so the customer is never asked /sethome.
         # config.yaml is the canonical store /sethome itself writes, and the
         # cron scheduler reads it back via config.get_home_channel(). The home
@@ -1795,6 +1798,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         is logged and dropped: a config the plugin could not write is the
         runtime's current behaviour, not a reason to fail the turn.
         """
+        if verbose is None:
+            return
         try:
             config = yaml.safe_load(GATEWAY_CONFIG.read_text()) or {}
             platform = (config.setdefault("display", {})
@@ -1805,14 +1810,18 @@ class PlowChatAdapter(BasePlatformAdapter):
             platform[INTERIM_KEY] = verbose
             # Written whole through a temp file in the same directory: the
             # gateway re-reads this file on every turn, and a half-written one
-            # is a turn that cannot start.
-            tmp = GATEWAY_CONFIG.with_suffix(".plow-chat-tmp")
-            tmp.write_text(yaml.safe_dump(config, sort_keys=False))
-            # The replacement carries the file's own mode, not the umask's:
-            # agent-mgr installs this config 0600 (atomic_write's default) and
-            # it is 0640 on the fleet, so a fresh 0644 temp file would widen
-            # it to world-readable on every write.
-            tmp.chmod(GATEWAY_CONFIG.stat().st_mode & 0o777)
+            # is a turn that cannot start. Staged the way agent-mgr's
+            # atomic_write stages this same file -- mkstemp opens at 0600 and
+            # the mode is set before any content is written, so the config is
+            # never briefly world-readable. It carries the file's OWN mode
+            # rather than a hardcoded 0600: agent-mgr installs it 0600 but the
+            # fleet runs it 0640, and either would be wrong for the other.
+            fd, name = tempfile.mkstemp(dir=GATEWAY_CONFIG.parent,
+                                        prefix=f".{GATEWAY_CONFIG.name}.")
+            tmp = pathlib.Path(name)
+            with os.fdopen(fd, "w") as handle:
+                os.fchmod(fd, GATEWAY_CONFIG.stat().st_mode & 0o777)
+                handle.write(yaml.safe_dump(config, sort_keys=False))
             tmp.replace(GATEWAY_CONFIG)
             log.info("[plow_chat] set %s=%s for this turn", INTERIM_KEY, verbose)
         except Exception as exc:                # noqa: BLE001 - best effort
@@ -1823,10 +1832,10 @@ class PlowChatAdapter(BasePlatformAdapter):
 
         Taken at the boundary and never on the reply path: a slow or failing
         preferences endpoint must not sit in front of the answers this agent
-        gives. Quiet on any failure -- the same answer an API that predates
-        the field serves -- because the cost of guessing wrong here is a
-        quieter thread for one turn, and guessing the other way puts a
-        stranger's errand narration in front of a room.
+        gives. None on any failure, which the caller treats as "change
+        nothing": a blink must not be able to flip a setting the owner chose,
+        and answering False here would silently quiet an assistant its owner
+        had asked to narrate.
         """
         try:
             # Bounded: this runs before the turn is published, so an
@@ -1838,7 +1847,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 return await self._verbose_enabled(http)
         except Exception as exc:                # noqa: BLE001 - best effort
             log.debug("[plow_chat] verbose preference: %s", exc)
-            return False
+            return None
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.
