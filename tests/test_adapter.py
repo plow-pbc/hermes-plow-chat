@@ -22,6 +22,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
+import yaml
 
 PLUGIN = pathlib.Path(__file__).resolve().parents[1] / "plow-chat-platform" / "__init__.py"
 
@@ -35,6 +36,11 @@ class _SendResult:
     success: bool
     message_id: str | None = None
     error: str | None = None
+
+
+async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+    """Stand in for a connect step these tests are not exercising."""
+    return None
 
 
 def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
@@ -5617,3 +5623,119 @@ async def test_recall_searches_what_was_said_not_the_rendered_prompt(
     query = module._recall_query(handled[0].recall_text)
     assert "untrusted" not in query, "the fence is not a search term"
     assert query.split(" OR ")[0] in expected.lower()
+
+
+def _bodies(http: Any) -> list[str]:
+    """The message bodies that reached the thread, in order.
+
+    A turn's completion also posts the typing stop, and these tests are about
+    what the room can read.
+    """
+    return [payload["body"] for url, payload in http.posts if url.endswith("/messages")]
+
+
+def _turn_event(module: Any) -> Any:
+    """An owner turn in cht_a whose prompt advertises the sentinel."""
+    return SimpleNamespace(
+        source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u",
+                               role_authorized=True),
+        message_id="msg_1", channel_prompt=module.GROUP_OWNER_CHANNEL_PROMPT)
+
+
+def _written_interim(module: Any) -> Any:
+    config = yaml.safe_load(module.GATEWAY_CONFIG.read_text())
+    return config["display"]["platforms"]["plow_chat"][module.INTERIM_KEY]
+
+
+@pytest.mark.parametrize("verbose", [False, True], ids=["quiet", "verbose"])
+async def test_a_turn_points_hermes_interim_knob_at_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    verbose: bool,
+) -> None:
+    """Whether the model's mid-turn commentary reaches the room is Hermes'
+    call, read from config.yaml at the start of every turn. Nothing pointed
+    that key at the owner's "Verbose agent output" preference, so a plugin
+    platform kept the chattier global default while Hermes' own iMessage
+    adapters sat quiet -- a DMV errand in a group posted 25 lines of
+    working-out before the one message that mattered. The turn boundary is
+    where the live answer reaches the runtime's own switch."""
+    module = _load(monkeypatch, tmp_path)
+    module.GATEWAY_CONFIG.write_text(yaml.safe_dump({"display": {"platforms": {
+        "plow_chat": {"tool_progress": "off", module.INTERIM_KEY: not verbose}}}}))
+    http = _PreferenceHTTP({"verbose_output_enabled": verbose})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    event = _turn_event(module)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, None)
+
+    assert _written_interim(module) is verbose
+    # Everything else in the file survives: the gateway reads the whole config
+    # each turn, so a rewrite that dropped a neighbouring key would take the
+    # setting it names with it.
+    config = yaml.safe_load(module.GATEWAY_CONFIG.read_text())
+    assert config["display"]["platforms"]["plow_chat"]["tool_progress"] == "off"
+
+
+async def test_the_knob_is_pointed_before_the_first_turn_not_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The key is read at the start of a turn, so a sync that waited for one
+    would let the turn right after a boot narrate its way through before going
+    quiet -- the loudest turn of the day, every deploy."""
+    module = _load(monkeypatch, tmp_path)
+    module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
+        {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    monkeypatch.setattr(adapter, "_refresh_reach", _noop_async)
+    monkeypatch.setattr(adapter, "_read_referrer", _noop_async)
+    monkeypatch.setattr(adapter, "_declare_home", _noop_async, raising=False)
+    monkeypatch.setattr(adapter, "_listen", _noop_async)
+
+    with contextlib.suppress(Exception):
+        await adapter.connect()
+
+    assert _written_interim(module) is False
+
+
+async def test_a_preference_the_plugin_cannot_read_leaves_the_turn_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The preference is a display choice, not an authority check. A turn that
+    refused to start because the preferences endpoint blinked would trade a
+    chattier thread for no answer at all, so the read fails to quiet and the
+    turn proceeds."""
+    module = _load(monkeypatch, tmp_path)
+    module.GATEWAY_CONFIG.write_text(yaml.safe_dump(
+        {"display": {"platforms": {"plow_chat": {module.INTERIM_KEY: True}}}}))
+    http = _PreferenceHTTP(RuntimeError("preferences unavailable"))
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    event = _turn_event(module)
+
+    await adapter.on_processing_start(event)
+    assert adapter._active_turn.get()["chat_uid"] == "cht_a"
+    await adapter.on_processing_complete(event, None)
+
+    assert _written_interim(module) is False
+
+
+async def test_an_unwritable_gateway_config_does_not_fail_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """A config the plugin could not write is the runtime's current behaviour,
+    which is a chattier thread -- not a reason to drop the owner's turn."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    event = _turn_event(module)
+
+    # No config.yaml at all: the read raises, and the turn still runs.
+    assert not module.GATEWAY_CONFIG.exists()
+    await adapter.on_processing_start(event)
+    assert adapter._active_turn.get()["chat_uid"] == "cht_a"
+    await adapter.on_processing_complete(event, None)

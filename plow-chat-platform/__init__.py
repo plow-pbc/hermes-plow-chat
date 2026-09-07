@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import aiohttp
+import yaml
 from gateway.config import HomeChannel, Platform, persist_home_channel
 try:
     from gateway.deferred_questions import DeferredQuestionResult
@@ -63,6 +64,13 @@ PLATFORM_NAME = "plow_chat"
 _STATE_ROOT = pathlib.Path(os.environ.get("HERMES_HOME") or "/var/lib/hermes")
 CHECKPOINT = _STATE_ROOT / "plow_chat_last_uid"
 GOALS_DIR = _STATE_ROOT / "plow_chat_goals"
+# Hermes decides whether the model's mid-turn commentary reaches the thread
+# from this key, re-read from config.yaml on every turn (gateway/run.py resolves
+# it per turn and nulls the interim callback when it is false). It is static
+# config and knows nothing of a per-credential preference, so this is where the
+# live answer and the runtime's own switch meet.
+GATEWAY_CONFIG = _STATE_ROOT / "config.yaml"
+INTERIM_KEY = "interim_assistant_messages"
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
 
@@ -1212,6 +1220,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # turn refreshes -- see _owner_identity -- so it is not read here.
             if not is_reconnect:
                 await self._read_referrer(http)
+                # Before the first turn, not after it: the knob is read at turn
+                # start, so a boot that waited would narrate its way through
+                # one whole turn before going quiet.
+                self._sync_interim_display(await self._verbose_enabled(http))
         # Declare the home channel, so the customer is never asked /sethome.
         # config.yaml is the canonical store /sethome itself writes, and the
         # cron scheduler reads it back via config.get_home_channel(). The home
@@ -1289,6 +1301,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                         "participant_identity": identity,
                         "triggered_at": datetime.now(timezone.utc).isoformat(),
                     })
+        self._sync_interim_display(await self._read_verbose())
         self._active_turn.set(turn)
         # Keyed by the turn's identity, not its chat: a goal wake and a real
         # inbound turn can both be live on one chat, and a single slot per chat
@@ -1763,6 +1776,56 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # itself.
                 await asyncio.to_thread(_mirror_sent, chat_id, body)
         return result
+
+    def _sync_interim_display(self, verbose):
+        """Point Hermes' interim-message knob at the credential's preference.
+
+        Quiet means the model's working-out -- "Now selecting Credit/Debit
+        Card", "Found Submit Payment" -- never leaves the turn, and only the
+        answer it arrived at reaches the room. Verbose restores the running
+        commentary. Hermes' own iMessage adapters sit at this setting by
+        default (`display_config._TIER_LOW`); a plugin platform inherits the
+        chattier global one, which is why an errand in a group posted 25
+        messages before the one that mattered.
+
+        Written only when it differs, so the steady state is a read. Failure
+        is logged and dropped: a config the plugin could not write is the
+        runtime's current behaviour, not a reason to fail the turn.
+        """
+        try:
+            config = yaml.safe_load(GATEWAY_CONFIG.read_text()) or {}
+            platform = (config.setdefault("display", {})
+                        .setdefault("platforms", {})
+                        .setdefault(PLATFORM_NAME, {}))
+            if platform.get(INTERIM_KEY) is verbose:
+                return
+            platform[INTERIM_KEY] = verbose
+            # Written whole through a temp file in the same directory: the
+            # gateway re-reads this file on every turn, and a half-written one
+            # is a turn that cannot start.
+            tmp = GATEWAY_CONFIG.with_suffix(".plow-chat-tmp")
+            tmp.write_text(yaml.safe_dump(config, sort_keys=False))
+            tmp.replace(GATEWAY_CONFIG)
+            log.info("[plow_chat] set %s=%s for the next turn", INTERIM_KEY, verbose)
+        except Exception as exc:                # noqa: BLE001 - best effort
+            log.warning("[plow_chat] could not sync %s: %s", INTERIM_KEY, exc)
+
+    async def _read_verbose(self):
+        """The verbose answer for the turn about to start, read defensively.
+
+        Taken at the boundary and never on the reply path: a slow or failing
+        preferences endpoint must not sit in front of the answers this agent
+        gives. Quiet on any failure -- the same answer an API that predates
+        the field serves -- because the cost of guessing wrong here is a
+        quieter thread for one turn, and guessing the other way puts a
+        stranger's errand narration in front of a room.
+        """
+        try:
+            async with aiohttp.ClientSession() as http:
+                return await self._verbose_enabled(http)
+        except Exception as exc:                # noqa: BLE001 - best effort
+            log.debug("[plow_chat] verbose preference: %s", exc)
+            return False
 
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.

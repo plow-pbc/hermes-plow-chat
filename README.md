@@ -114,6 +114,31 @@ turn-stop warnings — is dropped unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
 toggle) is true; the typing indicator already shows the turn is running.
 
+The same preference decides how much of a turn the room reads. Hermes gates the
+model's mid-turn commentary on
+`display.platforms.<platform>.interim_assistant_messages`, re-read from
+`config.yaml` at the start of every turn — the setting that puts its own
+iMessage adapters (photon, bluebubbles) in `display_config._TIER_LOW`. A plugin
+platform is in no tier and inherits the chattier global default, so an errand in
+a group posted twenty-five lines of working-out — "Now selecting Credit/Debit
+Card", "Found Submit Payment", "Button is disabled" — before the one message
+that mattered.
+
+That key is static config and knows nothing of a per-credential preference, so
+the plugin points it at the live answer: on connect, and at each turn boundary,
+`verbose_output_enabled` is read and written into `config.yaml` when it differs.
+Quiet keeps the working-out inside the turn and lets only the answer reach the
+room; verbose restores the running commentary. Hermes reads the key on the turn
+*after* the write, so a toggle flipped mid-conversation lands on the next
+message — and the connect-time write is what keeps the first turn after a boot
+from narrating.
+
+Writing a gateway key from here is deliberate. The base image owns the config
+*seed* — the static default every agent boots with; what reaches the room on a
+given turn is this plugin's concern, and this key is the only lever the runtime
+offers for it. A failed read or an unwritable config is logged and dropped: the
+worst case is a chattier thread, never a dropped turn.
+
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
 **Which chats the agent serves is not configured here at all.** The credential's
