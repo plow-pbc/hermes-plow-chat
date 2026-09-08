@@ -1346,18 +1346,26 @@ class PlowChatAdapter(BasePlatformAdapter):
         # producer, which could only delete (see #89). Above the `said` read
         # below: _goal_note_reply must land before said is snapshotted, or the
         # goal transcript misses the very reply this releases.
-        held = list(turn.get("held") or ()) if turn else []
+        held = turn.get("held") if turn else None
         if held and not turn.get("answered"):
             try:
-                async with aiohttp.ClientSession() as http:
-                    result = await self._post_message(http, chat_uid, {"body": held[-1]})
+                async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=5)) as http:
+                    result = await self._post_message(http, chat_uid, {"body": held})
                 if result.success:
                     log.info("[plow_chat] released held chatter as the answer for %s", chat_uid)
-                    self._goal_note_reply(chat_uid, held[-1])
+                    self._goal_note_reply(chat_uid, held)
                 else:
                     log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, result.error)
             except Exception as exc:            # noqa: BLE001 - the release runs earliest in this method and must not gate everything after it
                 log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, exc)
+        elif held:
+            # answered is set: a real answer (text, attachment, or sequence)
+            # already reached this chat, so the held note is stale working-out
+            # rather than the turn's answer -- discard it, but say so, since
+            # this whole mechanism exists because messages went missing
+            # invisibly.
+            log.info("[plow_chat] discarded held chatter for %s: an answer already reached the room", chat_uid)
         said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
@@ -1513,11 +1521,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         One owner for output capture: two turns for one chat overlap, so a
         chat-keyed buffer hands one turn's words to the other, and every send
         path that reaches the thread has to arrive here or the judge scores a
-        turn it cannot see.
+        turn it cannot see. The same guard is exactly "this turn answered its
+        own chat", so it also owns `answered` -- the one flag every
+        room-reaching path (send, _send_attachment, _sequence_post) needs set
+        and none of them previously agreed on.
         """
         turn = self._active_turn.get()
         if turn is None or chat_id != turn["chat_uid"] or not body:
             return
+        turn["answered"] = True
         said = turn.setdefault("said", [])
         said.append(body)
         del said[:-GOAL_HISTORY_ENTRIES]
@@ -1816,14 +1828,17 @@ class PlowChatAdapter(BasePlatformAdapter):
                 # is touched: a message the owner never sees must not eat the
                 # "working" signal either.
                 if chatter and turn is not None:
-                    turn.setdefault("held", []).append(body)
-                log.info("[plow_chat] held mid-turn chatter for %s", chat_id)
+                    # Only the last one is ever released, so this is a scalar,
+                    # not a list -- each new held body simply replaces the last.
+                    turn["held"] = body
+                    log.info("[plow_chat] held mid-turn chatter for %s", chat_id)
+                elif chatter:
+                    log.info("[plow_chat] dropped mid-turn chatter for %s: no active turn to hold it on", chat_id)
+                else:
+                    log.info("[plow_chat] dropped turn-stop explainer for %s", chat_id)
                 return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:
-            if turn is not None and not chatter:
-                # An answer reached the room, so nothing held needs releasing.
-                turn["answered"] = True
             # Only once it lands: text that never reached the thread is not
             # something the agent said. This records the turn's reply to its
             # OWN chat, which is exactly the case the mirror below excludes --

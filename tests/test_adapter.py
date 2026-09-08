@@ -3953,6 +3953,54 @@ async def test_a_failed_release_still_completes_the_turns_cleanup(
     assert adapter._active_turn.get() is None
 
 
+class _PreferenceMediaHTTP(_PreferenceHTTP):
+    """_PreferenceHTTP plus the declare/upload legs an attachment send needs,
+    so a photo answer can reach the messages endpoint the same way text does."""
+
+    def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+        if url.endswith("/attachments"):
+            return _Resp({"uid": "att_1", "upload_url": "https://uploads.example/put",
+                          "upload_headers": {"Content-Type": "image/png"}})
+        return super().post(url, json=json, headers=headers)
+
+    def put(self, url: str, *, data: bytes, headers: dict[str, str]) -> _Resp:
+        return _Resp({})
+
+
+async def test_a_photo_answer_suppresses_the_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """FINDING 2: `answered` used to have one writer (send()) covering only
+    the text-reply path, so a turn whose real answer was a photo -- or,
+    sharing the exact same _goal_note_reply call site, a sequence --
+    released stale held chatter on top of it. _goal_note_reply now owns
+    `answered`, and every room-reaching path (send, _send_attachment,
+    _sequence_post) already calls it, so a photo answer suppresses the
+    release the same way a text answer does."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceMediaHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    turn = {"chat_uid": "cht_a", "owner": True, "dm": False, "no_reply_ok": False}
+    adapter._active_turn.set(turn)
+
+    messages_url = f"{module.BASE}/v1/chats/cht_a/messages"
+    sent = lambda: [body for url, body in http.posts if url == messages_url]
+
+    photo = tmp_path / "map.png"
+    photo.write_bytes(b"\x89PNG")
+    result = await adapter.send_image_file("cht_a", str(photo), caption="Here's the map")
+    await adapter.send("cht_a", "Note to self: sent the map", metadata={"thread_id": "t"})
+
+    assert result.success and turn["answered"] is True
+
+    await adapter.on_processing_complete(
+        SimpleNamespace(source=SimpleNamespace(chat_id="cht_a")), None
+    )
+
+    assert sent() == [{"body": "Here's the map", "attachment_uids": ["att_1"]}]
+
+
 async def test_missing_field_means_quiet(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
