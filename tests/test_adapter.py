@@ -7,6 +7,7 @@ the adapter without adding Hermes itself as a dependency.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -1967,7 +1968,8 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
             assert turn["owner"] is False
             if event.message_id == "msg_no_reply":
                 return
-            results["reply"] = await adapter.send(event.source.chat_id, "reply in B")
+            results["reply"] = await adapter.send(event.source.chat_id, "reply in B",
+                                                    metadata={"notify": True})
             results["cross_chat"] = await adapter.send("cht_a", "must not leave B")
         finally:
             await adapter.on_processing_complete(event, None)
@@ -1978,7 +1980,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     await _settle(adapter)                   # same sender: settle, or it is one turn
     await adapter._on_frame(_envelope("evt_no_reply", "cht_b", "msg_no_reply", role="member"))
     await _settle(adapter)
-    results["after_turn"] = await adapter.send("cht_a", "allowed after B")
+    results["after_turn"] = await adapter.send("cht_a", "allowed after B", metadata={"notify": True})
     results["outside_grant"] = await adapter.send("cht_c", "not granted")
 
     assert "cht_b" not in adapter._typing
@@ -2204,12 +2206,12 @@ def _live_tool(
 
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
 
-    async def stub(*args: Any) -> Any:
+    async def stub(*args: Any, **kwargs: Any) -> Any:
         if record is not None:
             record.append(args)
         if raises is not None:
             raise raises
-        return result(*args) if callable(result) else result
+        return result(*args, **kwargs) if callable(result) else result
 
     setattr(adapter, method, stub)
     loop = asyncio.new_event_loop()
@@ -3681,8 +3683,10 @@ class _PreferenceHTTP(_HTTP):
 
 
 def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Reach covers both room shapes the quiet gate distinguishes: `cht_a` is
+    the owner's solo DM, `cht_g` has a second human in it."""
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a")])
+    adapter._set_reach([_chat("cht_a"), _chat("cht_g", group=True)])
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     return adapter
 
@@ -3726,10 +3730,10 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
     tmp_path: pathlib.Path,
 ) -> None:
     """In quiet mode the typing indicator is the only "working" signal, so it
-    must survive the whole turn: a delivered mid-turn send re-arms the refresh
-    loop, which posts a fresh `start` once the grace delay elapses (the
-    message post cleared the provider-side bubble); a quiet-dropped diagnostic
-    never touches it; and a send outside any turn starts none."""
+    must survive the whole turn: a delivered answer re-arms the refresh loop,
+    which posts a fresh `start` once the grace delay elapses (the message post
+    cleared the provider-side bubble); a quiet-held chatter send never touches
+    it; and a send outside any turn starts none."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3741,57 +3745,91 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 
     monkeypatch.setattr(module.asyncio, "sleep", instant)
     typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_a"] = typing
+    adapter._typing["cht_g"] = typing
 
-    dropped = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    assert dropped.success
-    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+    held = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
+    assert held.success
+    assert adapter._typing.get("cht_g") is typing and not typing.cancelled()
 
-    sent = await adapter.send("cht_a", "interim update")
+    sent = await adapter.send("cht_g", "the answer", metadata={"notify": True})
     assert sent.success and typing.cancelled()
     for _ in range(10):                      # let the re-armed loop run
         await real_sleep(0)
-    adapter._cancel_typing("cht_a")
-    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
+    adapter._cancel_typing("cht_g")
+    assert (f"{module.BASE}/v1/chats/cht_g/typing", {"action": "start"}) in http.posts
 
-    outside_turn = await adapter.send("cht_a", "cron delivery")
-    assert outside_turn.success and "cht_a" not in adapter._typing
+    outside_turn = await adapter.send("cht_g", "cron delivery", metadata={"job_id": "job_1"})
+    assert outside_turn.success and "cht_g" not in adapter._typing
 
 
 @pytest.mark.parametrize(
-    ("enabled", "expected_posts"),
-    [(False, 0), (True, 1)],
-    ids=["quiet", "verbose"],
+    "metadata,in_group",
+    [
+        ({"notify": True}, True),            # the turn-final reply
+        ({"job_id": "abc123"}, True),        # a cron delivery
+        ({"thread_id": "t1"}, False),        # interim prose
+        ({}, False),                         # a gateway notice
+        (None, False),                       # heartbeat with no metadata at all
+    ],
+    ids=["final", "cron", "interim", "notice", "no-metadata"],
 )
-@pytest.mark.parametrize(
-    "diagnostic",
-    ["💾 Self-improvement review: memory updated",
-     "⚠️ No reply: empty content after 3 attempts",
-     "⏳ Working — 3 min — iteration 22/500, 41 tool calls"],
-    ids=["review", "no_reply", "working"],
-)
-async def test_diagnostic_sends_follow_the_verbose_output_preference(
+async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listening(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
-    enabled: bool,
-    expected_posts: int,
-    diagnostic: str,
+    metadata: dict | None,
+    in_group: bool,
 ) -> None:
-    """The dashboard setting belongs to this assistant credential. Ordinary
-    replies must not pay for a preference lookup; only Hermes's marked
-    diagnostic bodies consult it before crossing into iMessage, one read
-    per diagnostic, so a toggle flip takes effect immediately."""
+    """Quiet is about the agent's working-out, not about volume: the turn's
+    answer carries Hermes' `notify` marker and a cron delivery carries the
+    scheduler's `job_id`, and both are what was asked for.
+
+    The room decides whether the rest is withheld. The seam cannot tell an
+    answer written mid-turn from the commentary around it, so withholding can
+    cost the answer -- paid only where a third party would otherwise read the
+    commentary. In the owner's own 1:1 nothing is withheld, so the same send
+    that is dropped in a group is delivered there."""
     module = _load(monkeypatch, tmp_path)
-    http = _PreferenceHTTP({"verbose_output_enabled": enabled})
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
+    adapter._active_turn.set(
+        {"chat_uid": "cht_g", "owner": True, "dm": False, "no_reply_ok": False}
+    )
 
-    ordinary = await adapter.send("cht_a", "You're welcome")
-    first = await adapter.send("cht_a", diagnostic)
-    second = await adapter.send("cht_a", diagnostic)
+    group = await adapter.send("cht_g", "the body", metadata=metadata)
+    assert group.success and bool(http.posts) is in_group
 
-    assert ordinary.success and first.success and second.success
-    assert http.gets == [f"{module.BASE}/v1/api-keys/current/preferences"] * 2
-    assert len(http.posts) == 1 + 2 * expected_posts
+    http.posts.clear()
+    adapter._active_turn.set(
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+    )
+    dm = await adapter.send("cht_a", "the body", metadata=metadata)
+    assert dm.success and http.posts, "the owner's own 1:1 withholds nothing"
+
+
+def test_every_internal_send_call_carries_metadata() -> None:
+    """The quiet gate reads intent off `metadata`, not off which internal
+    caller it is: an unmarked internal send() falls back to chatter and gets
+    held -- or, for a call with no active turn to hold it on (a tool call
+    running on another thread, say), silently never leaves while still
+    reporting success. `_plow_send_message` shipped exactly that miss once;
+    this sweeps every `self.send(`/`adapter.send(` call in the module so the
+    next one fails a test instead of dropping a message in production."""
+    source = PLUGIN.read_text()
+    offenders = [
+        f"line {node.lineno}: {ast.get_source_segment(source, node)}"
+        for node in ast.walk(ast.parse(source))
+        if (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "send"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"self", "adapter"}
+            and not any(kw.arg == "metadata" for kw in node.keywords))
+    ]
+    assert offenders == [], (
+        "every internal send() call must pass metadata= (e.g. "
+        "{'notify': True} for an answer, {'job_id': ...} for a cron path) so "
+        "the quiet gate can tell it from mid-turn chatter:\n" + "\n".join(offenders)
+    )
 
 
 async def test_missing_field_means_quiet(
@@ -3804,22 +3842,22 @@ async def test_missing_field_means_quiet(
     http = _PreferenceHTTP({"some_other_preference": True})
     adapter = _verbose_adapter(module, http, monkeypatch)
 
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    review = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
     status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
     assert review.success and status.success and http.posts == []
 
 
-async def test_preference_outage_never_touches_ordinary_prose(
+async def test_preference_outage_never_touches_the_turns_answer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """Only marked diagnostics pay for the preference read, so an outage
-    fails loudly there and cannot reach a normal reply at all."""
+    """Only a gated send pays for the preference read, so an outage fails
+    loudly there and cannot reach the turn's own `notify`-marked answer."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP(RuntimeError("preferences unreachable"))
     adapter = _verbose_adapter(module, http, monkeypatch)
 
-    prose = await adapter.send("cht_a", "Dinner is at 7.")
+    prose = await adapter.send("cht_a", "Dinner is at 7.", metadata={"notify": True})
     assert prose.success
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
                            {"body": "Dinner is at 7."})]
@@ -3866,7 +3904,7 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
             {"chat_uid": turn_chat, "owner": True,
              "no_reply_ok": bool(sentinel_turn)})
 
-    result = await adapter.send("cht_a", body)
+    result = await adapter.send("cht_a", body, metadata={"notify": True})
     assert result.success
     assert len(http.posts) == (1 if delivered else 0)
     assert http.gets == []
@@ -4498,7 +4536,7 @@ async def test_the_agent_s_reply_is_recorded_on_its_own_turn_once_delivered(
     turn = {"chat_uid": "cht_a", "owner": True, "no_reply_ok": False}
     adapter._active_turn.set(turn)
 
-    await adapter.send("cht_a", "I booked the campsite.")
+    await adapter.send("cht_a", "I booked the campsite.", metadata={"notify": True})
 
     assert turn.get("said", []) == (["I booked the campsite."] if posted else [])
 
@@ -5063,7 +5101,7 @@ async def test_send_mirrors_exactly_a_turns_message_to_another_chat(
     adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
     calls = _stub_mirror(monkeypatch)
     adapter._active_turn.set(turn)
-    result = await adapter.send(target, "the three addresses")
+    result = await adapter.send(target, "the three addresses", metadata={"notify": True})
     assert result.success and result.message_id == "msg_sent"
     assert [(c["chat_id"], c["text"]) for c in calls] == [(uid, "the three addresses") for uid in mirrored]
 
@@ -5398,7 +5436,7 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
     adapter.chat_uids = adapter.chat_uids | {'cht_b'}
     mirrored = []
     monkeypatch.setattr(module, '_mirror_sent', lambda *args: mirrored.append(args))
-    assert (await adapter.send('cht_b', 'Other chat')).success
+    assert (await adapter.send('cht_b', 'Other chat', metadata={'notify': True})).success
     assert mirrored == [('cht_b', 'Other chat')]
     assert http.posts == 2
 
@@ -5406,11 +5444,11 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
     await adapter.on_processing_complete(event, None)
     assert not adapter._sequence_turns
     posts = http.posts
-    assert (await adapter.send('cht_a', 'Between turns')).success
+    assert (await adapter.send('cht_a', 'Between turns', metadata={'notify': True})).success
     next_turn = dict(chat_uid='cht_a', owner=True, dm=True)
     adapter._active_turn.set(next_turn)
     adapter._sequence_turns[id(next_turn)] = next_turn
-    assert (await adapter.send('cht_a', 'Next turn')).success
+    assert (await adapter.send('cht_a', 'Next turn', metadata={'notify': True})).success
     assert http.posts == posts + 2
 
 
@@ -5428,7 +5466,7 @@ async def test_unsuccessful_sequence_preserves_final_reply(monkeypatch, tmp_path
     assert not receipt['success']
     assert receipt['failure']['status'] == status
     posts = http.posts
-    assert (await adapter.send('cht_a', 'Text fallback')).success
+    assert (await adapter.send('cht_a', 'Text fallback', metadata={'notify': True})).success
     assert http.posts == posts + 1
     assert http.calls[-1][2]['json'] == {'body': 'Text fallback'}
 
@@ -5455,7 +5493,7 @@ async def test_failed_sequence_after_a_successful_one_reopens_the_reply_path(mon
     assert not second['success']
 
     posts = http.posts
-    assert (await adapter.send('cht_a', 'Only the opening arrived.')).success
+    assert (await adapter.send('cht_a', 'Only the opening arrived.', metadata={'notify': True})).success
     assert http.posts == posts + 1
     assert http.calls[-1][2]['json'] == {'body': 'Only the opening arrived.'}
 
