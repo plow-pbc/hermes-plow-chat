@@ -7,7 +7,6 @@ the adapter without adding Hermes itself as a dependency.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -3845,31 +3844,31 @@ async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
     assert delivered.success and loud.posts, "verbose delivers the same diagnostic"
 
 
-def test_every_internal_send_call_carries_metadata() -> None:
-    """The quiet gate reads intent off `metadata`, not off which internal
-    caller it is: an unmarked internal send() falls back to chatter and gets
-    held -- or, for a call with no active turn to hold it on (a tool call
-    running on another thread, say), silently never leaves while still
-    reporting success. `_plow_send_message` shipped exactly that miss once;
-    this sweeps every `self.send(`/`adapter.send(` call in the module so the
-    next one fails a test instead of dropping a message in production."""
-    source = PLUGIN.read_text()
-    offenders = [
-        f"line {node.lineno}: {ast.get_source_segment(source, node)}"
-        for node in ast.walk(ast.parse(source))
-        if (isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "send"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in {"self", "adapter"}
-            and not any(kw.arg == "metadata" for kw in node.keywords))
-    ]
-    assert offenders == [], (
-        "every internal send() call must pass metadata= (e.g. "
-        "{'notify': True} for an answer, {'job_id': ...} for a cron path) so "
-        "the quiet gate can tell it from mid-turn chatter:\n" + "\n".join(offenders)
-    )
+@pytest.mark.parametrize(
+    "chat_id,turn",
+    [("cht_g", None),
+     ("cht_g", {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False})],
+    ids=["no-active-turn", "cross-chat-during-a-turn"],
+)
+async def test_a_send_outside_the_turns_own_chat_is_never_withheld(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    chat_id: str,
+    turn: dict | None,
+) -> None:
+    """Only prose the model writes INTO the open turn's own chat is its
+    working-out. The adapter's own sends -- the first-meeting greeting, a goal
+    notice, the send_message tool reaching another room -- run turn-less or
+    cross-chat, so they are never withheld and need no marker to say so. This
+    is what lets those callers stay unannotated: the boundary carries it."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    adapter._active_turn.set(turn)
 
+    result = await adapter.send(chat_id, "a message the adapter itself sent")
+
+    assert result.success and http.posts, "a send outside the turn's own chat always lands"
 
 async def test_missing_field_means_quiet(
     monkeypatch: pytest.MonkeyPatch,

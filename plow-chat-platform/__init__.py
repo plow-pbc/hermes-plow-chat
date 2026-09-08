@@ -213,26 +213,6 @@ def _owner_dm(chat):
     return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
 
 
-def _is_mid_turn_chatter(metadata):
-    """Whether this send is the agent's working-out rather than its answer.
-
-    Hermes marks the turn-final user-visible reply with `notify`
-    (gateway/platforms/base.py `_mark_notify_metadata`) -- the same key
-    telegram, discord, mattermost and a2a already read to tell a final reply
-    from a mid-turn one. A cron delivery is nobody's working-out: it carries
-    the scheduler's job_id and IS the turn. Everything else a turn emits --
-    interim prose, heartbeats, self-improvement notices, gateway warnings --
-    is the model thinking out loud, and that is what the owner's preference
-    decides on.
-
-    Metadata-shaped, not prefix-shaped, deliberately: the whitelist this
-    replaced knew three literal strings, so the running commentary that
-    published a cart and a card into a shared room went straight through it.
-    """
-    meta = metadata or {}
-    return not meta.get("notify") and "job_id" not in meta
-
-
 def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
@@ -1481,7 +1461,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn's mid-turn chatter, so the verbose preference must not gate them.
         """
         try:
-            result = await self.send(chat_uid, text, metadata={"notify": True})
+            result = await self.send(chat_uid, text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:                # noqa: BLE001 - undelivered is a state, not a crash
@@ -1791,7 +1771,17 @@ class PlowChatAdapter(BasePlatformAdapter):
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
-        chatter = _is_mid_turn_chatter(metadata)
+        # The turn boundary is the classifier: prose the model writes while a
+        # turn is open, into that turn's own chat, is its working-out. Hermes
+        # marks the turn-final reply `notify` -- the key telegram, discord,
+        # mattermost and a2a already read for the same distinction -- and the
+        # scheduler marks a cron delivery `job_id`. Everything the adapter
+        # itself sends (the greeting, a goal notice, the send_message tool)
+        # runs turn-less or cross-chat, so it falls out as not-chatter
+        # without needing to say so.
+        meta = metadata or {}
+        chatter = (turn is not None and chat_id == turn["chat_uid"]
+                   and not meta.get("notify") and "job_id" not in meta)
         # Matched on text because Hermes gives these no metadata of their own:
         # the heartbeat and the memory notice arrive unmarked, and the
         # turn-stop explainer arrives `notify`-marked because Hermes
@@ -2411,7 +2401,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         if not first_meeting:
             return
         try:
-            await self.send(chat_uid, "👋", metadata={"notify": True})
+            await self.send(chat_uid, "👋")
         except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
             log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
@@ -3321,7 +3311,7 @@ def _plow_send_message(args, **_kwargs):
     adapter, loop = _live
     try:
         result = asyncio.run_coroutine_threadsafe(
-            adapter.send(chat_id, body, metadata={"notify": True}), loop
+            adapter.send(chat_id, body), loop
         ).result(timeout=45)
     except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
         return _lost_answer(exc)
