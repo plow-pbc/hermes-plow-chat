@@ -37,6 +37,15 @@ class _SendResult:
     error: str | None = None
 
 
+def _rendered(module: Any, prompt: str, name: Any, identity: Any) -> str:
+    """A channel prompt as `_channel_prompt` renders it.
+
+    Identity opens it and the answer-ordering rule closes it; the tests below
+    model both so a change to either has one place to land.
+    """
+    return module._with_identity(prompt, name, identity) + module._ANSWER_LAST
+
+
 def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
     """Import the plugin against stub `gateway` modules."""
     config = types.ModuleType("gateway.config")
@@ -1151,13 +1160,13 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     # owner turn carries the shared-thread rules too — the room is the
     # boundary, not the asker.
     owner_prompt = handled[1]["channel_prompt"]
-    assert owner_prompt == module._with_identity(
+    assert owner_prompt == _rendered(module,
         _voiced(module, _owned(module, module.GROUP_OWNER_CHANNEL_PROMPT, room)),
         None, adapter._identity)
     for block in (module._DISCLOSURE, module._NO_RELAY):
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
-    assert member_prompt == module._with_identity(
+    assert member_prompt == _rendered(module,
         _voiced(module, module.EXTERNAL_CHANNEL_PROMPT), None, adapter._identity)
     for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
         assert block in member_prompt
@@ -1303,7 +1312,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
         expected = _owned(module, expected, chat)
     if group:
         expected = _voiced(module, expected)
-    assert event["channel_prompt"] == module._with_identity(expected, agent_name, adapter._identity)
+    assert event["channel_prompt"] == _rendered(module, expected, agent_name, adapter._identity)
 
 
 # The dashboard cards the prefix names, in the order it names them.
@@ -1395,7 +1404,7 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     # this test owns is the voice rule and the roster facts -- present in a
     # shared thread, absent in a solo DM, with the base prompt unchanged
     # either way.
-    assert event["channel_prompt"] == module._with_identity(
+    assert event["channel_prompt"] == _rendered(module,
         f"{rule}{roster_facts}{_owned(module, base, chat)}", "Elm", adapter._identity)
 
 
@@ -1432,7 +1441,7 @@ async def test_trust_selects_the_explicit_prompt_matrix(
         expected = _owned(module, expected, chat)
     if group:
         expected = _voiced(module, expected)
-    assert handled[0]["channel_prompt"] == module._with_identity(expected, None, adapter._identity)
+    assert handled[0]["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
 
     if trusted:
         prompt = handled[0]["channel_prompt"].lower()
@@ -1717,7 +1726,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
 
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
-    assert handled[0]["channel_prompt"] == module._with_identity(
+    assert handled[0]["channel_prompt"] == _rendered(module,
         _voiced(module, module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT), None, adapter._identity)
 
 
@@ -3948,27 +3957,26 @@ def test_every_turn_is_told_to_write_its_answer_last(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """Hermes reads whatever the model wrote LAST as the turn's final response,
-    and the model's habit is to write its real message, call one more tool, and
-    then write itself a note -- so the note lands as the answer and the message
-    reads as mid-turn chatter.
-
-    Suppressing mid-turn delivery is the remedy that deletes the message
-    instead: plow-hermes-agent's seed records it measured live, twice, taking a
-    whole onboarding introduction with it. The delivery seam cannot tell an
-    answer from a note, so the ordering is the model's to get right and has to
-    be asked for -- on every prompt, the solo owner DM included, because the
-    habit is the model's and does not vary by who is listening."""
+    """Every rendered channel prompt carries the answer-ordering rule -- the
+    solo owner DM included, because the habit is the model's and does not vary
+    by who is listening. Rendered, not per-constant: `_channel_prompt` is the
+    one seam both production paths go through."""
     module = _load(monkeypatch, tmp_path)
-    for prompt in (module.OWNER_CHANNEL_PROMPT,
-                   module.GROUP_OWNER_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT,
-                   module.EXTERNAL_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT):
-        assert module._ANSWER_LAST in prompt
-    # An ordering rule, not a volume one -- "say less" is what the refuted
-    # remedy already tried to enforce at the delivery seam.
-    assert "LAST" in module._ANSWER_LAST
+    identity = {"signup": None, "number": None}
+    def _room(*, group: bool = False, trusted: bool = False) -> dict[str, Any]:
+        # `type` is stamped by the adapter, not by the _chat fixture.
+        return {**_chat("cht_a", group=group, trusted=trusted),
+                "type": "group" if group else "dm"}
+
+    for chat, role in ((_room(), "owner"),
+                       (_room(group=True), "owner"),
+                       (_room(group=True), "member"),
+                       (_room(group=True, trusted=True), "owner"),
+                       (_room(group=True, trusted=True), "member")):
+        rendered = module._channel_prompt(chat, role, _collaboration_chat(), identity)
+        assert module._ANSWER_LAST in rendered
+        # The identity opener still comes first: appended, never prepended.
+        assert not rendered.startswith(module._ANSWER_LAST)
 
 
 # --------------------------------------------------------------- thread goals

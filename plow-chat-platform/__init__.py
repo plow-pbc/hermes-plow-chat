@@ -600,7 +600,9 @@ def _channel_prompt(chat, role, roster, identity):
         # it is the owner's own; the INVITER's name is theirs, so it arrives as
         # turn data instead -- see _referrer_block.
         prompt = f"{prompt} {_owner_fact(_owner_identity(roster))}"
-    return _collaboration_prompt(prompt, roster, identity)
+    # Appended, not prepended: every turn prompt has to OPEN with who this
+    # agent is, and the ordering rule is the same for every room and speaker.
+    return _collaboration_prompt(prompt, roster, identity) + _ANSWER_LAST
 
 
 def _goal_turn_line(record):
@@ -731,31 +733,24 @@ REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "plow_send_message tool and will be refused on an external turn."
 )
-# Everything the model writes reaches the room, and Hermes reads whatever it
-# wrote LAST as the turn's final response. The failure that follows from that
-# is ordering, not volume: the model writes its real message, calls one more
-# tool (a memory entry, per the variant personas), then writes a note to
-# itself -- so the note is the final response and the message reads as
-# mid-turn chatter.
-#
-# Suppressing mid-turn delivery is the remedy that does NOT work, and this is
-# the second time it has been tried: plow-hermes-agent's seed config records it
-# measured live, twice, deleting a whole onboarding introduction and leaving
-# "Already saved that. Now I'll wait for her next reply." Holding messages and
-# flushing the last fails identically -- the note is what arrives last. The
-# delivery seam cannot tell an answer from a note, so the ordering is the
-# model's to get right, which makes it a prompt rule.
+# Hermes reads the model's LAST message as the turn's final response.
+# Suppressing mid-turn delivery instead lost the intended answer in live
+# trials -- twice; see README and plow-pbc/hermes-plow-chat#89 -- so the
+# ordering is asked for here rather than enforced at the delivery seam.
 _ANSWER_LAST = (
     "Write your answer LAST. Every message you write reaches this chat as you "
     "write it, and whatever you write last is what this turn is read as. "
     "Finish the tool calls you need -- recording an outcome, saving a note to "
     "yourself, any bookkeeping -- BEFORE the message you want read, never "
-    "after it. Do not narrate the work on the way there: no running commentary "
+    "after it. A tool that POSTS to this chat is the exception: when one "
+    "delivers your answer, that delivery IS the message, and anything you "
+    "write after it is dropped. "
+    "Do not narrate the work on the way there: no running commentary "
     "on what you are about to click, search, fill in or try, and no progress "
     "notes between steps. When the work is done, say what happened, once. "
 )
 OWNER_CHANNEL_PROMPT = (
-    f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_ANSWER_LAST}"
+    f"You are talking to your owner. {REPLY_TARGET_PROMPT}"
 )
 # Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
 # plugin states the routing rule itself. Rendered only when plow-init exported
@@ -828,7 +823,7 @@ _GOAL_PEER_SILENCE = (
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and answer their message directly; never emit "
-    f"[NOOP], reasoning, or tool narration. {_ANSWER_LAST}{_SILENCE_OPTION}"
+    f"[NOOP], reasoning, or tool narration. {_SILENCE_OPTION}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
     f"{_MEMBER_TURN_PREAMBLE}"

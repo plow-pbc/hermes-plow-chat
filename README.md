@@ -127,8 +127,14 @@ measured live: a whole onboarding introduction disappeared and the owner's turn
 became *"Already saved that. Now I'll wait for her next reply."* Holding
 messages and flushing the last one fails identically — the note is what arrives
 last. The delivery seam cannot tell an answer from a note, so the ordering is
-the model's to get right, and `_ANSWER_LAST` rides every channel prompt asking
-for it.
+the model's to get right, and `_ANSWER_LAST` closes every channel prompt asking
+for it — appended once in `_channel_prompt`, the one seam both production
+paths go through, after the identity opener each prompt has to start with.
+
+One exception rides with it: a tool that *posts* to the chat is itself the
+answer. A successful `plow_send_sequence` has already delivered the turn's
+reply, so the guard drops the prose that follows — the rule says so, or a
+model that finished its tools first would have its answer suppressed.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
