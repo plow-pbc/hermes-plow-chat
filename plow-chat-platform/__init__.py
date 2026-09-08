@@ -749,13 +749,16 @@ REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "plow_send_message tool and will be refused on an external turn."
 )
-# Hermes reads the model's LAST message as the turn's final response.
-# Suppressing mid-turn delivery instead lost the intended answer in live
-# trials -- twice; see README and plow-pbc/hermes-plow-chat#89 -- so the
-# ordering is asked for here rather than enforced at the delivery seam.
+# Hermes reads the model's LAST message as the turn's final response, and that
+# is the one the delivery gate can recognise. The gate withholds the rest when
+# the owner asked for quiet, but it cannot tell an answer written mid-turn from
+# the working-out around it -- suppressing on that guess lost the intended
+# answer in live trials, twice; see README and plow-pbc/hermes-plow-chat#89.
+# So the ordering is asked for here; the seam only enforces the volume.
 _ANSWER_LAST = (
-    "Write your answer LAST. Every message you write reaches this chat as you "
-    "write it, and whatever you write last is what this turn is read as. "
+    "Write your answer LAST. Whatever you write last is what this turn is "
+    "read as, and it is the one message certain to reach this chat -- anything "
+    "you write before it may be withheld as working-out. "
     "Finish the tool calls you need -- recording an outcome, saving a note to "
     "yourself, any bookkeeping -- BEFORE the message you want read, never "
     "after it. A tool that POSTS to this chat is the exception: when one "
@@ -1338,34 +1341,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Read before the turn is cleared below: this is the only place the
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
-        # Quiet held this turn's chatter; if none of it was an answer, the last
-        # thing the model wrote IS the answer -- Hermes reads the model's final
-        # write as final_response, and when that is a note to self the real
-        # message is the one before it. Releasing here is what makes quiet
-        # non-lossy, and is why this gate lives at delivery rather than at the
-        # producer, which could only delete (see #89). Above the `said` read
-        # below: _goal_note_reply must land before said is snapshotted, or the
-        # goal transcript misses the very reply this releases.
-        held = turn.get("held") if turn else None
-        if held and not turn.get("answered"):
-            try:
-                async with aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=5)) as http:
-                    result = await self._post_message(http, chat_uid, {"body": held})
-                if result.success:
-                    log.info("[plow_chat] released held chatter as the answer for %s", chat_uid)
-                    self._goal_note_reply(chat_uid, held)
-                else:
-                    log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, result.error)
-            except Exception as exc:            # noqa: BLE001 - the release runs earliest in this method and must not gate everything after it
-                log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, exc)
-        elif held:
-            # answered is set: a real answer (text, attachment, or sequence)
-            # already reached this chat, so the held note is stale working-out
-            # rather than the turn's answer -- discard it, but say so, since
-            # this whole mechanism exists because messages went missing
-            # invisibly.
-            log.info("[plow_chat] discarded held chatter for %s: an answer already reached the room", chat_uid)
         said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
@@ -1521,15 +1496,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         One owner for output capture: two turns for one chat overlap, so a
         chat-keyed buffer hands one turn's words to the other, and every send
         path that reaches the thread has to arrive here or the judge scores a
-        turn it cannot see. The same guard is exactly "this turn answered its
-        own chat", so it also owns `answered` -- the one flag every
-        room-reaching path (send, _send_attachment, _sequence_post) needs set
-        and none of them previously agreed on.
+        turn it cannot see.
         """
         turn = self._active_turn.get()
         if turn is None or chat_id != turn["chat_uid"] or not body:
             return
-        turn["answered"] = True
         said = turn.setdefault("said", [])
         said.append(body)
         del said[:-GOAL_HISTORY_ENTRIES]
@@ -1819,23 +1790,17 @@ class PlowChatAdapter(BasePlatformAdapter):
         explainer = body.startswith(_NO_REPLY_PREFIX)
         async with aiohttp.ClientSession() as http:
             if (chatter or explainer) and not await self._verbose_enabled(http):
-                # Held on the turn, not dropped: if this turn never delivers an
-                # answer, on_processing_complete releases the last one. Quiet
-                # shrinks a turn; it must never silence one. The explainer is
-                # dropped rather than held -- it is Hermes reporting that there
-                # was no answer, so holding it as if it were one would deliver
-                # the diagnostic the preference just refused. Held before typing
-                # is touched: a message the owner never sees must not eat the
-                # "working" signal either.
-                if chatter and turn is not None:
-                    # Only the last one is ever released, so this is a scalar,
-                    # not a list -- each new held body simply replaces the last.
-                    turn["held"] = body
-                    log.info("[plow_chat] held mid-turn chatter for %s", chat_id)
-                elif chatter:
-                    log.info("[plow_chat] dropped mid-turn chatter for %s: no active turn to hold it on", chat_id)
-                else:
-                    log.info("[plow_chat] dropped turn-stop explainer for %s", chat_id)
+                # Dropped, not buffered for later release. A turn-end flush of
+                # the last withheld body was tried and removed: the seam cannot
+                # tell an answer from a note, so flushing publishes whatever the
+                # model happened to write last -- in a shared room, that is the
+                # running commentary this gate exists to keep out of it. The
+                # README's delivery-contract section records the same conclusion
+                # from two earlier attempts. Dropped before typing is touched:
+                # a message the owner never sees must not eat the "working"
+                # signal either.
+                log.info("[plow_chat] dropped %s for %s",
+                         "mid-turn chatter" if chatter else "turn-stop explainer", chat_id)
                 return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:

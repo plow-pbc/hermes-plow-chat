@@ -109,25 +109,31 @@ URL in git.
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
-Diagnostic chatter — agent status frames, 💾 background-review posts, ⚠️
-turn-stop warnings — is dropped unless the credential's
+Mid-turn chatter — interim prose, agent status frames, 💾 background-review
+posts, ⚠️ turn-stop warnings — is dropped unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
-toggle) is true; the typing indicator already shows the turn is running.
+toggle) is true; the typing indicator already shows the turn is running. What
+counts as chatter is a metadata test, not a prefix one: Hermes marks the
+turn-final reply `notify` and a cron delivery `job_id`, and anything carrying
+neither, sent while a turn is open, is the model working out loud.
 
-**The answer goes last, and that is a prompt rule because it cannot be a
-delivery one.** Everything the model writes reaches the room as it writes it,
-and Hermes reads whatever it wrote *last* as the turn's final response. The
-model's habit is to write its real message, call one more tool — recording an
-outcome, per the variant personas — and then write itself a note, so the note
-lands as the answer and the message reads as chatter.
+**The answer goes last, and that is still a prompt rule, because the delivery
+seam can suppress chatter but cannot recognise an answer.** Hermes reads
+whatever the model wrote *last* as the turn's final response. The model's habit
+is to write its real message, call one more tool — recording an outcome, per
+the variant personas — and then write itself a note, so the note is what gets
+marked, and the real message is indistinguishable from chatter.
 
-Suppressing mid-turn delivery is the remedy that does not work, and it has now
-been tried twice. `plow-hermes-agent`'s seed config records the first attempt,
-measured live: a whole onboarding introduction disappeared and the owner's turn
-became *"Already saved that. Now I'll wait for her next reply."* Holding
-messages and flushing the last one fails identically — the note is what arrives
-last. The delivery seam cannot tell an answer from a note, so the ordering is
-the model's to get right, and `_ANSWER_LAST` closes every channel prompt asking
+Quiet therefore delivers whichever message Hermes marked. When that is the
+note, the answer is suppressed with the rest of the chatter — the same outcome
+`plow-hermes-agent`'s seed config records from the first attempt, measured
+live: a whole onboarding introduction disappeared and the owner's turn became
+*"Already saved that. Now I'll wait for her next reply."* Buffering the
+withheld bodies and flushing the last one at turn end does not rescue it and
+was removed: the seam cannot tell an answer from a note either way, so a flush
+publishes whatever the model happened to write last — in a shared room, the
+running commentary the gate exists to keep out of it. The ordering is the
+model's to get right, and `_ANSWER_LAST` closes every channel prompt asking
 for it — appended once in `_channel_prompt`, the one seam both production
 paths go through, after the identity opener each prompt has to start with.
 
