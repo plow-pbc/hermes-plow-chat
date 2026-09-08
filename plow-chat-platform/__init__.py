@@ -43,14 +43,10 @@ from gateway.session import build_session_key
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
 DASHBOARD_URL = "https://app.plow.co/dashboard"
-BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
 # TODO(remove): once the fleet image pin includes srosro/hermes-agent's
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
 _NO_REPLY_PREFIX = "⚠️ No reply: "
-# Upstream's long-running heartbeat rides plain send(), not
-# send_or_update_status, so the one verbose preference has to gate it here.
-_WORKING_PREFIX = "⏳ Working —"
 PLATFORM_NAME = "plow_chat"
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
@@ -207,6 +203,26 @@ def _owner_dm(chat):
     """
     members = [p for p in chat.get("participants") or [] if p.get("type") == "member"]
     return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
+
+
+def _is_mid_turn_chatter(metadata):
+    """Whether this send is the agent's working-out rather than its answer.
+
+    Hermes marks the turn-final user-visible reply with `notify`
+    (gateway/platforms/base.py `_mark_notify_metadata`) -- the same key
+    telegram, discord, mattermost and a2a already read to tell a final reply
+    from a mid-turn one. A cron delivery is nobody's working-out: it carries
+    the scheduler's job_id and IS the turn. Everything else a turn emits --
+    interim prose, heartbeats, self-improvement notices, gateway warnings --
+    is the model thinking out loud, and that is what the owner's preference
+    decides on.
+
+    Metadata-shaped, not prefix-shaped, deliberately: the whitelist this
+    replaced knew three literal strings, so the running commentary that
+    published a cart and a card into a shared room went straight through it.
+    """
+    meta = metadata or {}
+    return not meta.get("notify") and "job_id" not in meta
 
 
 def _collaboration_prompt(prompt, chat, identity):
@@ -1448,9 +1464,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         A provider that raises is a notice that did not land, not a reason to
         abandon the transition mid-flight: an escaping exception leaves the
         pacing stopped and the goal with no task to re-fire or retire it.
+        Sent notify-marked: a `/goal` reply and a goal's own activation,
+        exhaustion or expiry notice are the goal subsystem's answer, not a
+        turn's mid-turn chatter, so the verbose preference must not gate them.
         """
         try:
-            result = await self.send(chat_uid, text)
+            result = await self.send(chat_uid, text, metadata={"notify": True})
         except asyncio.CancelledError:
             raise
         except Exception as exc:                # noqa: BLE001 - undelivered is a state, not a crash
@@ -1760,15 +1779,31 @@ class PlowChatAdapter(BasePlatformAdapter):
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
+        chatter = _is_mid_turn_chatter(metadata)
+        # The turn-stop explainer is the one diagnostic wearing an answer's
+        # marker: Hermes substitutes it AS final_response, so it arrives
+        # `notify`-marked and the predicate above correctly calls it an answer.
+        # It is still a diagnostic, so the preference still decides it.
+        explainer = body.startswith(_NO_REPLY_PREFIX)
         async with aiohttp.ClientSession() as http:
-            if body.startswith((BACKGROUND_REVIEW_PREFIX, _NO_REPLY_PREFIX, _WORKING_PREFIX)):
-                if not await self._verbose_enabled(http):
-                    # Dropped before touching typing: a frame the owner never
-                    # sees must not eat the "working" signal either.
-                    log.info("[plow_chat] dropped diagnostic message for %s", chat_id)
-                    return SendResult(success=True)
+            if (chatter or explainer) and not await self._verbose_enabled(http):
+                # Held on the turn, not dropped: if this turn never delivers an
+                # answer, on_processing_complete releases the last one. Quiet
+                # shrinks a turn; it must never silence one. The explainer is
+                # dropped rather than held -- it is Hermes reporting that there
+                # was no answer, so holding it as if it were one would deliver
+                # the diagnostic the preference just refused. Held before typing
+                # is touched: a message the owner never sees must not eat the
+                # "working" signal either.
+                if chatter and turn is not None:
+                    turn.setdefault("held", []).append(body)
+                log.info("[plow_chat] held mid-turn chatter for %s", chat_id)
+                return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:
+            if turn is not None and not chatter:
+                # An answer reached the room, so nothing held needs releasing.
+                turn["answered"] = True
             # Only once it lands: text that never reached the thread is not
             # something the agent said. This records the turn's reply to its
             # OWN chat, which is exactly the case the mirror below excludes --
@@ -2339,11 +2374,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         file is the durable record of having met this chat, so it rides
         whichever baseline write creates it -- an in-memory latch re-greeted
         every granted chat on every gateway restart, a wave of noise into
-        real rooms."""
+        real rooms. Sent notify-marked: this is the adapter's own structural
+        disclosure, not a turn's mid-turn chatter -- there may be no turn open
+        at all -- so the verbose preference must not gate it."""
         if not first_meeting:
             return
         try:
-            await self.send(chat_uid, "👋")
+            await self.send(chat_uid, "👋", metadata={"notify": True})
         except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
             log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
