@@ -109,10 +109,14 @@ URL in git.
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
-Diagnostics — agent status frames, 💾 background-review posts, ⚠️ turn-stop
-warnings — are dropped in every room unless the credential's
-`verbose_output_enabled` preference (the dashboard's "Verbose agent output"
-toggle) is true; the typing indicator already shows the turn is running.
+Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running
+heartbeats, ⚠️ turn-stop warnings — are dropped in **every** room unless the
+credential's `verbose_output_enabled` preference (the dashboard's "Verbose
+agent output" toggle) is true; the typing indicator already shows the turn is
+running. Hermes gives them no metadata of their own, so they are recognised by
+the text they open with, and the room rule below deliberately does not reach
+them: they are the runtime describing itself, never the turn's answer, so
+withholding one can never withhold the message the owner wanted.
 
 The model's own **mid-turn prose** is gated by the same preference, but only
 where someone else is listening. What counts as mid-turn is a metadata test,

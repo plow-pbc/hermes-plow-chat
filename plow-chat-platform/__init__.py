@@ -43,10 +43,18 @@ from gateway.session import build_session_key
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
 DASHBOARD_URL = "https://app.plow.co/dashboard"
+# Hermes' own diagnostics reach the adapter through plain send() carrying no
+# metadata that tells them apart from the model's prose, so they are still
+# recognised by the text they open with. The room carve-out below must not
+# reach them: they are the runtime talking about itself, never the turn's
+# answer, so withholding one can never withhold the message the owner wanted.
+BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
+_WORKING_PREFIX = "⏳ Working —"
 # TODO(remove): once the fleet image pin includes srosro/hermes-agent's
 # turn-stop-status PR, turn-stop text arrives as status frames and this
 # final-response shim is dead code.
 _NO_REPLY_PREFIX = "⚠️ No reply: "
+_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
@@ -1784,11 +1792,13 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
         chatter = _is_mid_turn_chatter(metadata)
-        # The turn-stop explainer is the one diagnostic wearing an answer's
-        # marker: Hermes substitutes it AS final_response, so it arrives
-        # `notify`-marked and the predicate above correctly calls it an answer.
-        # It is still a diagnostic, so the preference still decides it.
-        explainer = body.startswith(_NO_REPLY_PREFIX)
+        # Matched on text because Hermes gives these no metadata of their own:
+        # the heartbeat and the memory notice arrive unmarked, and the
+        # turn-stop explainer arrives `notify`-marked because Hermes
+        # substitutes it AS final_response -- so the metadata predicate calls
+        # one batch chatter and the other an answer, and neither reading is
+        # what the preference means by a diagnostic.
+        diagnostic = body.startswith(_DIAGNOSTIC_PREFIXES)
         # Withheld only where withholding is worth its own risk. The seam
         # cannot tell the model's answer from its working-out, so suppressing
         # chatter can suppress the answer with it -- a real cost, paid only in
@@ -1803,21 +1813,25 @@ class PlowChatAdapter(BasePlatformAdapter):
         # the seam cannot make -- see the README's delivery-contract section,
         # which records the same conclusion from two earlier attempts.
         #
-        # The explainer is gated everywhere: it is Hermes reporting that there
-        # was no answer, a diagnostic rather than the model's own words, and
-        # the preference has always decided those in every room.
+        # Hermes' own diagnostics stay gated in EVERY room, carve-out included.
+        # They are the runtime describing itself, so withholding one can never
+        # withhold the turn's answer, and the room rule exists only to protect
+        # the answer. Letting them ride the carve-out would hand a quiet owner
+        # the heartbeat and the memory notice in their own DM -- the two the
+        # base image's seed deliberately produces for this gate to decide.
+        #
         # .get, not indexing: a chat can be inside the grant without its
         # resource cached -- a cross-chat send reaches one this adapter
         # never listed. An unknown room is not the owner's 1:1, so the
         # empty default withholds, which is the direction that cannot
         # disclose.
-        withhold = explainer or (chatter and not _owner_dm(self._chats.get(chat_id, {})))
+        withhold = diagnostic or (chatter and not _owner_dm(self._chats.get(chat_id, {})))
         async with aiohttp.ClientSession() as http:
             if withhold and not await self._verbose_enabled(http):
                 # Before typing is touched: a message the owner never sees must
                 # not eat the "working" signal either.
                 log.info("[plow_chat] dropped %s for %s",
-                         "turn-stop explainer" if explainer else "mid-turn chatter", chat_id)
+                         "diagnostic" if diagnostic else "mid-turn chatter", chat_id)
                 return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:

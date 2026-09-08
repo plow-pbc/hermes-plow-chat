@@ -3745,21 +3745,21 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 
     monkeypatch.setattr(module.asyncio, "sleep", instant)
     typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_g"] = typing
+    adapter._typing["cht_a"] = typing
 
-    held = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
+    held = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
     assert held.success
-    assert adapter._typing.get("cht_g") is typing and not typing.cancelled()
+    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
 
-    sent = await adapter.send("cht_g", "the answer", metadata={"notify": True})
+    sent = await adapter.send("cht_a", "the answer", metadata={"notify": True})
     assert sent.success and typing.cancelled()
     for _ in range(10):                      # let the re-armed loop run
         await real_sleep(0)
-    adapter._cancel_typing("cht_g")
-    assert (f"{module.BASE}/v1/chats/cht_g/typing", {"action": "start"}) in http.posts
+    adapter._cancel_typing("cht_a")
+    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
 
-    outside_turn = await adapter.send("cht_g", "cron delivery", metadata={"job_id": "job_1"})
-    assert outside_turn.success and "cht_g" not in adapter._typing
+    outside_turn = await adapter.send("cht_a", "cron delivery", metadata={"job_id": "job_1"})
+    assert outside_turn.success and "cht_a" not in adapter._typing
 
 
 @pytest.mark.parametrize(
@@ -3806,6 +3806,45 @@ async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listen
     assert dm.success and http.posts, "the owner's own 1:1 withholds nothing"
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["💾 Self-improvement review: memory updated",
+     "⏳ Working — 6 min",
+     "⚠️ No reply: the model returned empty content after retries."],
+    ids=["background-review", "heartbeat", "turn-stop"],
+)
+async def test_hermes_diagnostics_stay_gated_in_the_owners_own_dm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: str,
+) -> None:
+    """The room carve-out protects the model's ANSWER, so it must not also
+    exempt Hermes' diagnostics. These are the runtime describing itself --
+    withholding one can never withhold the turn's message -- and the base
+    image's seed produces the heartbeat and the memory notice precisely so
+    this preference decides them. A quiet owner must not start receiving them
+    in their own 1:1 just because nothing is withheld there.
+
+    The same body is delivered when the preference is on: gated, not banned."""
+    module = _load(monkeypatch, tmp_path)
+    quiet = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, quiet, monkeypatch)
+    adapter._active_turn.set(
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+    )
+
+    dropped = await adapter.send("cht_a", body)
+    assert dropped.success and quiet.posts == [], "a diagnostic is gated in every room"
+
+    loud = _PreferenceHTTP({"verbose_output_enabled": True})
+    verbose = _verbose_adapter(module, loud, monkeypatch)
+    verbose._active_turn.set(
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+    )
+    delivered = await verbose.send("cht_a", body)
+    assert delivered.success and loud.posts, "verbose delivers the same diagnostic"
+
+
 def test_every_internal_send_call_carries_metadata() -> None:
     """The quiet gate reads intent off `metadata`, not off which internal
     caller it is: an unmarked internal send() falls back to chatter and gets
@@ -3842,7 +3881,7 @@ async def test_missing_field_means_quiet(
     http = _PreferenceHTTP({"some_other_preference": True})
     adapter = _verbose_adapter(module, http, monkeypatch)
 
-    review = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
+    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
     status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
     assert review.success and status.success and http.posts == []
 
