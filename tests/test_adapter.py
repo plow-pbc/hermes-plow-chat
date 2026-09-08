@@ -3944,6 +3944,33 @@ def test_every_silence_instruction_names_the_sentinel(
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
 
 
+def test_every_turn_is_told_to_write_its_answer_last(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes reads whatever the model wrote LAST as the turn's final response,
+    and the model's habit is to write its real message, call one more tool, and
+    then write itself a note -- so the note lands as the answer and the message
+    reads as mid-turn chatter.
+
+    Suppressing mid-turn delivery is the remedy that deletes the message
+    instead: plow-hermes-agent's seed records it measured live, twice, taking a
+    whole onboarding introduction with it. The delivery seam cannot tell an
+    answer from a note, so the ordering is the model's to get right and has to
+    be asked for -- on every prompt, the solo owner DM included, because the
+    habit is the model's and does not vary by who is listening."""
+    module = _load(monkeypatch, tmp_path)
+    for prompt in (module.OWNER_CHANNEL_PROMPT,
+                   module.GROUP_OWNER_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT,
+                   module.EXTERNAL_CHANNEL_PROMPT,
+                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT):
+        assert module._ANSWER_LAST in prompt
+    # An ordering rule, not a volume one -- "say less" is what the refuted
+    # remedy already tried to enforce at the delivery seam.
+    assert "LAST" in module._ANSWER_LAST
+
+
 # --------------------------------------------------------------- thread goals
 
 

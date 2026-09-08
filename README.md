@@ -114,6 +114,22 @@ turn-stop warnings — is dropped unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
 toggle) is true; the typing indicator already shows the turn is running.
 
+**The answer goes last, and that is a prompt rule because it cannot be a
+delivery one.** Everything the model writes reaches the room as it writes it,
+and Hermes reads whatever it wrote *last* as the turn's final response. The
+model's habit is to write its real message, call one more tool — recording an
+outcome, per the variant personas — and then write itself a note, so the note
+lands as the answer and the message reads as chatter.
+
+Suppressing mid-turn delivery is the remedy that does not work, and it has now
+been tried twice. `plow-hermes-agent`'s seed config records the first attempt,
+measured live: a whole onboarding introduction disappeared and the owner's turn
+became *"Already saved that. Now I'll wait for her next reply."* Holding
+messages and flushing the last one fails identically — the note is what arrives
+last. The delivery seam cannot tell an answer from a note, so the ordering is
+the model's to get right, and `_ANSWER_LAST` rides every channel prompt asking
+for it.
+
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
 **Which chats the agent serves is not configured here at all.** The credential's
