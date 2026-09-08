@@ -1806,6 +1806,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         # The explainer is gated everywhere: it is Hermes reporting that there
         # was no answer, a diagnostic rather than the model's own words, and
         # the preference has always decided those in every room.
+        # .get, not indexing: a chat can be inside the grant without its
+        # resource cached -- a cross-chat send reaches one this adapter
+        # never listed. An unknown room is not the owner's 1:1, so the
+        # empty default withholds, which is the direction that cannot
+        # disclose.
         withhold = explainer or (chatter and not _owner_dm(self._chats.get(chat_id, {})))
         async with aiohttp.ClientSession() as http:
             if withhold and not await self._verbose_enabled(http):
