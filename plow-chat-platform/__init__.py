@@ -602,7 +602,7 @@ def _channel_prompt(chat, role, roster, identity):
         prompt = f"{prompt} {_owner_fact(_owner_identity(roster))}"
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
-    return _collaboration_prompt(prompt, roster, identity) + _ANSWER_LAST
+    return f"{_collaboration_prompt(prompt, roster, identity)} {_ANSWER_LAST}"
 
 
 def _goal_turn_line(record):

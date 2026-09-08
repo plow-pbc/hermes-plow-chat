@@ -43,7 +43,7 @@ def _rendered(module: Any, prompt: str, name: Any, identity: Any) -> str:
     Identity opens it and the answer-ordering rule closes it; the tests below
     model both so a change to either has one place to land.
     """
-    return module._with_identity(prompt, name, identity) + module._ANSWER_LAST
+    return f"{module._with_identity(prompt, name, identity)} {module._ANSWER_LAST}"
 
 
 def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
@@ -3977,6 +3977,10 @@ def test_every_turn_is_told_to_write_its_answer_last(
         assert module._ANSWER_LAST in rendered
         # The identity opener still comes first: appended, never prepended.
         assert not rendered.startswith(module._ANSWER_LAST)
+        # And the join is a real separator. Membership alone cannot see a
+        # missing space -- the rule would arrive glued to the previous
+        # sentence ("...stays truthful.Write your answer LAST").
+        assert f" {module._ANSWER_LAST}" in rendered
 
 
 # --------------------------------------------------------------- thread goals
