@@ -1338,17 +1338,25 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Read before the turn is cleared below: this is the only place the
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
-        said = list(turn.get("said") or ()) if turn else []
         # Quiet held this turn's chatter; if none of it was an answer, the last
         # thing the model wrote IS the answer -- Hermes reads the model's final
         # write as final_response, and when that is a note to self the real
         # message is the one before it. Releasing here is what makes quiet
         # non-lossy, and is why this gate lives at delivery rather than at the
-        # producer, which could only delete (see #89).
+        # producer, which could only delete (see #89). Above the `said` read
+        # below: _goal_note_reply must land before said is snapshotted, or the
+        # goal transcript misses the very reply this releases.
         held = list(turn.get("held") or ()) if turn else []
-        if held and turn is not None and not turn.get("answered"):
-            async with aiohttp.ClientSession() as http:
-                await self._post_message(http, chat_uid, {"body": held[-1]})
+        if held and not turn.get("answered"):
+            try:
+                async with aiohttp.ClientSession() as http:
+                    result = await self._post_message(http, chat_uid, {"body": held[-1]})
+                if result.success:
+                    log.info("[plow_chat] released held chatter as the answer for %s", chat_uid)
+                    self._goal_note_reply(chat_uid, held[-1])
+            except Exception as exc:            # noqa: BLE001 - the release runs earliest in this method and must not gate everything after it
+                log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, exc)
+        said = list(turn.get("said") or ()) if turn else []
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # This turn's ownership and this turn's tasks: a completion that

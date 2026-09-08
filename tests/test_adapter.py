@@ -3857,15 +3857,39 @@ async def test_diagnostic_sends_follow_the_verbose_output_preference(
     assert len(http.posts) == 1 + 2 * expected_posts
 
 
-async def test_a_quiet_turn_that_answered_only_mid_turn_still_reaches_the_room(
+@pytest.mark.parametrize(
+    ("sends", "before", "after"),
+    [
+        pytest.param(
+            [("Looking up the booking", {"thread_id": "t"}),
+             ("Paid. Order #119441902", {"thread_id": "t"})],
+            [],
+            [{"body": "Paid. Order #119441902"}],
+            id="no_answer_releases_the_last_held_message",
+        ),
+        pytest.param(
+            [("Paid. Order #119441902", {"notify": True}),
+             ("Note to self: done", {"thread_id": "t"})],
+            [{"body": "Paid. Order #119441902"}],
+            [{"body": "Paid. Order #119441902"}],
+            id="an_answer_already_delivered_suppresses_the_release",
+        ),
+    ],
+)
+async def test_a_quiet_turn_releases_the_last_held_message_only_when_no_answer_landed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    sends: list[tuple[str, dict[str, Any]]],
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
 ) -> None:
     """The refutation in #89: the model writes the real message before its
     last tool call and a note to itself after, so the note is what Hermes
     reads as the turn's final response. Suppressing at the producer deleted
     the message and kept the note. Holding at delivery cannot: if no answer
-    was ever posted, the last held message is the answer, and it goes."""
+    was ever posted, the last held message is the answer, and it goes -- but
+    if a real answer already reached the room, the held note must not
+    double-post it."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3875,15 +3899,15 @@ async def test_a_quiet_turn_that_answered_only_mid_turn_still_reaches_the_room(
     messages_url = f"{module.BASE}/v1/chats/cht_a/messages"
     sent = lambda: [body for url, body in http.posts if url == messages_url]
 
-    await adapter.send("cht_a", "Looking up the booking", metadata={"thread_id": "t"})
-    await adapter.send("cht_a", "Paid. Order #119441902", metadata={"thread_id": "t"})
-    assert sent() == []
+    for body, metadata in sends:
+        await adapter.send("cht_a", body, metadata=metadata)
+    assert sent() == before
 
     await adapter.on_processing_complete(
         SimpleNamespace(source=SimpleNamespace(chat_id="cht_a")), None
     )
 
-    assert sent() == [{"body": "Paid. Order #119441902"}]
+    assert sent() == after
 
 
 async def test_missing_field_means_quiet(
