@@ -1442,6 +1442,9 @@ async def test_trust_selects_the_explicit_prompt_matrix(
     if group:
         expected = _voiced(module, expected)
     assert handled[0]["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
+    # The ordering rule closes every one of these, separated from the sentence
+    # before it -- membership alone would pass on "...truthful.Write your".
+    assert f" {module._ANSWER_LAST}" in handled[0]["channel_prompt"]
 
     if trusted:
         prompt = handled[0]["channel_prompt"].lower()
@@ -3951,36 +3954,6 @@ def test_every_silence_instruction_names_the_sentinel(
     # A solo owner DM never warrants unprompted silence, so its prompt does
     # not reserve the token — send()'s gate keys off exactly this absence.
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
-
-
-def test_every_turn_is_told_to_write_its_answer_last(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Every rendered channel prompt carries the answer-ordering rule -- the
-    solo owner DM included, because the habit is the model's and does not vary
-    by who is listening. Rendered, not per-constant: `_channel_prompt` is the
-    one seam both production paths go through."""
-    module = _load(monkeypatch, tmp_path)
-    identity = {"signup": None, "number": None}
-    def _room(*, group: bool = False, trusted: bool = False) -> dict[str, Any]:
-        # `type` is stamped by the adapter, not by the _chat fixture.
-        return {**_chat("cht_a", group=group, trusted=trusted),
-                "type": "group" if group else "dm"}
-
-    for chat, role in ((_room(), "owner"),
-                       (_room(group=True), "owner"),
-                       (_room(group=True), "member"),
-                       (_room(group=True, trusted=True), "owner"),
-                       (_room(group=True, trusted=True), "member")):
-        rendered = module._channel_prompt(chat, role, _collaboration_chat(), identity)
-        assert module._ANSWER_LAST in rendered
-        # The identity opener still comes first: appended, never prepended.
-        assert not rendered.startswith(module._ANSWER_LAST)
-        # And the join is a real separator. Membership alone cannot see a
-        # missing space -- the rule would arrive glued to the previous
-        # sentence ("...stays truthful.Write your answer LAST").
-        assert f" {module._ANSWER_LAST}" in rendered
 
 
 # --------------------------------------------------------------- thread goals
