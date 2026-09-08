@@ -3275,7 +3275,11 @@ def _plow_send_message(args, **_kwargs):
 
     The adapter's send() is the authority on reach: outside the grant, or a
     cross-chat send during a member's turn, comes back refused and is
-    relayed as-is. Nothing here is a second gate."""
+    relayed as-is. Nothing here is a second gate. Sent notify-marked: this is
+    a deliberate agent action on a tool call, not a turn's mid-turn chatter --
+    it also runs on another thread via run_coroutine_threadsafe, where
+    self._active_turn.get() reads None, so an unmarked send here would be
+    held nowhere and just silently never leave while still reporting success."""
     chat_id = (args.get("chat_id") or "").strip()
     body = (args.get("body") or "").strip()
     if not chat_id or not body:
@@ -3285,7 +3289,9 @@ def _plow_send_message(args, **_kwargs):
                            "error": "the Plow Chat gateway is not connected; nothing was sent"})
     adapter, loop = _live
     try:
-        result = asyncio.run_coroutine_threadsafe(adapter.send(chat_id, body), loop).result(timeout=45)
+        result = asyncio.run_coroutine_threadsafe(
+            adapter.send(chat_id, body, metadata={"notify": True}), loop
+        ).result(timeout=45)
     except Exception as exc:  # noqa: BLE001 - no answer is not a failure to retry
         return _lost_answer(exc)
     if not result.success:

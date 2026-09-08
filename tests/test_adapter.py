@@ -7,6 +7,7 @@ the adapter without adding Hermes itself as a dependency.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -2205,12 +2206,12 @@ def _live_tool(
 
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
 
-    async def stub(*args: Any) -> Any:
+    async def stub(*args: Any, **kwargs: Any) -> Any:
         if record is not None:
             record.append(args)
         if raises is not None:
             raise raises
-        return result(*args) if callable(result) else result
+        return result(*args, **kwargs) if callable(result) else result
 
     setattr(adapter, method, stub)
     loop = asyncio.new_event_loop()
@@ -3791,6 +3792,32 @@ async def test_quiet_delivers_answers_and_cron_but_holds_mid_turn_chatter(
 
     assert result.success
     assert bool(http.posts) is delivered
+
+
+def test_every_internal_send_call_carries_metadata() -> None:
+    """The quiet gate reads intent off `metadata`, not off which internal
+    caller it is: an unmarked internal send() falls back to chatter and gets
+    held -- or, for a call with no active turn to hold it on (a tool call
+    running on another thread, say), silently never leaves while still
+    reporting success. `_plow_send_message` shipped exactly that miss once;
+    this sweeps every `self.send(`/`adapter.send(` call in the module so the
+    next one fails a test instead of dropping a message in production."""
+    source = PLUGIN.read_text()
+    offenders = [
+        f"line {node.lineno}: {ast.get_source_segment(source, node)}"
+        for node in ast.walk(ast.parse(source))
+        if (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "send"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"self", "adapter"}
+            and not any(kw.arg == "metadata" for kw in node.keywords))
+    ]
+    assert offenders == [], (
+        "every internal send() call must pass metadata= (e.g. "
+        "{'notify': True} for an answer, {'job_id': ...} for a cron path) so "
+        "the quiet gate can tell it from mid-turn chatter:\n" + "\n".join(offenders)
+    )
 
 
 @pytest.mark.parametrize(
