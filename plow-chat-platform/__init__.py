@@ -1339,6 +1339,16 @@ class PlowChatAdapter(BasePlatformAdapter):
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
         said = list(turn.get("said") or ()) if turn else []
+        # Quiet held this turn's chatter; if none of it was an answer, the last
+        # thing the model wrote IS the answer -- Hermes reads the model's final
+        # write as final_response, and when that is a note to self the real
+        # message is the one before it. Releasing here is what makes quiet
+        # non-lossy, and is why this gate lives at delivery rather than at the
+        # producer, which could only delete (see #89).
+        held = list(turn.get("held") or ()) if turn else []
+        if held and turn is not None and not turn.get("answered"):
+            async with aiohttp.ClientSession() as http:
+                await self._post_message(http, chat_uid, {"body": held[-1]})
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # This turn's ownership and this turn's tasks: a completion that

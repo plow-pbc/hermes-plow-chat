@@ -3857,6 +3857,35 @@ async def test_diagnostic_sends_follow_the_verbose_output_preference(
     assert len(http.posts) == 1 + 2 * expected_posts
 
 
+async def test_a_quiet_turn_that_answered_only_mid_turn_still_reaches_the_room(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The refutation in #89: the model writes the real message before its
+    last tool call and a note to itself after, so the note is what Hermes
+    reads as the turn's final response. Suppressing at the producer deleted
+    the message and kept the note. Holding at delivery cannot: if no answer
+    was ever posted, the last held message is the answer, and it goes."""
+    module = _load(monkeypatch, tmp_path)
+    http = _PreferenceHTTP({"verbose_output_enabled": False})
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    turn = {"chat_uid": "cht_a", "owner": True, "dm": False, "no_reply_ok": False}
+    adapter._active_turn.set(turn)
+
+    messages_url = f"{module.BASE}/v1/chats/cht_a/messages"
+    sent = lambda: [body for url, body in http.posts if url == messages_url]
+
+    await adapter.send("cht_a", "Looking up the booking", metadata={"thread_id": "t"})
+    await adapter.send("cht_a", "Paid. Order #119441902", metadata={"thread_id": "t"})
+    assert sent() == []
+
+    await adapter.on_processing_complete(
+        SimpleNamespace(source=SimpleNamespace(chat_id="cht_a")), None
+    )
+
+    assert sent() == [{"body": "Paid. Order #119441902"}]
+
+
 async def test_missing_field_means_quiet(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
