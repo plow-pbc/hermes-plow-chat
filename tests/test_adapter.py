@@ -3683,8 +3683,10 @@ class _PreferenceHTTP(_HTTP):
 
 
 def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Reach covers both room shapes the quiet gate distinguishes: `cht_a` is
+    the owner's solo DM, `cht_g` has a second human in it."""
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a")])
+    adapter._set_reach([_chat("cht_a"), _chat("cht_g", group=True)])
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     return adapter
 
@@ -3743,25 +3745,25 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
 
     monkeypatch.setattr(module.asyncio, "sleep", instant)
     typing = asyncio.get_running_loop().create_future()
-    adapter._typing["cht_a"] = typing
+    adapter._typing["cht_g"] = typing
 
-    held = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    held = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
     assert held.success
-    assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
+    assert adapter._typing.get("cht_g") is typing and not typing.cancelled()
 
-    sent = await adapter.send("cht_a", "the answer", metadata={"notify": True})
+    sent = await adapter.send("cht_g", "the answer", metadata={"notify": True})
     assert sent.success and typing.cancelled()
     for _ in range(10):                      # let the re-armed loop run
         await real_sleep(0)
-    adapter._cancel_typing("cht_a")
-    assert (f"{module.BASE}/v1/chats/cht_a/typing", {"action": "start"}) in http.posts
+    adapter._cancel_typing("cht_g")
+    assert (f"{module.BASE}/v1/chats/cht_g/typing", {"action": "start"}) in http.posts
 
-    outside_turn = await adapter.send("cht_a", "cron delivery", metadata={"job_id": "job_1"})
-    assert outside_turn.success and "cht_a" not in adapter._typing
+    outside_turn = await adapter.send("cht_g", "cron delivery", metadata={"job_id": "job_1"})
+    assert outside_turn.success and "cht_g" not in adapter._typing
 
 
 @pytest.mark.parametrize(
-    "metadata,delivered",
+    "metadata,in_group",
     [
         ({"notify": True}, True),            # the turn-final reply
         ({"job_id": "abc123"}, True),        # a cron delivery
@@ -3771,27 +3773,37 @@ async def test_mid_turn_sends_keep_the_typing_indicator_alive(
     ],
     ids=["final", "cron", "interim", "notice", "no-metadata"],
 )
-async def test_quiet_delivers_answers_and_cron_but_holds_mid_turn_chatter(
+async def test_quiet_withholds_the_working_out_only_where_someone_else_is_listening(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     metadata: dict | None,
-    delivered: bool,
+    in_group: bool,
 ) -> None:
-    """Quiet is about the agent's working-out, not about volume. The turn's
-    answer carries Hermes' own `notify` marker and a cron delivery carries the
-    scheduler's `job_id`; both are what the owner asked for. Everything else
-    sent while a turn is open is the model thinking out loud."""
+    """Quiet is about the agent's working-out, not about volume: the turn's
+    answer carries Hermes' `notify` marker and a cron delivery carries the
+    scheduler's `job_id`, and both are what was asked for.
+
+    The room decides whether the rest is withheld. The seam cannot tell an
+    answer written mid-turn from the commentary around it, so withholding can
+    cost the answer -- paid only where a third party would otherwise read the
+    commentary. In the owner's own 1:1 nothing is withheld, so the same send
+    that is dropped in a group is delivered there."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)
     adapter._active_turn.set(
-        {"chat_uid": "cht_a", "owner": True, "dm": False, "no_reply_ok": False}
+        {"chat_uid": "cht_g", "owner": True, "dm": False, "no_reply_ok": False}
     )
 
-    result = await adapter.send("cht_a", "the body", metadata=metadata)
+    group = await adapter.send("cht_g", "the body", metadata=metadata)
+    assert group.success and bool(http.posts) is in_group
 
-    assert result.success
-    assert bool(http.posts) is delivered
+    http.posts.clear()
+    adapter._active_turn.set(
+        {"chat_uid": "cht_a", "owner": True, "dm": True, "no_reply_ok": False}
+    )
+    dm = await adapter.send("cht_a", "the body", metadata=metadata)
+    assert dm.success and http.posts, "the owner's own 1:1 withholds nothing"
 
 
 def test_every_internal_send_call_carries_metadata() -> None:
@@ -3830,7 +3842,7 @@ async def test_missing_field_means_quiet(
     http = _PreferenceHTTP({"some_other_preference": True})
     adapter = _verbose_adapter(module, http, monkeypatch)
 
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
+    review = await adapter.send("cht_g", "💾 Self-improvement review: memory updated")
     status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
     assert review.success and status.success and http.posts == []
 

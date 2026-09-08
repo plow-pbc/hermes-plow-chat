@@ -109,33 +109,41 @@ URL in git.
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
-Mid-turn chatter — interim prose, agent status frames, 💾 background-review
-posts, ⚠️ turn-stop warnings — is dropped unless the credential's
+Diagnostics — agent status frames, 💾 background-review posts, ⚠️ turn-stop
+warnings — are dropped in every room unless the credential's
 `verbose_output_enabled` preference (the dashboard's "Verbose agent output"
-toggle) is true; the typing indicator already shows the turn is running. What
-counts as chatter is a metadata test, not a prefix one: Hermes marks the
-turn-final reply `notify` and a cron delivery `job_id`, and anything carrying
-neither, sent while a turn is open, is the model working out loud.
+toggle) is true; the typing indicator already shows the turn is running.
+
+The model's own **mid-turn prose** is gated by the same preference, but only
+where someone else is listening. What counts as mid-turn is a metadata test,
+not a prefix one: Hermes marks the turn-final reply `notify` and a cron
+delivery `job_id`, and anything carrying neither, sent while a turn is open, is
+the model working out loud.
 
 **The answer goes last, and that is still a prompt rule, because the delivery
-seam can suppress chatter but cannot recognise an answer.** Hermes reads
-whatever the model wrote *last* as the turn's final response. The model's habit
-is to write its real message, call one more tool — recording an outcome, per
-the variant personas — and then write itself a note, so the note is what gets
-marked, and the real message is indistinguishable from chatter.
+seam can withhold prose but cannot recognise an answer.** Hermes reads whatever
+the model wrote *last* as the turn's final response. The model's habit is to
+write its real message, call one more tool — recording an outcome, per the
+variant personas — and then write itself a note, so the note is what gets
+marked and the real message is indistinguishable from the commentary.
 
-Quiet therefore delivers whichever message Hermes marked. When that is the
-note, the answer is suppressed with the rest of the chatter — the same outcome
-`plow-hermes-agent`'s seed config records from the first attempt, measured
-live: a whole onboarding introduction disappeared and the owner's turn became
-*"Already saved that. Now I'll wait for her next reply."* Buffering the
-withheld bodies and flushing the last one at turn end does not rescue it and
-was removed: the seam cannot tell an answer from a note either way, so a flush
-publishes whatever the model happened to write last — in a shared room, the
-running commentary the gate exists to keep out of it. The ordering is the
-model's to get right, and `_ANSWER_LAST` closes every channel prompt asking
-for it — appended once in `_channel_prompt`, the one seam both production
-paths go through, after the identity opener each prompt has to start with.
+That is why withholding is confined to rooms with a third party in them. There,
+a withheld answer costs a re-ask, while a delivered one can cost a cart, a
+shipping address and a card read by somebody who should not have them — the
+disclosure this gate exists to stop. In the owner's own 1:1 there is no such
+reader, so nothing is withheld and the answer cannot go missing.
+
+Buffering the withheld bodies and flushing the last one at turn end does not
+rescue the shared-room case and was removed: picking "the last one" is the same
+guess the seam cannot make, so a flush publishes whatever the model happened to
+write last — the running commentary, into the room the gate was protecting.
+`plow-hermes-agent`'s seed config records the same conclusion from an earlier
+attempt, measured live: a whole onboarding introduction disappeared and the
+owner's turn became *"Already saved that. Now I'll wait for her next reply."*
+The ordering is the model's to get right, and `_ANSWER_LAST` closes every
+channel prompt asking for it — appended once in `_channel_prompt`, the one seam
+both production paths go through, after the identity opener each prompt has to
+start with.
 
 One exception rides with it: a tool that *posts* to the chat is itself the
 answer. A successful `plow_send_sequence` has already delivered the turn's

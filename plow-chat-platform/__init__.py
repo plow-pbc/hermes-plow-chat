@@ -750,11 +750,12 @@ REPLY_TARGET_PROMPT = (
     "plow_send_message tool and will be refused on an external turn."
 )
 # Hermes reads the model's LAST message as the turn's final response, and that
-# is the one the delivery gate can recognise. The gate withholds the rest when
-# the owner asked for quiet, but it cannot tell an answer written mid-turn from
-# the working-out around it -- suppressing on that guess lost the intended
-# answer in live trials, twice; see README and plow-pbc/hermes-plow-chat#89.
-# So the ordering is asked for here; the seam only enforces the volume.
+# is the one message the delivery gate can recognise. Quiet withholds the rest
+# in rooms with a third party in them, but the gate cannot tell an answer
+# written mid-turn from the working-out around it -- withholding on that guess
+# lost the intended answer in live trials, twice; see README and
+# plow-pbc/hermes-plow-chat#89. So the ordering is asked for here rather than
+# inferred there, and it is what keeps the answer out of the withheld set.
 _ANSWER_LAST = (
     "Write your answer LAST. Whatever you write last is what this turn is "
     "read as, and it is the one message certain to reach this chat -- anything "
@@ -1788,19 +1789,30 @@ class PlowChatAdapter(BasePlatformAdapter):
         # `notify`-marked and the predicate above correctly calls it an answer.
         # It is still a diagnostic, so the preference still decides it.
         explainer = body.startswith(_NO_REPLY_PREFIX)
+        # Withheld only where withholding is worth its own risk. The seam
+        # cannot tell the model's answer from its working-out, so suppressing
+        # chatter can suppress the answer with it -- a real cost, paid only in
+        # the rooms that earn it. A room with somebody else in it earns it:
+        # that is where an errand published a cart, a shipping address and a
+        # card, and where a lost answer costs a re-ask rather than a
+        # disclosure. The owner's own 1:1 has no third party, so nothing is
+        # withheld there and the answer cannot go missing.
+        #
+        # Dropped, not buffered: a turn-end flush of the last withheld body was
+        # tried and removed, because picking "the last one" is the same guess
+        # the seam cannot make -- see the README's delivery-contract section,
+        # which records the same conclusion from two earlier attempts.
+        #
+        # The explainer is gated everywhere: it is Hermes reporting that there
+        # was no answer, a diagnostic rather than the model's own words, and
+        # the preference has always decided those in every room.
+        withhold = explainer or (chatter and not _owner_dm(self._chats.get(chat_id, {})))
         async with aiohttp.ClientSession() as http:
-            if (chatter or explainer) and not await self._verbose_enabled(http):
-                # Dropped, not buffered for later release. A turn-end flush of
-                # the last withheld body was tried and removed: the seam cannot
-                # tell an answer from a note, so flushing publishes whatever the
-                # model happened to write last -- in a shared room, that is the
-                # running commentary this gate exists to keep out of it. The
-                # README's delivery-contract section records the same conclusion
-                # from two earlier attempts. Dropped before typing is touched:
-                # a message the owner never sees must not eat the "working"
-                # signal either.
+            if withhold and not await self._verbose_enabled(http):
+                # Before typing is touched: a message the owner never sees must
+                # not eat the "working" signal either.
                 log.info("[plow_chat] dropped %s for %s",
-                         "mid-turn chatter" if chatter else "turn-stop explainer", chat_id)
+                         "turn-stop explainer" if explainer else "mid-turn chatter", chat_id)
                 return SendResult(success=True)
             result = await self._post_message(http, chat_id, {"body": body})
         if result.success:
