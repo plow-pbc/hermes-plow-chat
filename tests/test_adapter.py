@@ -3910,6 +3910,49 @@ async def test_a_quiet_turn_releases_the_last_held_message_only_when_no_answer_l
     assert sent() == after
 
 
+class _ReleaseFailureHTTP(_PreferenceHTTP):
+    """Fails only the release's own message POST -- the typing-stop POST and
+    the preference read a few lines up in on_processing_complete must still
+    go through untouched."""
+
+    def __init__(self, preferences: Any, *, raise_exc: bool = False) -> None:
+        super().__init__(preferences)
+        self._raise_exc = raise_exc
+
+    def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
+        if url.endswith("/messages"):
+            if self._raise_exc:
+                raise RuntimeError("network exploded")
+            return _Resp({"error": "rejected"}, 500)
+        return super().post(url, json=json, headers=headers)
+
+
+@pytest.mark.parametrize("raise_exc", [False, True], ids=["http_error", "network_exception"])
+async def test_a_failed_release_still_completes_the_turns_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    raise_exc: bool,
+) -> None:
+    """The release POST runs earliest in on_processing_complete: an HTTP
+    error response or a raised network exception there must not skip
+    _cancel_typing, _active_turn.set(None), and the rest of the turn's
+    cleanup -- the same failure the typing-stop and goal-check calls a few
+    lines later already guard against."""
+    module = _load(monkeypatch, tmp_path)
+    http = _ReleaseFailureHTTP({"verbose_output_enabled": False}, raise_exc=raise_exc)
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    turn = {"chat_uid": "cht_a", "owner": True, "dm": False, "no_reply_ok": False}
+    adapter._active_turn.set(turn)
+
+    await adapter.send("cht_a", "Note to self", metadata={"thread_id": "t"})
+
+    await adapter.on_processing_complete(
+        SimpleNamespace(source=SimpleNamespace(chat_id="cht_a")), None
+    )
+
+    assert adapter._active_turn.get() is None
+
+
 async def test_missing_field_means_quiet(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,

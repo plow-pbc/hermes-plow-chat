@@ -1354,6 +1354,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                 if result.success:
                     log.info("[plow_chat] released held chatter as the answer for %s", chat_uid)
                     self._goal_note_reply(chat_uid, held[-1])
+                else:
+                    log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, result.error)
             except Exception as exc:            # noqa: BLE001 - the release runs earliest in this method and must not gate everything after it
                 log.warning("[plow_chat] failed to release held chatter for %s: %s", chat_uid, exc)
         said = list(turn.get("said") or ()) if turn else []
