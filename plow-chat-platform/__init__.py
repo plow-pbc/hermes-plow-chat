@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import stat
+import time
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,11 @@ from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
+# How long one /v1/agents/me settings read serves the gates below. The owner
+# toggles a setting rarely and every gated send would otherwise pay for a
+# round trip; a minute bounds how long a flipped toggle stays unobserved
+# without making the read per-turn.
+SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
 # Hermes' own diagnostics reach the adapter through plain send() carrying no
 # metadata that tells them apart from the model's prose, so they are still
@@ -1007,6 +1013,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         }
         self._ws_task = None
         self._anchor_lock = asyncio.Lock()
+        self._settings = None                # (deadline, settings) from /v1/agents/me, see _agent_settings
+        self._settings_warned = False        # one log per outage, not one per gated send
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
         self._inbound = {}                   # chat uid -> (queue, the task serving it)
@@ -1840,19 +1848,52 @@ class PlowChatAdapter(BasePlatformAdapter):
                 await asyncio.to_thread(_mirror_sent, chat_id, body)
         return result
 
+    async def _agent_settings(self, http):
+        """This agent's owner-facing settings object, on a short-TTL cache.
+
+        `GET /v1/agents/me` -- not the `/v1/agents/cloud/me` alias, which
+        serves the old shape and carries no `agent` key at all. Each entry is
+        a property schema plus its `value`, so a reader wants
+        `settings[key]["value"]`, never `settings[key]`.
+
+        Unreadable is not a state a gate can act on, so it is not one this
+        returns: an outage, a 404 from a token that is not one agent, or a
+        response missing the key all yield {} and the caller reads its own
+        default from that. The empty answer is cached like any other so a
+        sustained outage costs one request per TTL rather than one per send,
+        and it is logged once per outage instead of once per gated send.
+        """
+        now = time.monotonic()
+        if self._settings is not None and now < self._settings[0]:
+            return self._settings[1]
+        settings = {}
+        try:
+            async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
+                if resp.status == 200:
+                    me = await resp.json(content_type=None)
+                    settings = (me.get("agent") or {}).get("settings") or {}
+                elif resp.status != 404:
+                    raise RuntimeError(f"the settings read returned HTTP {resp.status}")
+            self._settings_warned = False
+        except Exception as exc:             # noqa: BLE001 - a gate must not raise
+            # Including a 401: this read gates cosmetic output, and the
+            # credential seam belongs to the socket, which is already
+            # presenting the same token and owns the stop.
+            if not self._settings_warned:
+                log.warning("[plow_chat] settings read failed: %s", type(exc).__name__)
+                self._settings_warned = True
+        self._settings = (now + SETTINGS_TTL_SECONDS, settings)
+        return settings
+
     async def _verbose_enabled(self, http):
         """Whether this assistant's owner asked for diagnostic output in chat.
 
-        One preference gates all of it -- status frames, background-review
-        posts, turn-stop warnings. Anything but an explicit true reads as
-        quiet, which is also what an API that predates the field serves.
+        One setting gates all of it -- status frames, background-review posts,
+        turn-stop warnings. Anything but an explicit true reads as quiet,
+        which is also what an unreadable or field-less API serves.
         """
-        async with http.get(
-            f"{BASE}/v1/api-keys/current/preferences", headers=self.auth
-        ) as resp:
-            _auth_raise_for_status(resp)
-            prefs = await resp.json(content_type=None)
-        return prefs.get("verbose_output_enabled") is True
+        settings = await self._agent_settings(http)
+        return (settings.get("verbose_output") or {}).get("value") is True
 
     async def _invite_api(self, method, path, *, body=None):
         async with aiohttp.ClientSession() as http:
@@ -1980,9 +2021,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         thread as real iMessages (#30). Dropped by default -- the typing
         indicator already runs for the whole turn, so "working" is covered --
         and reported as success so the gateway treats the frame as handled.
-        The verbose_output_enabled credential preference (the dashboard's
-        "Verbose agent output" toggle) opts an assistant into receiving them
-        as messages.
+        The verbose_output setting (the dashboard's "Verbose agent output"
+        toggle) opts an assistant into receiving them as messages.
         """
         async with aiohttp.ClientSession() as http:
             if await self._verbose_enabled(http):

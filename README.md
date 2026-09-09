@@ -111,14 +111,14 @@ URL in git.
 
 Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running
 heartbeats, ⚠️ turn-stop warnings — are dropped in **every** room unless the
-credential's `verbose_output_enabled` preference (the dashboard's "Verbose
-agent output" toggle) is true; the typing indicator already shows the turn is
+agent's `verbose_output` setting (the dashboard's "Verbose agent output"
+toggle, read from `GET /v1/agents/me` on a short-TTL cache) is true; the typing indicator already shows the turn is
 running. Hermes gives them no metadata of their own, so they are recognised by
 the text they open with, and the room rule below deliberately does not reach
 them: they are the runtime describing itself, never the turn's answer, so
 withholding one can never withhold the message the owner wanted.
 
-The model's own **mid-turn prose** is gated by the same preference, but only
+The model's own **mid-turn prose** is gated by the same setting, but only
 where someone else is listening. What counts as mid-turn is a metadata test,
 not a prefix one: Hermes marks the turn-final reply `notify` and a cron
 delivery `job_id`, and anything carrying neither, sent while a turn is open, is
