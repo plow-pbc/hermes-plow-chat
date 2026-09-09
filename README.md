@@ -152,7 +152,10 @@ start with.
 One exception rides with it: a tool that *posts* to the chat is itself the
 answer. A successful `plow_send_sequence` has already delivered the turn's
 reply, so the guard drops the prose that follows — the rule says so, or a
-model that finished its tools first would have its answer suppressed.
+model that finished its tools first would have its answer suppressed. That
+drop is lifted again by a later message or goal wake for the same chat: once
+one arrives the lifecycle is ambiguous, and a duplicated line of intro prose
+is the price of never losing the reply the wake was queued for.
 
 `plugin.yaml` is the authority on this list; the table is a reader's summary.
 
@@ -453,6 +456,9 @@ Successful tool delivery already sent the copy: the adapter suppresses subsequen
 text replies to that chat for the rest of the active turn, logging the chat and
 the suppressed length but never the body. Suppression tracks the turn's latest
 sequence, so a failed, rejected, or delivery-unknown sequence — including one
-that follows a successful sequence in the same turn — reopens the reply path. Suppression runs in the one guard every outbound message passes, so it covers
+that follows a successful sequence in the same turn — reopens the reply path.
+A message or goal wake handed off for the same chat reopens it too, and keeps
+it open: no later sequence in that lifecycle can re-arm suppression, because
+Hermes may answer the queued event from the turn the sequence belongs to. Suppression runs in the one guard every outbound message passes, so it covers
 text, `MEDIA:` delivery and verbose status frames alike. Other chats and later turns retain their ordinary
 behavior. The tool does not interpret in-band markers.
