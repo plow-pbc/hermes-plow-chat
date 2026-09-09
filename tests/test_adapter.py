@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -3058,6 +3059,42 @@ def test_owner_send_escalates_to_the_human_gate(
     assert out["action"] == "approve"
     assert "andrew@example.com" in out["message"]
     assert out["rule_key"].startswith("google-send:")
+
+
+@pytest.mark.parametrize("flags", [
+    ["--account", "so@plow.co"], ["-a", "so@plow.co"],
+    ["--account=so@plow.co"], ["-a=so@plow.co"], ["-aso@plow.co"],
+    ["--confirm-conflict"],
+    ["--confirm-conflict", "-a", "so@plow.co"],
+])
+@pytest.mark.parametrize("draft", [False, True], ids=["send", "draft-send"])
+@pytest.mark.parametrize("owner", [True, False], ids=["owner-dm", "member"])
+def test_leading_global_flags_reach_mail_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    flags: list[str], draft: bool, owner: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": owner, "dm": owner})
+    command = ["gmail", "drafts", "send", "r-123"] if draft else _SEND_ARGV[1:-2]
+    argv = ["plow-gog", *flags, *command]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out is not None
+    assert out["action"] == ("approve" if owner and not draft else "block")
+    if draft:
+        assert "gmail send" in out["message"]
+    elif owner:
+        assert all(value in out["message"] for value in (
+            "andrew@example.com", "Catching up", "Menlo Park or a video call?",
+        ))
+        digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
+        assert out["rule_key"] == f"google-send:{digest}"
+        plain = module._pre_tool_call(
+            "mcp__latch__plow_run_command", {"argv": ["plow-gog", *command]},
+        )
+        assert out["rule_key"] != plain["rule_key"]
+    else:
+        assert "nothing was sent" in out["message"]
+    assert argv == ["plow-gog", *flags, *command]
 
 
 def test_rule_key_is_per_message_so_always_never_generalises(

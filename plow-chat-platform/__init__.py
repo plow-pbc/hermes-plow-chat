@@ -3029,8 +3029,8 @@ def _argv_flag(argv, name):
 
 def _google_send_summary(argv):
     """What `argv` would mail out, as the owner reads it in the approval
-    prompt — or None when it sends no mail. latch requires the command path
-    first (`plow-gog gmail send …`), so group and verb are positional.
+    prompt — or None when it sends no mail. `argv` has latch-owned global
+    flags removed, so group and verb are positional.
     Calendar is not here: booking over a conflict is the agent's judgment to
     make (it can be undone by deleting the event), and the hook cannot read
     the chat the owner already fixed the time in."""
@@ -3085,11 +3085,25 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     # no -- terminator anywhere; it mints no token and reaches nothing.
     if argv and argv[-1] in ("--help", "-h") and "--" not in argv:
         return None
-    if _is_draft_send(argv):
+    # Mirror latch's accountAt/planPlowGog stripping for classification only.
+    # Keep the original argv for the approval key and execution.
+    classified = argv[:1]
+    confirm_conflict = False
+    tokens = iter(argv[1:])
+    for arg in tokens:
+        if arg in ("--account", "-a"):
+            next(tokens, None)
+        elif arg.startswith(("--account=", "-a")):
+            continue
+        elif arg == "--confirm-conflict":
+            confirm_conflict = True
+        else:
+            classified.append(arg)
+    if _is_draft_send(classified):
         return {"action": "block",
                 "message": "a draft sent by id shows the owner nothing; send it as one "
                            "gmail send command with recipients, subject and body"}
-    summary = _google_send_summary(argv)
+    summary = _google_send_summary(classified)
     # The marker, not the command shape. gog takes --account (and every other
     # global flag) before the group as well as after, so a classifier that
     # expects `calendar` at argv[1] answers no to a real override and waves it
@@ -3097,7 +3111,7 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     # to decide; over-matching here costs an override outside the owner's DM
     # the room check it should have had anyway.
     override = (summary is None and bool(argv) and argv[0] in _GOOGLE_CLIS
-                and "--confirm-conflict" in argv)
+                and confirm_conflict)
     if summary is None and not override:
         return None
     turn = _ACTIVE_TURN.get() or {}
