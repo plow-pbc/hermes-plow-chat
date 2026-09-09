@@ -2345,6 +2345,12 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
     `failed`, so a `pending` chat arrives in the same payload -- and sending to
     one is a `409 chat_not_ready`, so listing its id would be handing the model
     a choice that fails.
+
+    And the read is authoritative: it lands in `_set_reach`, so a room joined
+    since the last reconnect is not merely listed but reachable. Reach here
+    starts stale -- the home alone, as it would be for an agent whose group was
+    adopted mid-connection -- and the send guard refuses the group before the
+    listing and accepts it after.
     """
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -2362,11 +2368,16 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
                  peer_room, unnamed],
     }))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    adapter._set_reach([_chat("cht_a")])
+    assert adapter._send_guard("cht_g") is not None, "stale reach refuses the new room"
 
     chats = await adapter.list_chats()
 
     assert [call[:2] for call in http.calls] == [("get", f"{module.BASE}/v1/chats")], \
         "the grant read, not a new API"
+    # One reach state, and this read advanced it: an id the tool hands the
+    # model is one the send path already accepts.
+    assert adapter._send_guard("cht_g") is None, "the listed room is now within the grant"
     assert chats == [
         {"chat_id": "cht_a", "kind": "dm", "trusted": False,
          "participants": [{"name": "+15550000001", "handle": "+15550000001"}]},

@@ -2345,10 +2345,28 @@ class PlowChatAdapter(BasePlatformAdapter):
         so it serves `pending` rooms too; the send path requires `active` and
         answers a pending one with `409 chat_not_ready`. Listing an id that
         cannot be sent to would be offering the model a choice that fails.
+
+        The read is authoritative, not a peek: it ends in `_set_reach`, the
+        same seam a reconnect uses, off the same route. Reach is otherwise
+        refreshed at connect, reconnect and adoption only, so a room joined
+        mid-connection was listed here and then refused by `_send_guard` as
+        outside the grant -- one endpoint answering two different questions
+        about the same thing. There is one reach state and this updates it, so
+        an id this tool hands the model is one the send path already accepts.
+
+        Reach is advanced AFTER the summaries are built: `_chat_summary`
+        indexes the fields the producer requires, so a malformed body raises
+        while the old reach still stands rather than half-adopting a listing
+        that could not be read.
         """
         body = await self._get_tool_json("/v1/chats", "{}")
-        return [_chat_summary(chat) for chat in body["data"]
-                if chat["status"] == "active"]
+        listed = [_chat_summary(chat) for chat in body["data"]
+                  if chat["status"] == "active"]
+        # The whole payload, exactly as `_refresh_reach` passes it: reach has
+        # never been status-filtered, and narrowing it here would quietly
+        # unsubscribe the pending rooms this tool merely declines to advertise.
+        self._set_reach(body["data"])
+        return listed
 
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
