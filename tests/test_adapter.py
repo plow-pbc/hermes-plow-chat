@@ -3889,22 +3889,6 @@ async def test_a_send_outside_the_turns_own_chat_is_never_withheld(
 
     assert result.success and http.posts, "a send outside the turn's own chat always lands"
 
-async def test_missing_field_means_quiet(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """An agent whose settings object carries no verbose_output entry must
-    read as quiet, not raise -- it is the deploy-window state while plow rolls
-    out, and the same answer an unmigrated row would give."""
-    module = _load(monkeypatch, tmp_path)
-    http = _SettingsHTTP({"agent": {"settings": {"daily_payment_cap_usd": {"type": ["number", "null"], "value": 200}}}})
-    adapter = _verbose_adapter(module, http, monkeypatch)
-
-    review = await adapter.send("cht_a", "💾 Self-improvement review: memory updated")
-    status = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
-    assert review.success and status.success and http.posts == []
-
-
 async def test_a_settings_outage_is_quiet_and_never_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -3949,8 +3933,10 @@ async def test_a_404_from_a_multi_line_token_is_quiet(
     [{"agent": {"settings": ["bad"]}},
      {"agent": {"settings": {"verbose_output": True}}},
      {"agent": "agt_1"},
-     ["not an object at all"]],
-    ids=["settings-is-a-list", "entry-is-a-bare-bool", "agent-is-a-string", "body-is-a-list"])
+     ["not an object at all"],
+     {"agent": {"settings": {"daily_payment_cap_usd": {"type": ["number", "null"], "value": 200}}}}],
+    ids=["settings-is-a-list", "entry-is-a-bare-bool", "agent-is-a-string", "body-is-a-list",
+         "missing-entry"])
 async def test_a_malformed_settings_body_is_quiet_not_an_exception(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
@@ -3962,7 +3948,10 @@ async def test_a_malformed_settings_body_is_quiet_not_an_exception(
     send for the whole TTL -- a worse outage than the one it came from. Every
     shape that is not an entry object carrying `value: true` reads as quiet.
     The bare-bool case is the plausible one: it is what a client that stored
-    the value without its property schema would leave behind."""
+    the value without its property schema would leave behind, and the
+    missing-entry row is the deploy-window state -- a well-formed settings
+    object that simply has no verbose_output yet, which an unmigrated row
+    gives too."""
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(body)
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3973,6 +3962,55 @@ async def test_a_malformed_settings_body_is_quiet_not_an_exception(
     assert first.success and second.success
     assert http.posts == [], "an uninterpretable setting withholds"
     assert len(http.gets) == 1, "a quiet answer, however it was reached, is cached"
+
+
+async def test_a_quiet_answer_landing_mid_read_beats_an_older_true(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two gated sends can be on the wire at once, and both can pass the
+    cache check before either answer lands. If the owner switches verbose off
+    between them, the newer read returns false and establishes quiet -- and
+    the older read's true, returned without looking again, would post into a
+    shared room after the owner had already stopped it. That is the exact
+    disclosure the never-cache-a-true rule exists to prevent, arrived at from
+    the other direction, so quiet wins the race: an affirmative answer is
+    only delivered if no quiet answer landed while it was out."""
+    module = _load(monkeypatch, tmp_path)
+    verbose_read_started = asyncio.get_running_loop().create_future()
+
+    class _RacingHTTP(_HTTP):
+        """The first read is the slow, affirmative one; the owner switches
+        verbose off while it is in flight, and the second read overtakes it."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.answers = [True, False]
+
+        def get(self, url: str, *, headers: dict[str, str]) -> Any:
+            answer = self.answers.pop(0)
+            resp = _Resp(_me(verbose=answer))
+            if answer:
+                original = resp.json
+
+                async def slow(content_type: Any = None) -> Any:
+                    if not verbose_read_started.done():
+                        verbose_read_started.set_result(None)
+                    await asyncio.sleep(0)          # the quiet read overtakes here
+                    return await original(content_type)
+
+                resp.json = slow                    # type: ignore[method-assign]
+            return resp
+
+    http = _RacingHTTP()
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    stale = asyncio.create_task(adapter.send("cht_g", "⚠️ No reply: empty content"))
+    await verbose_read_started
+    fresh = await adapter.send("cht_g", "⚠️ No reply: empty content")
+
+    assert (await stale).success and fresh.success
+    assert http.posts == [], "the owner's newer quiet answer governs both sends"
 
 
 async def test_only_a_quiet_answer_is_cached(

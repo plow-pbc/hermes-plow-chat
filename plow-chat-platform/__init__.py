@@ -1894,8 +1894,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         for key in ("agent", "settings", "verbose_output", "value"):
             found = found.get(key) if isinstance(found, dict) else None
         if found is True:
-            return True
-        self._quiet_until = now + SETTINGS_TTL_SECONDS
+            # Quiet wins a race. Two gated sends can be on the wire at once,
+            # and both can pass the check above; if a quiet answer landed
+            # while this read was still out, it is the newer answer, and
+            # returning this true would deliver into a shared room after the
+            # owner had already switched verbose off -- the one failure the
+            # whole no-caching-a-true rule exists to prevent. A deadline in
+            # the future can only have been set since, because the entry
+            # check passed.
+            return time.monotonic() >= self._quiet_until
+        # Timestamped on completion, not from `now`: the read is the slow
+        # part, and dating the deadline from before it would retire a quiet
+        # answer early by however long it took.
+        self._quiet_until = time.monotonic() + SETTINGS_TTL_SECONDS
         return False
 
     async def _invite_api(self, method, path, *, body=None):
