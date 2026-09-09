@@ -1641,6 +1641,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
+        await self._handoff_message(event)
+
+    async def _handoff_message(self, event):
+        # Hermes can recurse into a queued message or wake before the old
+        # processing lifecycle ends. The shared registry reaches the model's
+        # turn even when this handoff runs in a separate socket task.
+        # Once ambiguous, leave suppression disabled for the whole lifecycle:
+        # a sequence may start either before or after the handoff. Allowing
+        # duplicate intro prose is preferable to losing the queued reply.
+        for turn in self._sequence_turns.values():
+            if turn["chat_uid"] == event.source.chat_id:
+                turn["inbound_handed_off"] = True
+                turn["sequence_completed"] = False
         await self.handle_message(event)
 
     async def _goal_after_turn(self, chat_uid, event, said):
@@ -2082,7 +2095,6 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     async def send_sequence(self, args, turn, receipt=None):
         receipt = receipt if receipt is not None else _sequence_receipt()
-        inbound_generation = turn.get("inbound_generation", 0)
         task = asyncio.current_task()
         self._sequences[task] = turn
         position, progress = 0, {"posting": False, "message_ids": []}
@@ -2131,10 +2143,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # succeeded": a failed, rejected or delivery-unknown run has to reopen
         # the ordinary reply path so the model's recovery text still reaches
         # the owner after a partial delivery.
-        # An inbound queued during delivery belongs to a later model turn,
+        # An event queued before or during delivery belongs to a later model turn,
         # even if Hermes keeps using this processing lifecycle for its reply.
         turn["sequence_completed"] = (receipt["success"]
-                                      and turn.get("inbound_generation", 0) == inbound_generation)
+                                      and not turn.get("inbound_handed_off"))
         if not receipt["success"]:
             receipt["instruction"] = "Do not replay the sequence; inspect chat history before sending remaining items."
         return receipt
@@ -2735,16 +2747,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # wrapper in front of it and would spend most of the term budget
         # describing the goal instead of searching for what was said.
         event.recall_text = spoken
-        # Hermes may process this inbound recursively before calling the old
-        # turn's completion hook. Invalidate its suppression from the shared
-        # turn registry: the socket task does not own the model's ContextVar.
-        # Advancing the generation also prevents an in-flight sequence from
-        # restoring the stale flag when it finishes after this handoff.
-        for turn in self._sequence_turns.values():
-            if turn["chat_uid"] == chat_uid:
-                turn["inbound_generation"] = turn.get("inbound_generation", 0) + 1
-                turn["sequence_completed"] = False
-        await self.handle_message(event)
+        await self._handoff_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.

@@ -5491,16 +5491,17 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('inbound_during_sequence', 'final_reaches_guard'), [
-    (False, False), (False, True), (True, False),
-])
+@pytest.mark.parametrize('handoff', ['message', 'goal'])
+@pytest.mark.parametrize('timing', ['before', 'during', 'after_no_reply', 'after_final'])
 async def test_queued_inbound_reply_before_processing_complete(
-    monkeypatch, tmp_path, inbound_during_sequence, final_reaches_guard,
+    monkeypatch, tmp_path, handoff, timing,
 ):
     """Hermes can recurse into a queued model turn inside one adapter lifecycle."""
     module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
     _mark_anchored(adapter, 'cht_a')
     handed_off = []
+    other_turn = dict(chat_uid='cht_b', sequence_completed=True)
+    adapter._sequence_turns[id(other_turn)] = other_turn
 
     async def queue_in_hermes(event):
         handed_off.append(event)
@@ -5511,30 +5512,36 @@ async def test_queued_inbound_reply_before_processing_complete(
         # The socket task has its own ContextVar context, but must invalidate
         # the suppression held by the still-running model task.
         adapter._active_turn.set(None)
-        await adapter._deliver(
-            [SimpleNamespace(uid='msg_city', starts_slash_command=False,
-                             sender=dict(type='member', role='owner', uid='owner'))],
-            [([], [], 'Sacramento')], 'cht_a',
-        )
+        if handoff == 'goal':
+            await adapter._goal_fire('cht_a', dict(generation='queued', text='Learn the city'))
+        else:
+            await adapter._deliver(
+                [SimpleNamespace(uid='msg_city', starts_slash_command=False,
+                                 sender=dict(type='member', role='owner', uid='owner'))],
+                [([], [], 'Sacramento')], 'cht_a',
+            )
 
     original_post = adapter._sequence_post
 
     async def post_with_queued_inbound(*args):
         result = await original_post(*args)
-        if inbound_during_sequence:
+        if timing == 'during':
             await asyncio.create_task(inbound())
         return result
 
+    if timing == 'before':
+        await asyncio.create_task(inbound())
     monkeypatch.setattr(adapter, '_sequence_post', post_with_queued_inbound)
     assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
-    if not inbound_during_sequence:
-        if final_reaches_guard:
+    if timing.startswith('after'):
+        if timing == 'after_final':
             assert (await adapter.send('cht_a', 'Intro delivered. NO_REPLY')).success
             assert http.posts == 1
         # Otherwise Hermes consumed exact NO_REPLY without calling send().
         await asyncio.create_task(inbound())
 
     assert len(handed_off) == 1
+    assert other_turn['sequence_completed'], 'handoff must not invalidate another chat'
     assert adapter._active_turn.get() is turn
     assert adapter._sequence_turns[id(turn)] is turn
     reply = 'Sacramento, Pacific time, got it. Sports?'
@@ -5542,11 +5549,43 @@ async def test_queued_inbound_reply_before_processing_complete(
     assert http.posts == 2, 'queued model reply must post before on_processing_complete'
     assert http.calls[-1][2]['json'] == {'body': reply}
 
-    # A sequence in the recursive turn can still suppress its own final prose.
+    # Once a handoff makes the lifecycle ambiguous, even another sequence
+    # cannot re-arm suppression. This deliberately permits duplicate prose
+    # from the intro rather than silently losing a later model turn's reply.
     monkeypatch.setattr(adapter, '_sequence_post', original_post)
     assert (await adapter.send_sequence({'items': [dict(type='text', body='Next question')]}, turn))['success']
-    assert (await adapter.send('cht_a', 'Question delivered. NO_REPLY')).success
-    assert http.posts == 3
+    tail = 'Question delivered. NO_REPLY'
+    assert (await adapter.send('cht_a', tail, metadata={'notify': True})).success
+    assert http.posts == 4
+    assert http.calls[-1][2]['json'] == {'body': tail}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handoff', ['message', 'goal'])
+async def test_inbound_during_sequence_allows_the_intro_tail(monkeypatch, tmp_path, handoff):
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(adapter, 'handle_message', mock.AsyncMock())
+    _mark_anchored(adapter, 'cht_a')
+    original_post = adapter._sequence_post
+
+    async def post_with_handoff(*args):
+        result = await original_post(*args)
+        if handoff == 'goal':
+            await adapter._goal_fire('cht_a', dict(generation='queued', text='Learn the city'))
+        else:
+            await adapter._deliver(
+                [SimpleNamespace(uid='msg_city', starts_slash_command=False,
+                                 sender=dict(type='member', role='owner', uid='owner'))],
+                [([], [], 'Sacramento')], 'cht_a',
+            )
+        return result
+
+    monkeypatch.setattr(adapter, '_sequence_post', post_with_handoff)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
+    tail = 'Intro delivered. NO_REPLY'
+    assert (await adapter.send('cht_a', tail, metadata={'notify': True})).success
+    assert http.posts == 2
+    assert http.calls[-1][2]['json'] == {'body': tail}
 
 
 @pytest.mark.asyncio
