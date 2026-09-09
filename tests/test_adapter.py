@@ -5491,6 +5491,65 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(('inbound_during_sequence', 'final_reaches_guard'), [
+    (False, False), (False, True), (True, False),
+])
+async def test_queued_inbound_reply_before_processing_complete(
+    monkeypatch, tmp_path, inbound_during_sequence, final_reaches_guard,
+):
+    """Hermes can recurse into a queued model turn inside one adapter lifecycle."""
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    _mark_anchored(adapter, 'cht_a')
+    handed_off = []
+
+    async def queue_in_hermes(event):
+        handed_off.append(event)
+
+    monkeypatch.setattr(adapter, 'handle_message', queue_in_hermes)
+
+    async def inbound():
+        # The socket task has its own ContextVar context, but must invalidate
+        # the suppression held by the still-running model task.
+        adapter._active_turn.set(None)
+        await adapter._deliver(
+            [SimpleNamespace(uid='msg_city', starts_slash_command=False,
+                             sender=dict(type='member', role='owner', uid='owner'))],
+            [([], [], 'Sacramento')], 'cht_a',
+        )
+
+    original_post = adapter._sequence_post
+
+    async def post_with_queued_inbound(*args):
+        result = await original_post(*args)
+        if inbound_during_sequence:
+            await asyncio.create_task(inbound())
+        return result
+
+    monkeypatch.setattr(adapter, '_sequence_post', post_with_queued_inbound)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
+    if not inbound_during_sequence:
+        if final_reaches_guard:
+            assert (await adapter.send('cht_a', 'Intro delivered. NO_REPLY')).success
+            assert http.posts == 1
+        # Otherwise Hermes consumed exact NO_REPLY without calling send().
+        await asyncio.create_task(inbound())
+
+    assert len(handed_off) == 1
+    assert adapter._active_turn.get() is turn
+    assert adapter._sequence_turns[id(turn)] is turn
+    reply = 'Sacramento, Pacific time, got it. Sports?'
+    assert (await adapter.send('cht_a', reply, metadata={'notify': True})).success
+    assert http.posts == 2, 'queued model reply must post before on_processing_complete'
+    assert http.calls[-1][2]['json'] == {'body': reply}
+
+    # A sequence in the recursive turn can still suppress its own final prose.
+    monkeypatch.setattr(adapter, '_sequence_post', original_post)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Next question')]}, turn))['success']
+    assert (await adapter.send('cht_a', 'Question delivered. NO_REPLY')).success
+    assert http.posts == 3
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['rejected', 'failed', 'delivery_unknown'])
 async def test_unsuccessful_sequence_preserves_final_reply(monkeypatch, tmp_path, status):
     module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
