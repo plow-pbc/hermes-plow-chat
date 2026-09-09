@@ -796,7 +796,8 @@ def _latch_section(_session_info: Mapping[str, Any]) -> str:
 _DISCLOSURE = (
     "Everyone in this chat sees everything you say. This room uses discretion. "
     "On an owner turn, you may use the owner's connected accounts and share what "
-    "the owner asks for in this room. On a member turn, share the owner's material "
+    "the owner asks for in this room. On a member turn, share the owner's private "
+    "material — email contents, files, Slack, messages, contacts — "
     "only to the extent the owner has okayed it in this thread. Judge that consent "
     "from the conversation: a new kind of ask needs the owner's yes here. If it "
     "has not been okayed, say what was asked and that you need the owner's okay "

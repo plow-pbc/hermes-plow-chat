@@ -3195,13 +3195,13 @@ def test_no_falsy_or_unparseable_trusted_grants_access(
     assert sent == [(["+15550001111"], "hi", False)]
 
 
-def test_new_groups_default_to_discretion(
+def test_start_group_does_not_require_a_trust_question(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    schema = module.PLOW_START_GROUP_MESSAGE_SCHEMA
-    assert schema["parameters"]["properties"]["trusted"]["default"] is False
-    assert "trusted" not in schema["parameters"]["required"]
+    assert "Do you want them to be able to talk to me" not in (
+        module.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
+    )
 
 
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -4915,6 +4915,7 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
+    assert "not your owner" in text
 
 
 def _stub_mirror(
