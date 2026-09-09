@@ -174,6 +174,12 @@ distinct turns. The ack is the burst's last uid, so a restart mid-burst
 backfills the whole burst; a hand-off that fails is retried where it sits, with
 the rest of the chat waiting behind it.
 
+Inline replies carry the quoted sender, time, body, and part label as untrusted
+turn data. If the reply has no attachments of its own, the adapter delivers the
+quoted parent's media through the normal attachment path: the matching provider
+part when its index is available, otherwise all parent attachments. Everything
+comes from the message frame; no parent-message lookup is made.
+
 ### Trusted group conversations
 
 Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.

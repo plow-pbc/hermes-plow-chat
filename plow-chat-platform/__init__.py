@@ -698,6 +698,27 @@ async def _fetch_attachment(item, content_type):
         return None
 
 
+def _reply_parts(reply):
+    """Select the quoted media by provider part index, never by array position."""
+    attachments = reply["message"]["attachments"]
+    index = reply["part_index"]
+    for number, item in enumerate(attachments, 1):
+        if index is not None and item.get("part_index") == index:
+            kind = "photo" if (item["content_type"] or "").startswith("image/") else "attachment"
+            return [item], f"{kind} {number} of {len(attachments)}"
+    return attachments, "text"
+
+
+def _quoted_reply_context(reply, chat):
+    """Quote frame data without letting its text or labels close the fence."""
+    parent = reply["message"]
+    name = _speaker_name(parent["sender"], chat)[0]
+    _parts, label = _reply_parts(reply)
+    context = (f'Replying to {name} at {parent["created_at"]}: "{parent["body"]}" '
+               f'— quoted part: {label}.')
+    return json.dumps(context, ensure_ascii=False).replace("[", r"\u005b").replace("]", r"\u005d")
+
+
 async def _resolve_parts(msg):
     """One message as its turn will carry it: media paths, their kinds, and
     the text -- the body plus a note per part that could not be fetched. A
@@ -705,8 +726,11 @@ async def _resolve_parts(msg):
     schema drift; a part whose bytes cannot be fetched now is the same to
     the model: named in the turn, never dropped with it. Parts fetch
     concurrently, so a stalled one costs one timeout, not one per part."""
+    attachments = msg["attachments"]
+    if not attachments and msg.get("reply_to"):
+        attachments, _label = _reply_parts(msg["reply_to"])
     parts = [(item, (item["content_type"] or "application/octet-stream").split(";")[0].strip())
-             for item in msg["attachments"]]
+             for item in attachments]
     paths = await asyncio.gather(*(
         _fetch_attachment(item, kind) if item["url"] else asyncio.sleep(0) for item, kind in parts))
     media_urls, media_types, notes = [], [], []
@@ -958,6 +982,7 @@ class _Inbound:
     sender: dict
     starts_slash_command: bool
     resolved: asyncio.Task                   # of _resolve_parts: begun on arrival, awaited by the burst
+    reply_to: dict | None = None
 
 
 class _PlowAuthError(Exception):
@@ -2637,6 +2662,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 sender,
                 msg["body"].startswith("/"),
                 asyncio.create_task(_resolve_parts(msg)),
+                msg.get("reply_to"),
             )
         )
         # Seen at enqueue: queued, in flight or delivered, a second copy is the
@@ -2715,6 +2741,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # boundary already puts a command first and alone, so burst[0] is it.
         turn_context = ("" if burst[0].starts_slash_command
                         else _collaboration_turn_context(roster, sender))
+        if not burst[0].starts_slash_command:
+            quotes = [_quoted_reply_context(m.reply_to, roster) for m in burst if m.reply_to]
+            if quotes:
+                text = f"{_untrusted('quoted message', ' '.join(quotes))}\n\n{text}"
         if turn_context:
             text = f"{turn_context}\n\n{text}"
         # Who invited the owner is the inviter's own words about themselves, so
