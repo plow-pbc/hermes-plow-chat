@@ -198,7 +198,13 @@ agent's own sends. So a message the agent posts to chat B from a turn in chat
 A is invisible to chat B's next turn unless it is recorded there. The
 `plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
 through the adapter's `send()` like every other outbound message (the grant
-and member-turn confinement apply exactly as for a reply). Recording lives in
+and member-turn confinement apply exactly as for a reply). `plow_list_chats`
+is where its `cht_` id comes from: a live `GET /v1/chats` — the same read that
+establishes reach, so the credential's grant is the whole listing — reduced to
+id, kind, title, the humans by name and handle, and trust. It is refused on a
+member's turn for the reason the alias registry publishes no participant
+names: a listing that carries handles must not let one room's members
+enumerate the owner's others. Recording lives in
 that same `send()`: when a turn's message lands in a chat other than the
 turn's own, the adapter mirrors the text into that chat's session as an
 assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses

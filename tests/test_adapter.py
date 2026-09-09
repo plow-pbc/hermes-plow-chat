@@ -2147,6 +2147,7 @@ def test_tools_register_with_optional_deferred_questions(
     assert [t["name"] for t in ctx.tools] == [
         "plow_start_group_message",
         "plow_send_message",
+        "plow_list_chats",
         "plow_name_contact",
         "plow_contacts",
         "plow_set_conversation_trusted",
@@ -2166,23 +2167,30 @@ def test_tools_register_with_optional_deferred_questions(
     assert send_message_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert send_message_tool["check_fn"]()
 
-    name_contact_tool = ctx.tools[2]
+    list_chats_tool = ctx.tools[2]
+    assert list_chats_tool["schema"]["name"] == "plow_list_chats"
+    assert list_chats_tool["schema"]["parameters"]["properties"] == {}
+    assert list_chats_tool["handler"] is module._plow_list_chats
+    assert list_chats_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
+    assert list_chats_tool["check_fn"]()
+
+    name_contact_tool = ctx.tools[3]
     assert name_contact_tool["schema"]["name"] == "plow_name_contact"
     assert name_contact_tool["schema"]["parameters"]["required"] == ["handle"]
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert name_contact_tool["check_fn"]()
 
-    contacts_tool = ctx.tools[3]
+    contacts_tool = ctx.tools[4]
     assert contacts_tool["schema"]["name"] == "plow_contacts"
     assert contacts_tool["schema"]["parameters"]["properties"] == {}
     assert contacts_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert contacts_tool["check_fn"]()
 
-    trust_tool = ctx.tools[4]
+    trust_tool = ctx.tools[5]
     assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[5]
+    invite_tool = ctx.tools[6]
     assert invite_tool["schema"]["name"] == "plow_offer_invite"
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
@@ -2314,6 +2322,132 @@ def test_the_contact_book_reads_on_the_owners_turn_and_on_no_turn_but_never_a_me
     # what a rosterless turn is here for.
     assert out.get("contacts") == (_BOOK if read else None)
     assert record == ([()] if read else []), "a refusal must not reach Plow at all"
+
+
+class _ChatListingHTTP:
+    """A session serving one `GET /v1/chats` answer, like the API does."""
+
+    def __init__(self, payload: Any, status: int = 200) -> None:
+        self.payload = payload
+        self.status = status
+        self.gets: list[tuple[str, dict[str, str]]] = []
+
+    async def __aenter__(self) -> "_ChatListingHTTP":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None: ...
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _Resp:
+        self.gets.append((url, headers))
+        return _Resp(self.payload, status=self.status)
+
+
+async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The listing exists so a cht_ id has somewhere to come from, so every
+    field is one a model needs to choose a room: the id, whether it is a 1:1
+    or a group, the thread's own title when it has one, the humans in it by
+    name and handle, and trust. An untitled thread carries no `title` key at
+    all rather than an empty one -- "never named" and "named empty" are not
+    the same answer, and the API itself omits the key. `kind` is the same
+    `_is_solo_dm` call every other gate makes, so a room holding one human and
+    somebody else's agent is a group, not a DM. Peer agents are not
+    participants here: they have no handle to address, and `kind` already
+    says one is present."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    peer_room = _chat("cht_peer")
+    peer_room["participants"] = [{"type": "agent", "relationship": "peer"},
+                                 {"type": "member", "role": "owner",
+                                  "display_name": "Sam", "provider_key": "+15550000001"}]
+    http = _ChatListingHTTP({
+        "object": "list", "has_more": False,
+        "data": [_chat("cht_a"),
+                 _chat("cht_g", name="Cabin Cleaning", group=True, trusted=True),
+                 peer_room],
+    })
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    listing = await adapter.list_chats()
+
+    assert http.gets == [(f"{module.BASE}/v1/chats", adapter.auth)], \
+        "the grant read, not a new API"
+    assert listing == {
+        "truncated": False,
+        "chats": [
+            {"chat_id": "cht_a", "kind": "dm", "trusted": False,
+             "participants": [{"name": "+15550000001", "handle": "+15550000001"}]},
+            {"chat_id": "cht_g", "kind": "group", "trusted": True,
+             "title": "Cabin Cleaning",
+             "participants": [{"name": "+15550000001", "handle": "+15550000001"},
+                              {"name": "+15550000002", "handle": "+15550000002"}]},
+            {"chat_id": "cht_peer", "kind": "group", "trusted": False,
+             "participants": [{"name": "Sam", "handle": "+15550000001"}]},
+        ],
+    }
+
+
+async def test_a_truncated_listing_is_flagged_not_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """`_refresh_reach` refuses a truncated listing because a chat missing
+    from reach silently narrows what the agent can serve. Here a partial
+    answer is still a useful one -- some ids beat none -- so it is served with
+    the flag that says it is partial, rather than raised."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ChatListingHTTP({"object": "list", "has_more": True, "data": [_chat("cht_a")]})
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    listing = await adapter.list_chats()
+
+    assert listing["truncated"] is True and len(listing["chats"]) == 1
+
+
+async def test_a_declined_chat_listing_reaches_the_tool_as_a_decline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Non-2xx follows the contact book's convention -- `_PlowSendError`, so
+    the tool can tell "Plow said no" from "the read fell over"."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ChatListingHTTP({"detail": "nope"}, status=403)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    with pytest.raises(module._PlowSendError):
+        await adapter.list_chats()
+
+
+@pytest.mark.parametrize(
+    ("turn", "listed"),
+    [
+        pytest.param({"chat_uid": "cht_a", "owner": True}, True, id="owner-turn"),
+        pytest.param(None, True, id="a-cron-turn-has-no-turn-at-all"),
+        pytest.param({"chat_uid": "cht_a", "owner": False}, False, id="member-turn-refused"),
+    ],
+)
+def test_the_chat_listing_is_refused_on_a_members_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    turn: dict[str, Any] | None, listed: bool,
+) -> None:
+    """A listing carrying participants is exactly what one room's member must
+    not be able to read about the owner's other rooms -- the same line
+    plow_contacts and a cross-chat send already hold. The gate is the contact
+    book's, not naming's: a turn-less caller (cron) is the owner's own agent
+    with nobody steering it, and reads. A refusal makes no request at all."""
+    module = _load(monkeypatch, tmp_path)
+    record: list[Any] = []
+    listing = {"chats": [{"chat_id": "cht_a", "kind": "dm", "trusted": False,
+                          "participants": []}], "truncated": False}
+    _live_tool(module, monkeypatch, "list_chats", result=listing, record=record)
+    module._ACTIVE_TURN.set(turn)
+
+    out = json.loads(module._plow_list_chats({}))
+
+    assert out["success"] is listed
+    assert out.get("chats") == (listing["chats"] if listed else None)
+    assert record == ([()] if listed else []), "a refusal must not reach Plow at all"
 
 
 @pytest.mark.parametrize(

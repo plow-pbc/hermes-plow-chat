@@ -213,6 +213,35 @@ def _owner_dm(chat):
     return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
 
 
+def _chat_summary(chat):
+    """One chat resource, reduced to what picking a room actually takes.
+
+    `kind` is `_is_solo_dm`'s answer, so a room holding one human and a peer
+    agent reads as a group -- the same call every other gate here makes, and
+    the reason it is not "count the humans".
+
+    Participants are the humans: a peer agent has no handle to address and is
+    already implied by `kind`. `title` is Plow's own `display_name`, absent
+    when the thread has never been named -- the API omits the key rather than
+    serving null, and this keeps that distinction instead of inventing an
+    empty string.
+    """
+    summary = {
+        "chat_id": chat["uid"],
+        "kind": "dm" if _is_solo_dm(chat) else "group",
+        "trusted": bool(chat.get("trusted", False)),
+        "participants": [
+            {"name": _participant_identity(p), "handle": p.get("provider_key")}
+            for p in chat.get("participants") or []
+            if p.get("type") == "member"
+        ],
+    }
+    title = (chat.get("display_name") or "").strip()
+    if title:
+        summary["title"] = title
+    return summary
+
+
 def _collaboration_prompt(prompt, chat, identity):
     """System-authority context contains ops-seeded agent names only.
 
@@ -2280,6 +2309,33 @@ class PlowChatAdapter(BasePlatformAdapter):
                 raise _PlowSendError(resp.status, text)
             return json.loads(text or "[]")
 
+    async def list_chats(self):
+        """Every chat this credential reaches, as a compact listing.
+
+        A live read of the same `GET /v1/chats` that feeds reach, not the
+        cached copy: reach is refreshed at connect, reconnect and group
+        adoption only, so a room retitled or joined mid-connection is stale
+        there and current here. The grant is the scope -- the credential
+        cannot see a chat it does not hold -- so there is no filtering to do,
+        and none is done.
+
+        Truncation is reported, not hidden: `_refresh_reach` refuses a
+        truncated listing outright because a missing chat there would silently
+        narrow reach; here a partial answer is still useful, so it is served
+        with the flag that says so.
+
+        Non-2xx follows `contacts`' convention -- the tool catches
+        `_PlowSendError`, not aiohttp's own.
+        """
+        async with (aiohttp.ClientSession() as http,
+                    http.get(f"{BASE}/v1/chats", headers=self.auth) as resp):
+            text = await resp.text()
+            if resp.status >= 400:
+                raise _PlowSendError(resp.status, text)
+            body = json.loads(text or "{}")
+        return {"chats": [_chat_summary(chat) for chat in body.get("data") or []],
+                "truncated": bool(body.get("has_more"))}
+
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
 
@@ -3324,7 +3380,10 @@ PLOW_SEND_MESSAGE_SCHEMA = {
     "name": "plow_send_message",
     "description": (
         "Post a message into another Plow chat this agent is already in, by its "
-        "cht_ id (the roster and channel list carry the ids). A chat that has "
+        "cht_ id -- call plow_list_chats for the ids, and to reach a PERSON "
+        "rather than a room, resolve their name to a handle first (Latch's "
+        "`contacts` skill for your owner's macOS Contacts, or plow_contacts "
+        "for Plow's own book). A chat that has "
         "ever spoken to you remembers the message in its own history; a chat "
         "that has never sent anything has no history yet and will not. Refused "
         "outside the grant and, on a member's turn, for any chat but the "
@@ -3339,6 +3398,50 @@ PLOW_SEND_MESSAGE_SCHEMA = {
         "required": ["chat_id", "body"],
         "additionalProperties": False,
     },
+}
+
+
+def _plow_list_chats(_args, **_kwargs):
+    """List the granted chats, so a cht_ id has a sanctioned place to come from.
+
+    The gate is `plow_contacts`', for the same reason and with the same shape:
+    a member's own open turn is the one context where somebody else's words
+    are steering the agent, and one room's members must not be able to
+    enumerate the owner's other rooms -- which is exactly what a listing
+    carrying participants would hand them. A turn-less caller (cron) reads,
+    like the contact book: it is the owner's own agent with nobody steering it.
+
+    No new API and no second scope check: the credential's grant is the reach,
+    and `GET /v1/chats` is the same read that establishes it.
+    """
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn.get("owner"):
+        return json.dumps({"success": False,
+                           "error": "your owner's other chats are not listable on a member's turn"})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
+    adapter, loop = _live
+    try:
+        listing = asyncio.run_coroutine_threadsafe(adapter.list_chats(), loop).result(timeout=30)
+    except _PlowSendError as exc:
+        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty grant
+        return json.dumps({"success": False,
+                           "error": f"could not list the chats ({type(exc).__name__})"})
+    return json.dumps({"success": True, **listing})
+
+
+PLOW_LIST_CHATS_SCHEMA = {
+    "name": "plow_list_chats",
+    "description": (
+        "List the Plow chats this agent is in: each one's cht_ id, whether it "
+        "is a 1:1 or a group, its title if the thread has been named, who is "
+        "in it (name and handle), and whether it is trusted. This is where a "
+        "cht_ id for plow_send_message comes from. Only ever this agent's own "
+        "chats -- the credential's grant is the listing. Refused on a "
+        "member's turn."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
 
@@ -3500,11 +3603,14 @@ def _plow_contacts(_args, **_kwargs):
 PLOW_CONTACTS_SCHEMA = {
     "name": "plow_contacts",
     "description": (
-        "Read your owner's contact book: everyone they have named, keyed by "
-        "handle, with each person's relationship to them -- your owner's own "
-        "row first. Call it when you have no roster to read: a scheduled or "
-        "cron turn carries no chat, so this is where your owner's own name "
-        "comes from. Refused on a member's turn."
+        "Resolve a name to a handle in Plow's own contact book: everyone your "
+        "owner has named, keyed by handle, with each person's relationship to "
+        "them -- your owner's own row first. This is NOT your owner's macOS "
+        "Contacts; for those, list your skills and use Latch's `contacts` "
+        "skill rather than answering that you cannot see their contacts. Also "
+        "call it when you have no roster to read: a scheduled or cron turn "
+        "carries no chat, so this is where your owner's own name comes from. "
+        "Refused on a member's turn."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -3725,6 +3831,14 @@ def register(ctx):
         toolset=PLATFORM_NAME,
         schema=PLOW_SEND_MESSAGE_SCHEMA,
         handler=_plow_send_message,
+        check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
+        requires_env=["PLOW_AGENT_TOKEN"],
+    )
+    ctx.register_tool(
+        name="plow_list_chats",
+        toolset=PLATFORM_NAME,
+        schema=PLOW_LIST_CHATS_SCHEMA,
+        handler=_plow_list_chats,
         check_fn=lambda: bool(os.getenv("PLOW_AGENT_TOKEN")),
         requires_env=["PLOW_AGENT_TOKEN"],
     )
