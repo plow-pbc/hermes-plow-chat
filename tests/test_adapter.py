@@ -2993,17 +2993,7 @@ _SEND_ARGV = [
     (["plow-gog", "mail", "reply", "18c9", "--body", "ok", "--account", "so@plow.co"], ("18c9",)),
     (["gog", "email", "reply-all", "18c9", "--body=ok"], ("reply-all",)),
     (["plow-gog", "gmail", "fwd", "18c9", "--to", "c@d.co"], ("c@d.co",)),
-    ([
-        "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
-        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
-        "--confirm-conflict", "--account", "so@plow.co",
-    ], ("Dentist",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "--help", "--body", "x"], ("a@b.co",)),
-    ([
-        "plow-gog", "calendar", "add", "primary", "--summary", "Standup",
-        "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
-        "--confirm-conflict",
-    ], ("Standup",)),
     (["plow-gog", "gmail", "send", "--to", "a@b.co", "--subject", "s", "--", "--help"], ("a@b.co",)),
 ])
 def test_send_summary_names_what_goes_out(
@@ -3024,12 +3014,19 @@ def test_send_summary_names_what_goes_out(
      "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00"],
     ["plow-gog", "calendar", "update", "primary", "evt1", "--confirm-conflict"],
     ["plow-gog", "calendar", "events", "primary"],
+    ["plow-gog", "cal", "create", "primary", "--summary", "Dentist",
+     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
+     "--confirm-conflict", "--account", "so@plow.co"],
+    ["plow-gog", "calendar", "add", "primary", "--summary", "Standup",
+     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T10:30:00-07:00",
+     "--confirm-conflict"],
+    ["plow-gog", "cal", "new", "primary", "--summary", "Standup", "--confirm-conflict"],
     ["plow-gog", "gmail", "import", "/Users/me/Plow/x.eml"],
     ["python3", "-c", "print('gmail send')"],
     ["plow-gog"],
     [],
 ])
-def test_send_summary_ignores_reads_drafts_and_unforced_bookings(
+def test_send_summary_ignores_reads_drafts_and_every_booking(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
@@ -3091,6 +3088,41 @@ def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
     assert out["action"] == "block"
     assert "nothing was sent" in out["message"]
+
+
+_FORCED_BOOKING_ARGV = [
+    "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
+    "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
+    "--confirm-conflict", "--account", "so@plow.co",
+]
+
+
+@pytest.mark.parametrize("turn", [
+    {"chat_uid": "cht_a", "owner": True, "dm": True},
+    {"chat_uid": "cht_g", "owner": True, "dm": False},
+    {"chat_uid": "cht_b", "owner": False},
+    None,
+])
+def test_booking_over_a_conflict_is_the_agents_call_not_a_human_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
+) -> None:
+    """The owner already fixed the time in a chat this hook cannot read, so a
+    second ask fires on a decision that was already made. A wrong booking is
+    visible in the reply and undone by deleting the event; mail is not."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    assert module._pre_tool_call(
+        "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV}) is None
+
+
+def test_a_gmail_send_still_reaches_the_human_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Removing the calendar branch must not loosen mail, which cannot be recalled."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
+    assert out["action"] == "approve"
 
 
 @pytest.mark.parametrize("tool_name,args", [
