@@ -308,7 +308,7 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
 
 def _chat(uid: str, *, name: str | None = None, group: bool = False,
           agent_name: str | None = None, trusted: bool = False,
-          owner_name: str | None = None) -> dict[str, Any]:
+          owner_name: str | None = None, status: str = "active") -> dict[str, Any]:
     participants = [
         {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
         if agent_name else {"type": "agent"},
@@ -319,7 +319,7 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
                              "provider_key": "+15550000002"})
     return {"uid": uid, "display_name": name, "participants": participants,
-            "trusted": trusted}
+            "trusted": trusted, "status": status}
 
 
 def _voiced(module: Any, prompt: str) -> str:
@@ -2340,6 +2340,11 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
     provider defaulted to the room's own comma-joined handles is that same
     absence wearing a value: the API says to read it as unnamed, so it is
     dropped rather than passed off as somebody's choice.
+
+    A room still being set up is not a room to pick. `/v1/chats` excludes only
+    `failed`, so a `pending` chat arrives in the same payload -- and sending to
+    one is a `409 chat_not_ready`, so listing its id would be handing the model
+    a choice that fails.
     """
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -2352,6 +2357,8 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
         "object": "list", "has_more": False,
         "data": [_chat("cht_a"),
                  _chat("cht_g", name="Cabin Cleaning", group=True, trusted=True),
+                 _chat("cht_pending", name="Still Activating", group=True,
+                       status="pending"),
                  peer_room, unnamed],
     }))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
@@ -2372,7 +2379,7 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
         {"chat_id": "cht_u", "kind": "group", "trusted": False,
          "participants": [{"name": "+15550000001", "handle": "+15550000001"},
                           {"name": "+15550000002", "handle": "+15550000002"}]},
-    ]
+    ], "the pending room is served by the route and omitted here"
 
 
 async def test_a_declined_chat_listing_reaches_the_tool_as_a_decline(

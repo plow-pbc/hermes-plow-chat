@@ -201,7 +201,11 @@ through the adapter's `send()` like every other outbound message (the grant
 and member-turn confinement apply exactly as for a reply). `plow_list_chats`
 is where its `cht_` id comes from: a live `GET /v1/chats` — the same read that
 establishes reach, so the credential's grant is the whole listing — reduced to
-id, kind, title, the humans by name and handle, and trust. Titles and names in
+id, kind, title, the humans by name and handle, and trust. Only `active` rooms
+are listed. The route excludes just `failed`, so it serves rooms still being
+set up as well; `send` requires `active` and answers a pending one with `409
+chat_not_ready`, and a listing whose whole job is to source a sendable id has
+no business offering a choice that fails. Titles and names in
 it are other people's words, so the result carries the same untrusted marker
 every such block does; a title the provider defaulted to the room's own
 comma-joined handles is dropped, because that column is how the API says
