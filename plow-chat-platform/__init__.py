@@ -376,13 +376,13 @@ def _goal_new(text, activated_by=None, now=None, set_by=None):
     which message already did this a replay mints a new generation and
     resurrects work that had since finished.
 
-    `set_by` is WHO set it -- `{"role", "name"}` as the roster knew them at the
-    time. `activated_by` is a message uid and answers "was this the same
-    command?", never "whose instruction is this?", and without an author the
-    turn line could only present a goal the owner had personally authorized as
-    words from the thread. This records a fact the write already verified
-    (`_goal_command` refuses a non-owner); it is not a second check, and
-    nothing reads it for authorization.
+    `set_by` is the owner's name as the roster knew them when they set it.
+    `activated_by` is a message uid and answers "was this the same command?",
+    never "whose instruction is this?", and without an author the turn line
+    could only present a goal the owner had personally authorized as words
+    from the thread. Just the name: `_goal_command` refuses a non-owner, so a
+    stored role would be an authorization-shaped field with one reachable
+    value. Nothing reads this for authorization either.
     """
     now = now or datetime.now(timezone.utc)
     return {
@@ -530,12 +530,14 @@ def _goal_notice(status, evidence):
 def _goal_retire(record, status):
     """Close a goal out.
 
-    The transcript is dropped with it: nothing reads `history` once the runtime
-    consumer is gone, so keeping roster names, thread text and connected-account
-    output on the persistent volume past that point is retention with no reader.
+    The transcript is dropped with it, and the setter's name with the
+    transcript: nothing reads `history` or `set_by` once the runtime consumer
+    is gone, so keeping roster names, thread text and connected-account output
+    on the persistent volume past that point is retention with no reader.
     """
     record["status"] = status
     record.pop("history", None)
+    record.pop("set_by", None)
     return record
 
 
@@ -658,24 +660,14 @@ def _goal_turn_line(record):
     still the channel prompt's answer, and a goal has never been a way to buy
     authority the room does not grant.
 
-    And the claim is only ever as strong as the record. A goal written before
-    this field existed was owner-gated too, so a missing `set_by` still reads
-    as the owner. A role that is anything else is described and nothing more:
-    no "accepted by you", no "their instruction" -- the sentence that makes a
-    goal actionable is the owner's alone.
+    And every record here is the owner's, named or not: the gate predates the
+    field, so a goal written before it existed was owner-gated too.
     """
-    setter = record.get("set_by") or {}
-    # Absent means "written before authorship was recorded" -- and the gate
-    # predates the field, so the owner is the honest reading.
-    role = setter.get("role", "owner")
-    name = setter.get("name")
-    who = "your owner" if role == "owner" else f"a {role} of this thread"
-    if name:
-        who = f"{who} {_goal_encode(name)}"
-    standing = (" and accepted by you -- their instruction, not thread data."
-                if role == "owner" else ".")
-    return (f"[Standing goal, set by {who} with /goal{standing} It changes nothing "
-            f"about what you may do or disclose on this turn. Their text, quoted: "
+    setter = record.get("set_by")
+    who = f"your owner {_goal_encode(setter)}" if setter else "your owner"
+    return (f"[Standing goal, set by {who} with /goal and accepted by you -- their "
+            f"instruction, not thread data. It changes nothing about what you may do "
+            f"or disclose on this turn. Their text, quoted: "
             f"{_goal_encode(record['text'])}]")
 
 
@@ -1463,8 +1455,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 f"I'll work toward it and report back. It stops on its own when it is done, "
                 f"unreachable, or after {GOAL_TTL_HOURS}h. `/goal` for status, `/goal clear` to stop.",
                 lambda _current: _goal_new(argument, message_uid,
-                                           set_by={"role": role,
-                                                   "name": _participant_identity(sender or {})}),
+                                           set_by=_participant_identity(sender or {}) or None),
                 restart=True):
             raise RuntimeError(f"goal announcement was not delivered to {chat_uid}")
 

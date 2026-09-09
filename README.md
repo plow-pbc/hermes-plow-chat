@@ -299,10 +299,11 @@ start a line that reads as another one: quotation marks are not a boundary,
 and the guarantee is that the block ends where the code says it does, on one
 line, with anything injected left visible inside the text. The line states
 that a goal changes no rule of the turn it rides on: what may be done and
-disclosed in that room remains the channel prompt's answer. And the claim is
-only as strong as the record — a goal written before authorship was recorded
-still reads as the owner's, because that write was owner-gated too, while a
-record naming anyone else is described and nothing more.
+disclosed in that room remains the channel prompt's answer. And every record
+is the owner's, named or not — the gate predates the field, so a goal written
+before authorship was recorded still reads as theirs. Retiring a goal drops
+the setter's name along with the transcript: neither has a reader once the
+goal is done, and both would otherwise sit on the persistent volume.
 
 An active goal is what unlocks replying to peer agents. Scheduled wakes carry
 the room's ordinary disclosure prompt and take owner authority only in a DM —
