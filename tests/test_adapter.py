@@ -5533,12 +5533,21 @@ async def test_queued_inbound_reply_before_processing_complete(
         await asyncio.create_task(inbound())
     monkeypatch.setattr(adapter, '_sequence_post', post_with_queued_inbound)
     assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
+    delivered = http.posts
     if timing.startswith('after'):
         if timing == 'after_final':
             assert (await adapter.send('cht_a', 'Intro delivered. NO_REPLY')).success
-            assert http.posts == 1
+            assert http.posts == delivered, 'suppression holds until the handoff'
         # Otherwise Hermes consumed exact NO_REPLY without calling send().
         await asyncio.create_task(inbound())
+    else:
+        # The handoff has already lifted suppression, so the intro's own tail
+        # reaches the chat instead of being dropped behind the sequence.
+        intro_tail = 'Intro delivered. NO_REPLY'
+        assert (await adapter.send('cht_a', intro_tail, metadata={'notify': True})).success
+        delivered += 1
+        assert http.posts == delivered
+        assert http.calls[-1][2]['json'] == {'body': intro_tail}
 
     assert len(handed_off) == 1
     assert other_turn['sequence_completed'], 'handoff must not invalidate another chat'
@@ -5546,7 +5555,8 @@ async def test_queued_inbound_reply_before_processing_complete(
     assert adapter._sequence_turns[id(turn)] is turn
     reply = 'Sacramento, Pacific time, got it. Sports?'
     assert (await adapter.send('cht_a', reply, metadata={'notify': True})).success
-    assert http.posts == 2, 'queued model reply must post before on_processing_complete'
+    delivered += 1
+    assert http.posts == delivered, 'queued model reply must post before on_processing_complete'
     assert http.calls[-1][2]['json'] == {'body': reply}
 
     # Once a handoff makes the lifecycle ambiguous, even another sequence
@@ -5556,35 +5566,8 @@ async def test_queued_inbound_reply_before_processing_complete(
     assert (await adapter.send_sequence({'items': [dict(type='text', body='Next question')]}, turn))['success']
     tail = 'Question delivered. NO_REPLY'
     assert (await adapter.send('cht_a', tail, metadata={'notify': True})).success
-    assert http.posts == 4
-    assert http.calls[-1][2]['json'] == {'body': tail}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('handoff', ['message', 'goal'])
-async def test_inbound_during_sequence_allows_the_intro_tail(monkeypatch, tmp_path, handoff):
-    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
-    monkeypatch.setattr(adapter, 'handle_message', mock.AsyncMock())
-    _mark_anchored(adapter, 'cht_a')
-    original_post = adapter._sequence_post
-
-    async def post_with_handoff(*args):
-        result = await original_post(*args)
-        if handoff == 'goal':
-            await adapter._goal_fire('cht_a', dict(generation='queued', text='Learn the city'))
-        else:
-            await adapter._deliver(
-                [SimpleNamespace(uid='msg_city', starts_slash_command=False,
-                                 sender=dict(type='member', role='owner', uid='owner'))],
-                [([], [], 'Sacramento')], 'cht_a',
-            )
-        return result
-
-    monkeypatch.setattr(adapter, '_sequence_post', post_with_handoff)
-    assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
-    tail = 'Intro delivered. NO_REPLY'
-    assert (await adapter.send('cht_a', tail, metadata={'notify': True})).success
-    assert http.posts == 2
+    delivered += 2
+    assert http.posts == delivered
     assert http.calls[-1][2]['json'] == {'body': tail}
 
 
