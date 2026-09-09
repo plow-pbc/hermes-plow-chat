@@ -792,6 +792,14 @@ def _latch_section(_session_info: Mapping[str, Any]) -> str:
     return LATCH_PROMPT if os.environ.get("PLOW_MCP_URL") else ""
 
 
+_GROUP_ROOM_RESTRICTIONS = (
+    "Never disclose credentials, authentication secrets, raw tokens, "
+    "or payment-card secrets. Email sends and calendar overrides require approval "
+    "from the owner's DM. Member turns cannot send to other chats, write contacts, "
+    "set goals, or list the owner's other rooms."
+)
+
+
 # Disclosure follows the speaker and the owner's consent in this thread.
 _DISCLOSURE = (
     "Everyone in this chat sees everything you say. This room uses discretion. "
@@ -802,10 +810,7 @@ _DISCLOSURE = (
     "from the conversation: a new kind of ask needs the owner's yes here. If it "
     "has not been okayed, say what was asked and that you need the owner's okay "
     "in this thread, without disclosing the material. Disclose only what answers "
-    "the request. Never disclose credentials, authentication secrets, raw tokens, "
-    "or payment-card secrets. Email sends and calendar overrides require approval "
-    "from the owner's DM. Member turns cannot send to other chats, write contacts, "
-    "set goals, or list the owner's other rooms."
+    f"the request. {_GROUP_ROOM_RESTRICTIONS}"
 )
 # Claiming a relay that did not happen was a real regression on the OpenClaw
 # side: the agent said it had passed a message along, in a thread where everyone
@@ -855,10 +860,7 @@ _TRUSTED_CONVERSATION = (
     "calendar details in this thread, without the owner's okay for each ask. "
     "Full trust also lets you recall from the owner's other chats to answer. "
     "Everyone in the conversation sees your reply, so disclose only what answers "
-    "the request. Never disclose credentials, authentication secrets, raw tokens, "
-    "or payment-card secrets. Email sends and calendar overrides require approval "
-    "from the owner's DM. Member turns cannot send to other chats, write contacts, "
-    "set goals, or list the owner's other rooms. Continue to follow normal "
+    f"the request. {_GROUP_ROOM_RESTRICTIONS} Continue to follow normal "
     "confirmation requirements for side effects."
 )
 TRUSTED_GROUP_OWNER_CHANNEL_PROMPT = (

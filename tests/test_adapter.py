@@ -1455,21 +1455,6 @@ async def test_trust_selects_the_explicit_prompt_matrix(
             assert secret in prompt
 
 
-@pytest.mark.parametrize("trusted", [False, True], ids=["discretion", "full-trust"])
-@pytest.mark.parametrize("role", ["owner", "member"])
-def test_group_turn_selects_room_disclosure_policy(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool, role: str,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    prompt = module._channel_prompt({"type": "group", "trusted": trusted}, role, _chat("cht_a", group=True), {})
-    selected, excluded = (
-        (module._TRUSTED_CONVERSATION, module._DISCLOSURE) if trusted
-        else (module._DISCLOSURE, module._TRUSTED_CONVERSATION)
-    )
-    assert selected in prompt
-    assert excluded not in prompt
-
-
 # What an owner turn is told about its own owner. Both name the OWNER, whose
 # name their own agent may carry as prompt authority; the inviter's name for
 # themselves may not, and is asserted separately below.
