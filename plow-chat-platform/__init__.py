@@ -3014,9 +3014,6 @@ _GMAIL_GROUPS = frozenset({"gmail", "mail", "email"})
 _MAIL_SEND_VERBS = frozenset({"send", "reply", "reply-all", "replyall", "forward", "fwd"})
 _DRAFT_GROUPS = frozenset({"drafts", "draft"})
 _DRAFT_SEND_VERBS = frozenset({"send", "post"})
-_CALENDAR_GROUPS = frozenset({"calendar", "cal"})
-# latch honours --confirm-conflict on create only; on update it is inert.
-_CALENDAR_CREATE_VERBS = frozenset({"create", "add", "new"})
 
 
 def _argv_flag(argv, name):
@@ -3053,20 +3050,6 @@ def _google_send_summary(argv):
     if body:
         lines += ["", body]
     return "\n".join(lines)
-
-
-def _is_conflict_override(argv):
-    """`calendar create ... --confirm-conflict`: a booking the agent is making
-    over a known conflict. Legitimate only when the owner fixed the time, and
-    only the owner can have done that -- so this is not an approval question,
-    it is a question of who is asking."""
-    return (
-        len(argv) > 2
-        and argv[0] in _GOOGLE_CLIS
-        and argv[1] in _CALENDAR_GROUPS
-        and argv[2] in _CALENDAR_CREATE_VERBS
-        and "--confirm-conflict" in argv
-    )
 
 
 def _is_draft_send(argv):
@@ -3107,7 +3090,14 @@ def _pre_tool_call(tool_name, args, **_kwargs):
                 "message": "a draft sent by id shows the owner nothing; send it as one "
                            "gmail send command with recipients, subject and body"}
     summary = _google_send_summary(argv)
-    override = _is_conflict_override(argv)
+    # The marker, not the command shape. gog takes --account (and every other
+    # global flag) before the group as well as after, so a classifier that
+    # expects `calendar` at argv[1] answers no to a real override and waves it
+    # past the room check below. Which commands the flag applies to is latch's
+    # to decide; over-matching here costs an override outside the owner's DM
+    # the room check it should have had anyway.
+    override = (summary is None and bool(argv) and argv[0] in _GOOGLE_CLIS
+                and "--confirm-conflict" in argv)
     if summary is None and not override:
         return None
     turn = _ACTIVE_TURN.get() or {}

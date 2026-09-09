@@ -3097,35 +3097,37 @@ _FORCED_BOOKING_ARGV = [
 ]
 
 
-def test_booking_over_a_conflict_is_the_agents_call_not_a_human_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """The owner already fixed the time in a chat this hook cannot read, so a
-    second ask fires on a decision that was already made. A wrong booking is
-    visible in the reply and undone by deleting the event; mail is not."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
-    assert module._pre_tool_call(
-        "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV}) is None
+# gog takes its global flags before the group as well as after, and latch
+# strips them wherever they sit. A classifier keyed on the command's shape
+# answers no to this one and waves it past the room check.
+_FORCED_BOOKING_LEADING_ACCOUNT_ARGV = [
+    "plow-gog", "--account", "so@plow.co", "calendar", "create", "primary",
+    "--summary", "Dentist", "--from", "2026-09-09T10:00:00-07:00",
+    "--to", "2026-09-09T11:00:00-07:00", "--confirm-conflict",
+]
 
 
-@pytest.mark.parametrize("turn", [
-    {"chat_uid": "cht_g", "owner": True, "dm": False},
-    {"chat_uid": "cht_b", "owner": False},
-    None,
+@pytest.mark.parametrize("argv", [_FORCED_BOOKING_ARGV,
+                                  _FORCED_BOOKING_LEADING_ACCOUNT_ARGV])
+@pytest.mark.parametrize(("turn", "expected"), [
+    ({"chat_uid": "cht_a", "owner": True, "dm": True}, None),
+    ({"chat_uid": "cht_g", "owner": True, "dm": False}, "block"),
+    ({"chat_uid": "cht_b", "owner": False}, "block"),
+    (None, "block"),
 ])
-def test_an_override_outside_the_owner_dm_is_refused(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
+def test_conflict_override_requires_owner_dm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    argv: list[str], turn: Any, expected: str | None,
 ) -> None:
-    """Dropping the prompt does not drop the room test. A member of a group
-    cannot have fixed the owner's time, so their override licenses nothing --
-    and a cron run, with no turn at all, has no owner behind it either."""
+    """In the owner's own chat the hook stands aside: they fixed the time in a
+    chat it cannot read, so asking again puts the question to somebody who has
+    already answered it. Everywhere else the override is refused -- a member of
+    a group cannot have fixed the owner's time, and a cron run with no turn at
+    all has no owner behind it either."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
-    out = module._pre_tool_call(
-        "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV})
-    assert out["action"] == "block"
-    assert "nothing was sent" in out["message"]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert (None if out is None else out["action"]) == expected
 
 
 
