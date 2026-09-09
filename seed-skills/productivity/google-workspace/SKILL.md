@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: "Gmail and Google Calendar through the owner's Mac."
-version: 2.2.0
+version: 2.3.0
 ---
 
 # Google Workspace — through the owner's Mac
@@ -41,7 +41,9 @@ Mac-managed instances):
    Otherwise tell the owner what the slot overlaps and ask. When you do
    book over a conflict, say so in the reply and name the overlap — in
    a shared room, "overlaps an existing commitment" rather than the
-   other event's name.
+   other event's name. Only the owner can fix a time, so from any other
+   chat the override is blocked and nothing is booked — ask the owner
+   to repeat the request in their direct chat.
 4. If a connected MCP server lists no `google-workspace` skill, Google is
    not available to this agent. Say exactly that — do not fall back to
    local OAuth. If no MCP server with `plow_*` tools is connected at all,

@@ -3014,6 +3014,9 @@ _GMAIL_GROUPS = frozenset({"gmail", "mail", "email"})
 _MAIL_SEND_VERBS = frozenset({"send", "reply", "reply-all", "replyall", "forward", "fwd"})
 _DRAFT_GROUPS = frozenset({"drafts", "draft"})
 _DRAFT_SEND_VERBS = frozenset({"send", "post"})
+_CALENDAR_GROUPS = frozenset({"calendar", "cal"})
+# latch honours --confirm-conflict on create only; on update it is inert.
+_CALENDAR_CREATE_VERBS = frozenset({"create", "add", "new"})
 
 
 def _argv_flag(argv, name):
@@ -3052,6 +3055,20 @@ def _google_send_summary(argv):
     return "\n".join(lines)
 
 
+def _is_conflict_override(argv):
+    """`calendar create ... --confirm-conflict`: a booking the agent is making
+    over a known conflict. Legitimate only when the owner fixed the time, and
+    only the owner can have done that -- so this is not an approval question,
+    it is a question of who is asking."""
+    return (
+        len(argv) > 2
+        and argv[0] in _GOOGLE_CLIS
+        and argv[1] in _CALENDAR_GROUPS
+        and argv[2] in _CALENDAR_CREATE_VERBS
+        and "--confirm-conflict" in argv
+    )
+
+
 def _is_draft_send(argv):
     """`gmail drafts send <id>`: the owner would see only the id, never the mail."""
     return (
@@ -3064,11 +3081,17 @@ def _is_draft_send(argv):
 
 
 def _pre_tool_call(tool_name, args, **_kwargs):
-    """Escalate an outbound email to the owner, whatever the latch MCP server
-    is named. Hermes's `approve` directive is a gate the model cannot flip
-    itself: the gateway posts the request into this chat and waits for the
-    owner's /approve. Mail earns that gate because a sent message cannot be
-    recalled. Returns None for every call that mails nothing."""
+    """Hold an outbound email for the owner, and hold a conflict override to
+    the owner's own chat, whatever the latch MCP server is named.
+
+    Hermes's `approve` directive is a gate the model cannot flip itself: the
+    gateway posts the request into this chat and waits for the owner's
+    /approve. Mail earns that gate because a sent message cannot be recalled.
+    A conflict override does not: the owner fixed the time in a chat this hook
+    cannot read, so asking again puts the question to somebody who has already
+    answered it. What it still earns is the room check -- a member of a group
+    cannot have fixed the owner's time, so an override from their turn is
+    refused outright. Returns None for every other call."""
     if not str(tool_name).endswith("plow_run_command"):
         return None
     argv = (args or {}).get("argv") if isinstance(args, dict) else None
@@ -3084,16 +3107,23 @@ def _pre_tool_call(tool_name, args, **_kwargs):
                 "message": "a draft sent by id shows the owner nothing; send it as one "
                            "gmail send command with recipients, subject and body"}
     summary = _google_send_summary(argv)
-    if summary is None:
+    override = _is_conflict_override(argv)
+    if summary is None and not override:
         return None
     turn = _ACTIVE_TURN.get() or {}
     if not (turn.get("owner") and turn.get("dm")):
         # The prompt must land where only the owner can read and answer it;
         # a group room would publish the email and let any member approve it.
+        # The same room test refuses an override, for a different reason: the
+        # only person whose fixed time licenses one is not the one speaking.
         return {"action": "block",
-                "message": "email sends are approved only in the owner's own "
-                           "chat; nothing was sent — ask the owner to repeat "
-                           "the request in their direct chat with you"}
+                "message": "email sends and conflict overrides are approved "
+                           "only in the owner's own chat; nothing was sent — "
+                           "ask the owner to repeat the request in their "
+                           "direct chat with you"}
+    if override:
+        # Past the room test, the judgment is the agent's; see the docstring.
+        return None
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()

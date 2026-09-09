@@ -3097,22 +3097,35 @@ _FORCED_BOOKING_ARGV = [
 ]
 
 
-@pytest.mark.parametrize("turn", [
-    {"chat_uid": "cht_a", "owner": True, "dm": True},
-    {"chat_uid": "cht_g", "owner": True, "dm": False},
-    {"chat_uid": "cht_b", "owner": False},
-    None,
-])
 def test_booking_over_a_conflict_is_the_agents_call_not_a_human_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """The owner already fixed the time in a chat this hook cannot read, so a
     second ask fires on a decision that was already made. A wrong booking is
     visible in the reply and undone by deleting the event; mail is not."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(turn)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
     assert module._pre_tool_call(
         "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV}) is None
+
+
+@pytest.mark.parametrize("turn", [
+    {"chat_uid": "cht_g", "owner": True, "dm": False},
+    {"chat_uid": "cht_b", "owner": False},
+    None,
+])
+def test_an_override_outside_the_owner_dm_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
+) -> None:
+    """Dropping the prompt does not drop the room test. A member of a group
+    cannot have fixed the owner's time, so their override licenses nothing --
+    and a cron run, with no turn at all, has no owner behind it either."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set(turn)
+    out = module._pre_tool_call(
+        "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV})
+    assert out["action"] == "block"
+    assert "nothing was sent" in out["message"]
 
 
 
