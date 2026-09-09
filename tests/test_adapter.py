@@ -4454,6 +4454,43 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
     assert prompt.startswith("You are Elm, a Plow assistant")
 
 
+@pytest.mark.parametrize("group", [False, True], ids=["owner-dm", "group"])
+@pytest.mark.parametrize("trusted", [False, True], ids=["discretion", "full-trust"])
+async def test_goal_wake_can_start_a_thread_only_with_owner_dm_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, group: bool, trusted: bool,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "MessageEvent", SimpleNamespace)
+    sent: list[Any] = []
+    adapter = _live_tool(module, monkeypatch, "start_group_thread",
+                         result={"chat_id": "cht_new", "adoption": "adopted"}, record=sent)
+    adapter._set_reach([_chat("cht_a", group=group, trusted=trusted)])
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _HTTP())
+    monkeypatch.setattr(adapter, "_goal_after_turn", mock.AsyncMock())
+    args = {"recipients": ["+15550001111"], "body": "Can we meet Friday?",
+            "dry_run": False, "confirm": True, "trusted": False}
+    results = []
+
+    async def process(event: Any) -> None:
+        await adapter.on_processing_start(event)
+        try:
+            # Hermes copies the processing context into its tool worker.
+            results.append(json.loads(await asyncio.to_thread(module._plow_start_group_message, args)))
+        finally:
+            await adapter.on_processing_complete(event, None)
+
+    monkeypatch.setattr(adapter, "handle_message", process)
+    await adapter._goal_fire("cht_a", module._goal_new("Arrange a meeting with Taylor"))
+
+    assert results[0]["success"] is (not group)
+    assert sent == ([] if group else [(["+15550001111"], args["body"], False)])
+    if group:
+        assert "nothing was sent" in results[0]["error"]
+    assert module._ACTIVE_TURN.get() is None
+    # A plain cron call has no processing event and acquires no owner authority.
+    assert json.loads(module._plow_start_group_message(args))["success"] is False
+
+
 async def test_a_wake_fired_under_a_replaced_goal_cannot_settle_its_successor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:

@@ -2984,7 +2984,7 @@ def _plow_start_group_message(args, **_kwargs):
                 "trusted": trusted,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "
-                         "explicit user approval.",
+                         "explicit owner approval.",
         })
 
     # The tool only exists on a running gateway, and a thread nobody can listen
@@ -3375,7 +3375,7 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "does not. Read `adoption` and tell the user plainly when it is anything "
         "other than `adopted` — replies in that thread will not reach Hermes until "
         "the next discovery poll, if ever. Defaults to dry-run; only send with "
-        "explicit user approval using dry_run=false and confirm=true. New groups default "
+        "explicit owner approval using dry_run=false and confirm=true. New groups default "
         "to discretion: the owner can share what they ask for, and members need the "
         "owner's okay in the thread for new kinds of asks. Full trust can be enabled "
         "later with plow_set_conversation_trusted; no trust question is needed to "
