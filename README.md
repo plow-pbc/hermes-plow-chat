@@ -21,6 +21,8 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
+> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827):
+> deploy that API change before pinning this plugin, or reply context will be absent.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
