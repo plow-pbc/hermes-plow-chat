@@ -3910,12 +3910,18 @@ async def test_preference_outage_never_touches_the_turns_answer(
     ("body", "sentinel_turn", "delivered"),
     [("NO_REPLY", True, False),
      ("  NO_REPLY \n", True, False),
+     ("no_reply", True, False),
+     ("NO_REPLY.", True, False),
+     ("`NO_REPLY`", True, False),
+     ("**NO_REPLY**", True, False),
+     ("Checked the thread; nothing needs me.\n\nNO_REPLY", True, False),
      ("NO_REPLY is what I would send here", True, True),
      ("(no reply needed)", True, True),
      ("NO_REPLY", False, True),
      ("NO_REPLY", None, True),
      ("NO_REPLY", "cross_chat", True)],
-    ids=["exact", "whitespace", "embedded", "prose_silence",
+    ids=["exact", "whitespace", "lowercased", "full_stop", "fenced", "emphasised",
+         "trailing_after_a_note", "embedded", "prose_silence",
          "solo_dm_turn", "no_turn", "cross_chat_send"],
 )
 async def test_no_reply_sentinel_is_dropped_before_delivery(
@@ -3925,14 +3931,21 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
     sentinel_turn: bool | str | None,
     delivered: bool,
 ) -> None:
-    """A turn whose whole answer is the sentinel stays silent: reported as a
-    success to the gateway (silence is the intended outcome, not a failure to
-    retry) but never posted, and without the verbose-preference read — this is
-    the silence contract, not a diagnostic. Only the exact sentinel is
-    silence, and only on and for the turn whose prompt established it: prose
-    that merely mentions it, a solo-DM turn whose prompt never advertised it,
-    a turn-less (cron) delivery, and an owner turn's explicit send to a
-    *different* granted chat are all real content and deliver."""
+    """A turn that ends on the sentinel stays silent: reported as a success to
+    the gateway (silence is the intended outcome, not a failure to retry) but
+    never posted, and without the verbose-preference read — this is the
+    silence contract, not a diagnostic.
+
+    Asking for the sentinel "exactly" does not get it exactly. It arrives
+    lowercased, fenced, emphasised, with a full stop, or on its own line after
+    a note the model wrote on the way to deciding it had nothing to say — all
+    of them the same decision, so all of them silence, and the note goes with
+    it. What is NOT silence: the sentinel inside a sentence, which is prose
+    about the sentinel; the model verbalising its silence in words of its own,
+    which is a prompt problem and not this seam's to guess at; and any turn
+    the contract does not cover — a solo-DM turn whose prompt never advertised
+    it, a turn-less (cron) delivery, and an owner turn's explicit send to a
+    *different* granted chat all deliver."""
     module = _load(monkeypatch, tmp_path)
     http = _PreferenceHTTP({"verbose_output_enabled": False})
     adapter = _verbose_adapter(module, http, monkeypatch)

@@ -816,8 +816,22 @@ _SPEAKER_FACT = "The message below is from a participant in this chat who does n
 # hermes' conversation loop retries empty content at full input cost and the
 # retry pressure makes the model verbalize its silence instead ("(no reply
 # needed)"), which then delivers as a real message. The sentinel gives the
-# turn non-empty content that send() drops before delivery. Exact match only.
+# turn non-empty content that send() drops before delivery.
 NO_REPLY_SENTINEL = "NO_REPLY"
+# What the model actually writes when it reaches for the sentinel. Asking for
+# it "exactly" does not get it exactly: it arrives fenced, emphasised, quoted,
+# lowercased, with a full stop, or on its own line after the note the model
+# wrote first. Those are the same decision -- nothing to say -- so they are
+# read as it. The characters are markdown and punctuation only; stripping them
+# cannot turn some other word into the sentinel.
+_SENTINEL_TRIM = "`*_~\"'“”‘’ \t.!"
+
+
+def _is_no_reply(line):
+    """Whether this line is the sentinel, however the model dressed it."""
+    return line.strip(_SENTINEL_TRIM).upper() == NO_REPLY_SENTINEL
+
+
 _SILENCE_OPTION = (
     f"When you have nothing to say, reply with exactly {NO_REPLY_SENTINEL} "
     "and it will not be delivered. "
@@ -1760,15 +1774,26 @@ class PlowChatAdapter(BasePlatformAdapter):
         # asyncio task than the WebSocket loop, where a shared session breaks.
         body = content.strip()
         turn = self._active_turn.get()
-        if (body == NO_REPLY_SENTINEL and turn is not None
+        spoken = [line for line in body.splitlines() if line.strip()]
+        if (spoken and _is_no_reply(spoken[-1]) and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
-            # The turn's whole answer was "nothing to say" — honor it. Gated
-            # on the turn's own prompt having advertised the sentinel AND on
-            # the turn's own chat: on a solo owner DM, a cron delivery, or an
+            # The turn ended on "nothing to say" — honor it, and drop what it
+            # was written after: a note the model made on its way to deciding
+            # it had nothing to say is not a message to the room. Gated on the
+            # turn's own prompt having advertised the sentinel AND on the
+            # turn's own chat: on a solo owner DM, a cron delivery, or an
             # explicit send to another granted chat, NO_REPLY is ordinary
             # text — whoever asked for that literal string must get it. No
             # verbose-preference read: this is the silence contract, not a
             # diagnostic, so it never delivers.
+            #
+            # The LAST line, not the whole body: the trailing shape is the one
+            # the model actually produces, and reading only an exact whole-body
+            # match let it through with a sentence in front of it. A sentinel
+            # in the middle of a sentence is prose and still delivers.
+            if len(spoken) > 1:
+                log.debug("[plow_chat] dropped before NO_REPLY for %s: %s",
+                          chat_id, "\n".join(spoken[:-1]))
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
         # The turn boundary is the classifier: prose the model writes while a
