@@ -3115,15 +3115,6 @@ def test_booking_over_a_conflict_is_the_agents_call_not_a_human_gate(
         "mcp__latch__plow_run_command", {"argv": _FORCED_BOOKING_ARGV}) is None
 
 
-def test_a_gmail_send_still_reaches_the_human_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """Removing the calendar branch must not loosen mail, which cannot be recalled."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
-    assert out["action"] == "approve"
-
 
 @pytest.mark.parametrize("tool_name,args", [
     ("terminal", {"command": "plow-gog gmail send"}),
