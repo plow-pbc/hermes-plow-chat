@@ -1710,7 +1710,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             "messages": [{"role": "system", "content": _GOAL_JUDGE_SYSTEM},
                          {"role": "user", "content": _goal_judge_prompt(record)}],
             "response_format": {"type": "json_object"},
-            "temperature": 0,
             "max_tokens": 300,
         }
         # A judge that is down, slow, or returns a shape we did not expect must
@@ -3615,7 +3614,6 @@ async def _handle_invite_consent(question, response):
         }],
         json_schema=_INVITE_DECISION_SCHEMA,
         schema_name="invite_consent_decision",
-        temperature=0,
         max_tokens=40,
         purpose="classify invite consent",
     )

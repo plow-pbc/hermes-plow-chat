@@ -2566,6 +2566,7 @@ async def test_deferred_answer_is_semantically_classified_and_persisted(
     result = await ctx.deferred_questions.handlers["invite-consent"](question, "Sure, sounds good")
 
     assert result.resolved is resolved
+    assert "temperature" not in ctx.llm.calls[0]
     assert consent == ([] if enabled is None else [enabled])
     assert resumed == ([question.context] if enabled is True else [])
     if decision == "unclear":
@@ -4336,6 +4337,25 @@ def test_a_torn_goal_file_reads_as_no_goal(monkeypatch: pytest.MonkeyPatch, tmp_
     module.GOALS_DIR.mkdir(parents=True, exist_ok=True)
     module._goal_path("cht_a").write_text("{not json")
     assert module._goal_load("cht_a") is None
+
+
+async def test_goal_judge_uses_the_models_default_temperature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    http = _HTTP()
+    response = _Resp({"choices": [{"message": {"content": json.dumps({
+        "verdict": "met", "evidence": "The campsite booking is confirmed.",
+    })}}]})
+    post = mock.Mock(return_value=response)
+    monkeypatch.setattr(http, "post", post)
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda **kwargs: http)
+
+    verdict = await adapter._goal_judge(module._goal_new("book the campsite"))
+
+    assert "temperature" not in post.call_args.kwargs["json"]
+    assert verdict == ("met", "The campsite booking is confirmed.")
 
 
 async def test_an_unreachable_judge_still_costs_an_attempt(
