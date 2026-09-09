@@ -3972,18 +3972,24 @@ async def test_a_malformed_settings_body_is_quiet_not_an_exception(
 
     assert first.success and second.success
     assert http.posts == [], "an uninterpretable setting withholds"
-    assert len(http.gets) == 1, "the malformed answer is cached like any other"
+    assert len(http.gets) == 1, "a quiet answer, however it was reached, is cached"
 
 
-async def test_the_gate_reads_agents_me_and_caches_it_for_the_ttl(
+async def test_only_a_quiet_answer_is_cached(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
     """The read is `/v1/agents/me` -- the `/v1/agents/cloud/me` alias serves
-    the old shape and has no `agent` key at all -- and it is a cached read,
-    not a per-send one: a chatty turn would otherwise pay a round trip per
-    withheld line. The TTL is what makes a flipped toggle land without a
-    restart, so it must actually expire."""
+    the old shape and has no `agent` key at all -- and only the quiet answer
+    it can give is cached.
+
+    Quiet is cached because a chatty turn would otherwise pay a round trip per
+    withheld line, and because being slow to start delivering costs a re-ask.
+    True is never cached, because being slow to STOP delivering costs the
+    disclosure the gate exists to prevent: a shared room reading the cart, the
+    address and the card for as long as the entry lives. So an owner switching
+    verbose on waits out the TTL, and an owner switching it off is obeyed on
+    the very next line."""
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(_me(verbose=False))
     adapter = _verbose_adapter(module, http, monkeypatch)
@@ -3992,19 +3998,34 @@ async def test_the_gate_reads_agents_me_and_caches_it_for_the_ttl(
 
     for _ in range(3):
         assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
-    assert http.gets == [f"{module.BASE}/v1/agents/me"], "one read serves the whole TTL"
+    assert http.gets == [f"{module.BASE}/v1/agents/me"], "one quiet read serves the whole TTL"
     assert http.posts == []
 
+    # Switched ON inside the TTL: the cached quiet still governs, and the
+    # owner waits. Withholding is the safe direction to be stale in.
     http._body = _me(verbose=True)
     clock[0] += module.SETTINGS_TTL_SECONDS - 1
     assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
-    assert http.posts == [], "inside the TTL the cached answer still governs"
+    assert http.posts == [], "inside the TTL the cached quiet answer still governs"
 
     clock[0] += 2
     assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
     assert len(http.gets) == 2
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages",
                            {"body": "⚠️ No reply: empty content"})]
+
+    # Switched OFF again: no entry authorised the delivery above, so there is
+    # none to go stale, and the very next line is withheld -- no TTL to wait
+    # out, which is the whole point of caching one answer and not the other.
+    http._body = _me(verbose=False)
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert len(http.posts) == 1, "a disabled toggle withholds immediately, not a minute later"
+    assert len(http.gets) == 3, "the true was re-read, never cached"
+
+    # And that fresh quiet answer is cached like any other.
+    assert (await adapter.send("cht_a", "⚠️ No reply: empty content")).success
+    assert len(http.gets) == 3
+    assert len(http.posts) == 1
 
 
 @pytest.mark.parametrize(

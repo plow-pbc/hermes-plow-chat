@@ -43,10 +43,12 @@ from gateway.session import build_session_key
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
 LATCH_URL = "https://plow.co/latch"
-# How long one /v1/agents/me settings read serves the gates below. The owner
-# toggles a setting rarely and every gated send would otherwise pay for a
-# round trip; a minute bounds how long a flipped toggle stays unobserved
-# without making the read per-turn.
+# How long a QUIET answer from /v1/agents/me serves the gate below. Only the
+# quiet answer is cached: withholding while the owner has already turned
+# verbose on costs a re-ask, and delivering while they have already turned it
+# off costs the disclosure this gate exists to stop, so staleness is only ever
+# spent in the safe direction. A minute bounds how long an owner who just
+# enabled it waits; an owner who just disabled it waits not at all.
 SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
 # Hermes' own diagnostics reach the adapter through plain send() carrying no
@@ -980,18 +982,6 @@ def _auth_raise_for_status(resp):
     resp.raise_for_status()
 
 
-def _entries(value):
-    """`value` if it is a dict, else an empty one.
-
-    The settings read below walks nested JSON straight off the network, where
-    a proxy error page, a shape change, or a hand-edited row can put anything
-    at any level. A gate that must not raise cannot afford a bare `.get` on
-    whatever arrived, and every level it descends is one more chance to meet a
-    list, a string or a bare bool.
-    """
-    return value if isinstance(value, dict) else {}
-
-
 def _platform():
     """Resolve the Platform member LAZILY, never at import.
 
@@ -1025,8 +1015,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         }
         self._ws_task = None
         self._anchor_lock = asyncio.Lock()
-        self._settings = None                # (deadline, settings) from /v1/agents/me, see _agent_settings
-        self._settings_warned = False        # one log per outage, not one per gated send
+        self._quiet_until = 0.0              # while now is under this, the gate is quiet without a read
         self._seen = []                      # (chat uid, message uid), newest last
         self._seen_events = []               # event uids, newest last
         self._inbound = {}                   # chat uid -> (queue, the task serving it)
@@ -1860,59 +1849,54 @@ class PlowChatAdapter(BasePlatformAdapter):
                 await asyncio.to_thread(_mirror_sent, chat_id, body)
         return result
 
-    async def _agent_settings(self, http):
-        """This agent's owner-facing settings object, on a short-TTL cache.
+    async def _verbose_enabled(self, http):
+        """Whether this agent's owner asked for diagnostic output in chat.
+
+        One setting gates all of it -- status frames, background-review posts,
+        turn-stop warnings, and the model's mid-turn prose in a shared room.
+        Anything but an explicit true reads as quiet, which is also what an
+        unreadable or field-less API serves.
+
+        Only the quiet answer is cached. A cached true would keep authorizing
+        delivery into a room with a third party in it for up to a minute after
+        the owner switched it off -- and what it would deliver there is the
+        cart, the shipping address and the card this gate exists to withhold.
+        So every delivery-authorizing true is read fresh, and staleness is
+        only ever spent on withholding.
 
         `GET /v1/agents/me` -- not the `/v1/agents/cloud/me` alias, which
-        serves the old shape and carries no `agent` key at all. Each entry is
-        a property schema plus its `value`, so a reader wants
-        `settings[key]["value"]`, never `settings[key]`.
-
-        Unreadable is not a state a gate can act on, so it is not one this
-        returns: an outage, a 404 from a token that is not one agent, or a
-        response missing the key -- or carrying a shape that is not an object
-        at any level -- all yield {} and the caller reads its own default from
-        that. The validation happens here, inside the boundary, because a
-        malformed body is cached exactly like a good one: an interpretation
-        that raised would repeat the raise on every send for the whole TTL. The empty answer is cached like any other so a
-        sustained outage costs one request per TTL rather than one per send,
-        and it is logged once per outage instead of once per gated send.
+        serves the old shape and carries no `agent` key at all. Each setting
+        is a property schema plus its `value`, so the walk ends on `value`,
+        never on the entry. It walks JSON straight off the network, where a
+        proxy error page or a shape change can put anything at any level, so
+        each step is guarded: a gate that must not raise cannot afford a bare
+        `.get` on whatever arrived.
         """
         now = time.monotonic()
-        if self._settings is not None and now < self._settings[0]:
-            return self._settings[1]
-        settings = {}
+        if now < self._quiet_until:
+            return False
+        found = {}
         try:
             async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
                 if resp.status == 200:
-                    me = await resp.json(content_type=None)
-                    settings = _entries(_entries(_entries(me).get("agent")).get("settings"))
+                    found = await resp.json(content_type=None)
                 elif resp.status != 404:
                     raise RuntimeError(f"HTTP {resp.status}")
-            self._settings_warned = False
         except Exception as exc:             # noqa: BLE001 - a gate must not raise
             # Including a 401: this read gates cosmetic output, and the
             # credential seam belongs to the socket, which is already
-            # presenting the same token and owns the stop.
-            if not self._settings_warned:
-                # Message included: what makes this actionable is the status or
-                # the transport error, and neither carries the token -- the
-                # credential rides a header, never the URL.
-                log.warning("[plow_chat] settings read failed: %s: %s",
-                            type(exc).__name__, exc)
-                self._settings_warned = True
-        self._settings = (now + SETTINGS_TTL_SECONDS, settings)
-        return settings
-
-    async def _verbose_enabled(self, http):
-        """Whether this assistant's owner asked for diagnostic output in chat.
-
-        One setting gates all of it -- status frames, background-review posts,
-        turn-stop warnings. Anything but an explicit true reads as quiet,
-        which is also what an unreadable or field-less API serves.
-        """
-        settings = await self._agent_settings(http)
-        return _entries(settings.get("verbose_output")).get("value") is True
+            # presenting the same token and owns the stop. Logged once per
+            # read, and a failed read is quiet for the TTL, so a sustained
+            # outage costs one line a minute rather than one per gated send.
+            # The message carries the status or the transport error and never
+            # the token -- the credential rides a header, never the URL.
+            log.warning("[plow_chat] settings read failed: %s: %s", type(exc).__name__, exc)
+        for key in ("agent", "settings", "verbose_output", "value"):
+            found = found.get(key) if isinstance(found, dict) else None
+        if found is True:
+            return True
+        self._quiet_until = now + SETTINGS_TTL_SECONDS
+        return False
 
     async def _invite_api(self, method, path, *, body=None):
         async with aiohttp.ClientSession() as http:
