@@ -1873,7 +1873,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         `.get` on whatever arrived.
         """
         now = time.monotonic()
-        if now < self._quiet_until:
+        # Snapshotted, not just compared: what makes an affirmative answer
+        # stale is that a quiet one landed while it was out, and the only
+        # evidence of that is the deadline having MOVED. Asking instead
+        # whether quiet is still unexpired reads a read that took longer than
+        # the TTL as no race at all.
+        quiet_until = self._quiet_until
+        if now < quiet_until:
             return False
         found = {}
         try:
@@ -1899,10 +1905,12 @@ class PlowChatAdapter(BasePlatformAdapter):
             # while this read was still out, it is the newer answer, and
             # returning this true would deliver into a shared room after the
             # owner had already switched verbose off -- the one failure the
-            # whole no-caching-a-true rule exists to prevent. A deadline in
-            # the future can only have been set since, because the entry
-            # check passed.
-            return time.monotonic() >= self._quiet_until
+            # whole no-caching-a-true rule exists to prevent.
+            #
+            # Any move of the deadline is that landing, whether or not it has
+            # since expired: a slow read is exactly the case where it has, and
+            # a slow read is the one most likely to have been overtaken.
+            return self._quiet_until == quiet_until
         # Timestamped on completion, not from `now`: the read is the slow
         # part, and dating the deadline from before it would retire a quiet
         # answer early by however long it took.

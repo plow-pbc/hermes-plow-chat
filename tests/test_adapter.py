@@ -3964,9 +3964,13 @@ async def test_a_malformed_settings_body_is_quiet_not_an_exception(
     assert len(http.gets) == 1, "a quiet answer, however it was reached, is cached"
 
 
+@pytest.mark.parametrize(
+    "stall_seconds", [0, 61],
+    ids=["true-completes-inside-the-quiet-window", "true-completes-after-quiet-expired"])
 async def test_a_quiet_answer_landing_mid_read_beats_an_older_true(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    stall_seconds: int,
 ) -> None:
     """Two gated sends can be on the wire at once, and both can pass the
     cache check before either answer lands. If the owner switches verbose off
@@ -3974,9 +3978,16 @@ async def test_a_quiet_answer_landing_mid_read_beats_an_older_true(
     the older read's true, returned without looking again, would post into a
     shared room after the owner had already stopped it. That is the exact
     disclosure the never-cache-a-true rule exists to prevent, arrived at from
-    the other direction, so quiet wins the race: an affirmative answer is
-    only delivered if no quiet answer landed while it was out."""
+    the other direction, so quiet wins the race.
+
+    What settles it is that the deadline MOVED, not that it is still in the
+    future. The second row is the case that separates those two questions: a
+    read slow enough to outlive the quiet window it lost to. Asking "is quiet
+    still unexpired?" reads that as no race at all and delivers -- and a slow
+    read is the one most likely to have been overtaken in the first place."""
     module = _load(monkeypatch, tmp_path)
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
     verbose_read_started = asyncio.get_running_loop().create_future()
 
     class _RacingHTTP(_HTTP):
@@ -3997,6 +4008,7 @@ async def test_a_quiet_answer_landing_mid_read_beats_an_older_true(
                     if not verbose_read_started.done():
                         verbose_read_started.set_result(None)
                     await asyncio.sleep(0)          # the quiet read overtakes here
+                    clock[0] += stall_seconds       # and this read drags on
                     return await original(content_type)
 
                 resp.json = slow                    # type: ignore[method-assign]
