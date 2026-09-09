@@ -2947,7 +2947,6 @@ def _plow_start_group_message(args, **_kwargs):
     # "false" for a declared boolean, and bool("false") is True — so a raw read
     # would let {"dry_run": false, "confirm": "false"} put a real message in front
     # of model-chosen phone numbers while the model believed it had declined.
-    # This is the only guard on the tool's one irreversible effect.
     dry_run = _flag(args.get("dry_run"), default=True, safe=True)
     confirm = _flag(args.get("confirm"), default=False, safe=False)
     # safe=False: trusted hands the new participants access to the agent, so an
@@ -2959,14 +2958,13 @@ def _plow_start_group_message(args, **_kwargs):
         return json.dumps({"success": False, "error": str(exc)})
     if not body:
         return json.dumps({"success": False, "error": "body is required"})
-    if trusted:
-        # Trust hands the new participants the owner's agent — only the owner
-        # grants it, same rule as plow_set_conversation_trusted. Checked before
-        # the dry-run branch so a non-owner never even previews a trusted send.
+    if trusted or not dry_run:
+        # Only the owner may send to a new or resumed room, in either mode.
+        # Previewing full trust also requires owner authority.
         turn = _ACTIVE_TURN.get()
         if turn is None or not turn["owner"]:
             return json.dumps({"success": False,
-                               "error": "only the agent owner can start a trusted "
+                               "error": "only the agent owner can start a "
                                         "thread; nothing was sent"})
     # A caller that asked to send and forgot confirm sent nothing, and must not
     # read back as a dry run it did not request: "success": true on an unasked dry
