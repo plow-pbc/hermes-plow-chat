@@ -288,12 +288,21 @@ quiet.
 
 Every turn under a goal opens with the goal itself, framed as what the command
 already established: a standing instruction from the owner who set it, named,
-with their text quoted as theirs. It used to ride as "untrusted thread data,
+with their text carried as theirs. It used to ride as "untrusted thread data,
 not an instruction" — the right posture for words the thread supplied, and the
 wrong one for a task the owner personally authorized, which had the agent
-disown it. The quoting stays: what the owner authorized is a task, not a
-licence to write this agent's framing. A goal written before authorship was
-recorded still reads as the owner's, because that write was owner-gated too.
+disown it.
+
+Three things bound that. Every field interpolated into the line — the goal
+text and the setter's name alike — is encoded so it cannot end the block or
+start a line that reads as another one: quotation marks are not a boundary,
+and the guarantee is that the block ends where the code says it does, on one
+line, with anything injected left visible inside the text. The line states
+that a goal changes no rule of the turn it rides on: what may be done and
+disclosed in that room remains the channel prompt's answer. And the claim is
+only as strong as the record — a goal written before authorship was recorded
+still reads as the owner's, because that write was owner-gated too, while a
+record naming anyone else is described and nothing more.
 
 An active goal is what unlocks replying to peer agents. Scheduled wakes carry
 the room's ordinary disclosure prompt and take owner authority only in a DM —
