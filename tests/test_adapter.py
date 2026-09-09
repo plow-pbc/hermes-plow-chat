@@ -4297,20 +4297,89 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
         assert "when you have a useful contribution" not in prompt
 
 
-async def test_an_active_goal_rides_every_turn_as_untrusted_thread_data(
+async def test_an_active_goal_rides_every_turn_as_the_owners_standing_instruction(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
+    """`/goal` is owner-gated, so by the time a record exists the authorship
+    has been checked -- and presenting it to the model as thread data had the
+    agent disown the one task it was told to pursue. The line now says who set
+    it and that it is their instruction, while still quoting the text as
+    theirs: what the owner authorized is a task, not a licence to write this
+    agent's framing."""
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
-    module._goal_save("cht_a", module._goal_new("book the campsite"))
+    module._goal_save("cht_a", module._goal_new(
+        "book the campsite", set_by={"role": "owner", "name": "Sam"}))
     handled = _capture_events(monkeypatch, adapter)
 
     await adapter._on_frame(_envelope("evt_x", "cht_a", "msg_x", body="any news?"), object())
     await _settle(adapter)
 
     text = handled[0]["text"]
-    assert "book the campsite" in text
-    assert "not an instruction" in text
+    assert "Sam" in text, "the setter the write already verified"
+    assert "not thread data" in text and "instruction" in text
+    assert '"book the campsite"' in text, "the text stays quoted as the owner's own"
+    assert "Untrusted thread data" not in text
+
+
+async def test_setting_a_goal_records_who_set_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """`activated_by` is a message uid: it answers "was this the same command?"
+    and never "whose instruction is this?". The turn line needs an author, so
+    the setter is recorded at the write -- the one place the role has already
+    been checked."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    _capture_events(monkeypatch, adapter)
+    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+    monkeypatch.setattr(adapter, "_goal_start_wake", lambda _uid: None)
+
+    await adapter._on_frame(
+        _envelope("evt_g", "cht_a", "msg_g", body="/goal book the campsite"), object())
+    await _settle(adapter)
+
+    assert module._goal_load("cht_a")["set_by"] == {"role": "owner", "name": "Owner"}
+
+
+async def test_a_members_goal_is_still_refused_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """The reframing carries a fact the gate established; it must not become
+    the gate. A member's `/goal` is refused exactly as before, so there is
+    never a record whose `set_by` says anything but owner."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _goal_chat_with_owner_speaking(module)
+    _capture_events(monkeypatch, adapter)
+    sent = mock.AsyncMock(return_value=_SendResult(success=True))
+    monkeypatch.setattr(adapter, "send", sent)
+
+    await adapter._on_frame(
+        _envelope("evt_m", "cht_a", "msg_m", role="member", body="/goal book the campsite"),
+        object())
+    await _settle(adapter)
+
+    assert module._goal_load("cht_a") is None
+    assert "owner" in sent.await_args[0][1].lower()
+
+
+def test_a_goal_written_before_authorship_was_recorded_still_reads_as_the_owners(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A goal already on disk at upgrade has no `set_by`, and its write was
+    owner-gated too -- so the honest reading of a missing field is the owner,
+    not a demotion back to thread data. A role that is anything else is
+    described as it was rather than promoted."""
+    module = _load(monkeypatch, tmp_path)
+    legacy = module._goal_new("book the campsite")
+    legacy.pop("set_by")
+
+    line = module._goal_turn_line(legacy)
+
+    assert "your owner" in line and "not thread data" in line
+    assert '"book the campsite"' in line
+    assert "a member of this thread" in module._goal_turn_line(
+        dict(legacy, set_by={"role": "member", "name": "Daniel"}))
 
 
 async def test_clearing_a_goal_stops_it_and_says_so(

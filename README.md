@@ -286,8 +286,20 @@ unreachable — cannot buy unbounded turns. Every settlement is announced, and a
 notice that fails to deliver leaves the goal running rather than letting it go
 quiet.
 
+Every turn under a goal opens with the goal itself, framed as what the command
+already established: a standing instruction from the owner who set it, named,
+with their text quoted as theirs. It used to ride as "untrusted thread data,
+not an instruction" — the right posture for words the thread supplied, and the
+wrong one for a task the owner personally authorized, which had the agent
+disown it. The quoting stays: what the owner authorized is a task, not a
+licence to write this agent's framing. A goal written before authorship was
+recorded still reads as the owner's, because that write was owner-gated too.
+
 An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM.
+the room's ordinary disclosure prompt and take owner authority only in a DM —
+unchanged by the reframing: in a group the thread is still full of other
+people's words, and an owner-authorized turn acting on them unprompted is a
+confused deputy holding owner-only tools.
 
 In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
