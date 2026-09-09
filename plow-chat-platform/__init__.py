@@ -980,6 +980,18 @@ def _auth_raise_for_status(resp):
     resp.raise_for_status()
 
 
+def _entries(value):
+    """`value` if it is a dict, else an empty one.
+
+    The settings read below walks nested JSON straight off the network, where
+    a proxy error page, a shape change, or a hand-edited row can put anything
+    at any level. A gate that must not raise cannot afford a bare `.get` on
+    whatever arrived, and every level it descends is one more chance to meet a
+    list, a string or a bare bool.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def _platform():
     """Resolve the Platform member LAZILY, never at import.
 
@@ -1858,8 +1870,11 @@ class PlowChatAdapter(BasePlatformAdapter):
 
         Unreadable is not a state a gate can act on, so it is not one this
         returns: an outage, a 404 from a token that is not one agent, or a
-        response missing the key all yield {} and the caller reads its own
-        default from that. The empty answer is cached like any other so a
+        response missing the key -- or carrying a shape that is not an object
+        at any level -- all yield {} and the caller reads its own default from
+        that. The validation happens here, inside the boundary, because a
+        malformed body is cached exactly like a good one: an interpretation
+        that raised would repeat the raise on every send for the whole TTL. The empty answer is cached like any other so a
         sustained outage costs one request per TTL rather than one per send,
         and it is logged once per outage instead of once per gated send.
         """
@@ -1871,16 +1886,20 @@ class PlowChatAdapter(BasePlatformAdapter):
             async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
                 if resp.status == 200:
                     me = await resp.json(content_type=None)
-                    settings = (me.get("agent") or {}).get("settings") or {}
+                    settings = _entries(_entries(_entries(me).get("agent")).get("settings"))
                 elif resp.status != 404:
-                    raise RuntimeError(f"the settings read returned HTTP {resp.status}")
+                    raise RuntimeError(f"HTTP {resp.status}")
             self._settings_warned = False
         except Exception as exc:             # noqa: BLE001 - a gate must not raise
             # Including a 401: this read gates cosmetic output, and the
             # credential seam belongs to the socket, which is already
             # presenting the same token and owns the stop.
             if not self._settings_warned:
-                log.warning("[plow_chat] settings read failed: %s", type(exc).__name__)
+                # Message included: what makes this actionable is the status or
+                # the transport error, and neither carries the token -- the
+                # credential rides a header, never the URL.
+                log.warning("[plow_chat] settings read failed: %s: %s",
+                            type(exc).__name__, exc)
                 self._settings_warned = True
         self._settings = (now + SETTINGS_TTL_SECONDS, settings)
         return settings
@@ -1893,7 +1912,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         which is also what an unreadable or field-less API serves.
         """
         settings = await self._agent_settings(http)
-        return (settings.get("verbose_output") or {}).get("value") is True
+        return _entries(settings.get("verbose_output")).get("value") is True
 
     async def _invite_api(self, method, path, *, body=None):
         async with aiohttp.ClientSession() as http:

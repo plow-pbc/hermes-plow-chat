@@ -3944,6 +3944,37 @@ async def test_a_404_from_a_multi_line_token_is_quiet(
     assert review.success and http.posts == []
 
 
+@pytest.mark.parametrize(
+    "body",
+    [{"agent": {"settings": ["bad"]}},
+     {"agent": {"settings": {"verbose_output": True}}},
+     {"agent": "agt_1"},
+     ["not an object at all"]],
+    ids=["settings-is-a-list", "entry-is-a-bare-bool", "agent-is-a-string", "body-is-a-list"])
+async def test_a_malformed_settings_body_is_quiet_not_an_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    body: Any,
+) -> None:
+    """"Never raises" has to cover interpreting the body, not just fetching
+    it: a `.get` on a list, a string or a bare bool is an AttributeError, and
+    one raised while reading the cached answer would repeat on every gated
+    send for the whole TTL -- a worse outage than the one it came from. Every
+    shape that is not an entry object carrying `value: true` reads as quiet.
+    The bare-bool case is the plausible one: it is what a client that stored
+    the value without its property schema would leave behind."""
+    module = _load(monkeypatch, tmp_path)
+    http = _SettingsHTTP(body)
+    adapter = _verbose_adapter(module, http, monkeypatch)
+
+    first = await adapter.send("cht_a", "⚠️ No reply: empty content")
+    second = await adapter.send_or_update_status("cht_a", "compacted", "✓ done")
+
+    assert first.success and second.success
+    assert http.posts == [], "an uninterpretable setting withholds"
+    assert len(http.gets) == 1, "the malformed answer is cached like any other"
+
+
 async def test_the_gate_reads_agents_me_and_caches_it_for_the_ttl(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
