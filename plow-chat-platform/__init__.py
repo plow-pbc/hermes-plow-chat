@@ -760,7 +760,9 @@ _ANSWER_LAST = (
     "yourself, any bookkeeping -- BEFORE the message you want read, never "
     "after it. A tool that POSTS to this chat is the exception: when one "
     "delivers your answer, that delivery IS the message, and anything you "
-    "write after it is dropped. "
+    "write after it is dropped -- unless a later message or goal wake "
+    "arrives for this chat first, which lifts the drop for the rest of the "
+    "lifecycle so the queued reply cannot be lost with it. "
     "Do not narrate the work on the way there: no running commentary "
     "on what you are about to click, search, fill in or try, and no progress "
     "notes between steps. When the work is done, say what happened, once. "
@@ -1650,6 +1652,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
+        await self._handoff_message(event)
+
+    async def _handoff_message(self, event):
+        # Hermes can recurse into a queued message or wake before the old
+        # processing lifecycle ends. The shared registry reaches the model's
+        # turn even when this handoff runs in a separate socket task.
+        # Once ambiguous, leave suppression disabled for the whole lifecycle:
+        # a sequence may start either before or after the handoff. Allowing
+        # duplicate intro prose is preferable to losing the queued reply.
+        for turn in self._sequence_turns.values():
+            if turn["chat_uid"] == event.source.chat_id:
+                turn["inbound_handed_off"] = True
+                turn["sequence_completed"] = False
         await self.handle_message(event)
 
     async def _goal_after_turn(self, chat_uid, event, said):
@@ -1744,7 +1759,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         # A completed sequence already delivered this turn's reply, so the
         # trailing prose the model adds after it is the same duplicate the
         # peer gate above exists to stop. Keyed on the sequence's own turn
-        # rather than the chat, so it lifts the moment that turn ends.
+        # rather than the chat, and invalidated by the next inbound handoff
+        # even when Hermes recurses before ending this processing lifecycle.
         if (turn and turn.get("sequence_completed") and id(turn) in self._sequence_turns
                 and chat_id == turn["chat_uid"]):
             log.debug("[plow_chat] suppressed post-sequence reply for %s", chat_id)
@@ -1978,7 +1994,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         identity = turn["participant_identity"]
         question = (
             f"Hey! I noticed {identity} loves Plow and isn't a user yet. "
-            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "Can I send them a Plow invite, and do that in situations like this on your behalf? "
             "You'll both get $100 in free API credits. 🙂"
         )
         record = _deferred_questions.enqueue(
@@ -2191,7 +2207,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         # succeeded": a failed, rejected or delivery-unknown run has to reopen
         # the ordinary reply path so the model's recovery text still reaches
         # the owner after a partial delivery.
-        turn["sequence_completed"] = receipt["success"]
+        # An event queued before or during delivery belongs to a later model turn,
+        # even if Hermes keeps using this processing lifecycle for its reply.
+        turn["sequence_completed"] = (receipt["success"]
+                                      and not turn.get("inbound_handed_off"))
         if not receipt["success"]:
             receipt["instruction"] = "Do not replay the sequence; inspect chat history before sending remaining items."
         return receipt
@@ -2792,7 +2811,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # wrapper in front of it and would spend most of the term budget
         # describing the goal instead of searching for what was said.
         event.recall_text = spoken
-        await self.handle_message(event)
+        await self._handoff_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
         # backfill would then page right past it.
