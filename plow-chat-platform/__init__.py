@@ -1775,6 +1775,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         body = content.strip()
         turn = self._active_turn.get()
         spoken = [line for line in body.splitlines() if line.strip()]
+        # A fenced sentinel closes on a fence of its own, so the decision is
+        # the line above it. Guarded on there being one: a message that is
+        # nothing but a fence has said nothing to read.
+        if len(spoken) > 1 and not spoken[-1].strip("`~ \t"):
+            spoken = spoken[:-1]
         if (spoken and _is_no_reply(spoken[-1]) and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             # The turn ended on "nothing to say" — honor it, and drop what it
@@ -1791,9 +1796,9 @@ class PlowChatAdapter(BasePlatformAdapter):
             # the model actually produces, and reading only an exact whole-body
             # match let it through with a sentence in front of it. A sentinel
             # in the middle of a sentence is prose and still delivers.
-            if len(spoken) > 1:
-                log.debug("[plow_chat] dropped before NO_REPLY for %s: %s",
-                          chat_id, "\n".join(spoken[:-1]))
+            # The chat id and nothing else: what the model wrote above the
+            # sentinel is the owner's prose, and prose withheld from the room
+            # does not become log material by being withheld.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
         # The turn boundary is the classifier: prose the model writes while a

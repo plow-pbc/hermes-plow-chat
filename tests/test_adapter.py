@@ -3915,18 +3915,20 @@ async def test_preference_outage_never_touches_the_turns_answer(
      ("`NO_REPLY`", True, False),
      ("**NO_REPLY**", True, False),
      ("Checked the thread; nothing needs me.\n\nNO_REPLY", True, False),
+     ("```\nNO_REPLY\n```", True, False),
      ("NO_REPLY is what I would send here", True, True),
      ("(no reply needed)", True, True),
      ("NO_REPLY", False, True),
      ("NO_REPLY", None, True),
      ("NO_REPLY", "cross_chat", True)],
-    ids=["exact", "whitespace", "lowercased", "full_stop", "fenced", "emphasised",
-         "trailing_after_a_note", "embedded", "prose_silence",
+    ids=["exact", "whitespace", "lowercased", "full_stop", "inline_backticks", "emphasised",
+         "trailing_after_a_note", "fenced_block", "embedded", "prose_silence",
          "solo_dm_turn", "no_turn", "cross_chat_send"],
 )
 async def test_no_reply_sentinel_is_dropped_before_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
     body: str,
     sentinel_turn: bool | str | None,
     delivered: bool,
@@ -3955,10 +3957,19 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
             {"chat_uid": turn_chat, "owner": True,
              "no_reply_ok": bool(sentinel_turn)})
 
-    result = await adapter.send("cht_a", body, metadata={"notify": True})
+    with caplog.at_level("DEBUG"):
+        result = await adapter.send("cht_a", body, metadata={"notify": True})
     assert result.success
     assert len(http.posts) == (1 if delivered else 0)
     assert http.gets == []
+    # Withheld prose is not log material, at any level: a note the model wrote
+    # above the sentinel was kept out of the room, and the logs are a second
+    # place it must not turn up. Asserted against a buffer proven to be live —
+    # the drop announces itself by chat id, so an empty capture cannot pass
+    # this by saying nothing at all.
+    if not delivered:
+        assert "dropped NO_REPLY sentinel for cht_a" in caplog.text
+    assert "nothing needs me" not in caplog.text
 
 
 async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
