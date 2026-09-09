@@ -174,15 +174,21 @@ distinct turns. The ack is the burst's last uid, so a restart mid-burst
 backfills the whole burst; a hand-off that fails is retried where it sits, with
 the rest of the chat waiting behind it.
 
-### Trusted group conversations
+### Group discretion and full trust
 
-Trust is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
+The room mode is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
 Before handing off each inbound burst, the adapter refreshes that chat so a
-dashboard change applies to the next message. An untrusted group keeps owner
-data private. In a trusted group, every participant may ask the assistant to
-use its normal tools and connected accounts, and requested results such as
-calendar details may be answered in the thread; credential, authentication,
-token, and payment-card secrets remain excluded.
+dashboard change applies to the next message. By default, groups use discretion:
+the owner may use connected accounts and share what they ask for in the room;
+members may obtain owner material only within what the owner has okayed in this
+thread. A new kind of ask waits for the owner's yes here, with the model judging
+that consent from the conversation. With full trust enabled, members may use the
+owner's accounts without a per-ask okay; only what answers the request is disclosed.
+Both modes exclude credentials, authentication secrets, raw tokens and payment-card
+secrets. Email sends and calendar overrides require owner-DM approval. Member turns
+cannot send to other chats, write contacts, set goals, or list the owner's other rooms.
+New groups default to discretion without a trust question; the owner can enable
+full trust later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
 dashboard. It only succeeds during an owner-authored Plow Chat turn and after
@@ -225,9 +231,9 @@ runs an OR-query built from the message's own words over the Hermes session
 store and appends up to six dated one-line snippets from other sessions to the
 turn (upstream's seam for per-turn recall: the user message, never the system
 prompt). The room is the boundary, not the asker: the home chat (the owner's
-own DM) and a trusted room recall from every chat, the owner's DMs included —
-that is what trust means here. Every other turn, an owner's turn in an
-untrusted group included, recalls only from its own chat's earlier sessions.
+own DM) and a full-trust room recall from every chat, the owner's DMs included —
+full trust also enables this broader recall. Every other turn, an owner's turn in a
+group using discretion included, recalls only from its own chat's earlier sessions.
 The current session is never recalled. Snippets are labelled as data, not
 instructions, the same way the roster is. A failing store is not caught
 here: Hermes isolates and logs a failing hook and the turn proceeds without

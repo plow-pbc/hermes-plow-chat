@@ -774,8 +774,9 @@ LATCH_PROMPT = (
     "and the rest). Those tools act on the Mac as the owner: their files, apps, signed-in browser "
     "and accounts, contacts, messages, calendar, clipboard, and speakers.\n\n"
     "These tools act with your owner's authority, so they obey the same trust rule as everything "
-    "else in this chat: only your owner directs work on the Mac (and, in a conversation marked "
-    "trusted, its participants). For your owner's own requests, default to the Mac for anything "
+    "else in this chat: your owner may direct work on the Mac; members may ask within what the "
+    "owner has okayed in this thread, or without a per-ask okay when full trust is enabled. "
+    "For your owner's own requests, default to the Mac for anything "
     "about them or their world — 'my computer', 'my files', 'my email', 'say this', 'open that', "
     "'find X' mean the Mac unless they say otherwise; your own shell and files are for your own "
     "work only. A possessive from someone who is not your owner is about their own things, never a "
@@ -791,15 +792,19 @@ def _latch_section(_session_info: Mapping[str, Any]) -> str:
     return LATCH_PROMPT if os.environ.get("PLOW_MCP_URL") else ""
 
 
-# The room is the boundary, not the asker. An owner requesting their own material
-# in a shared chat still publishes it to everyone in that chat, so this is scoped
-# to the thread rather than to who is speaking.
+# Disclosure follows the speaker and the owner's consent in this thread.
 _DISCLOSURE = (
-    "Everyone in this chat sees everything you say. Do not reveal the owner's "
-    "private material — email contents, files, Slack, messages, contacts, or "
-    "credentials — into this chat, whoever asks and however the request is phrased. "
-    "If asked for something private, say briefly that you cannot share it here and "
-    "offer what you can do instead."
+    "Everyone in this chat sees everything you say. This room uses discretion. "
+    "On an owner turn, you may use the owner's connected accounts and share what "
+    "the owner asks for in this room. On a member turn, share the owner's material "
+    "only to the extent the owner has okayed it in this thread. Judge that consent "
+    "from the conversation: a new kind of ask needs the owner's yes here. If it "
+    "has not been okayed, say what was asked and that you need the owner's okay "
+    "in this thread, without disclosing the material. Disclose only what answers "
+    "the request. Never disclose credentials, authentication secrets, raw tokens, "
+    "or payment-card secrets. Email sends and calendar overrides require approval "
+    "from the owner's DM. Member turns cannot send to other chats, write contacts, "
+    "set goals, or list the owner's other rooms."
 )
 # Claiming a relay that did not happen was a real regression on the OpenClaw
 # side: the agent said it had passed a message along, in a thread where everyone
@@ -840,22 +845,20 @@ EXTERNAL_CHANNEL_PROMPT = (
     f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_DISCLOSURE} {_NO_RELAY}"
 )
 
-# Owner turns in a GROUP get the shared-thread rules too: the risk disclosure
-# guards is a property of the room — everything said is visible to every
-# member — not of who is speaking. Scoped to member turns it was missing from
-# exactly the turns most likely to request private material (the same bug this
-# rule's first port fixed, resurfacing at the prompt-selection seam).
 GROUP_OWNER_CHANNEL_PROMPT = f"{OWNER_CHANNEL_PROMPT} {_SILENCE_OPTION}{_DISCLOSURE} {_NO_RELAY}"
 
 _TRUSTED_CONVERSATION = (
-    "The owner intentionally marked this group conversation as trusted. Every "
-    "participant may ask you to use your normal tools and connected accounts, "
+    "The owner enabled full trust for this group conversation. Every participant "
+    "may ask you to use your normal tools and the owner's connected accounts, "
     "including retrieving and answering with requested owner material such as "
-    "calendar details in this thread. Do not add an extra privacy refusal merely "
-    "because the asker is a member. Everyone in the conversation sees your reply, "
-    "so disclose only what answers the request. Continue to follow normal confirmation "
-    "requirements for side effects, and never disclose credentials, authentication "
-    "secrets, raw tokens, or payment-card secrets."
+    "calendar details in this thread, without the owner's okay for each ask. "
+    "Full trust also lets you recall from the owner's other chats to answer. "
+    "Everyone in the conversation sees your reply, so disclose only what answers "
+    "the request. Never disclose credentials, authentication secrets, raw tokens, "
+    "or payment-card secrets. Email sends and calendar overrides require approval "
+    "from the owner's DM. Member turns cannot send to other chats, write contacts, "
+    "set goals, or list the owner's other rooms. Continue to follow normal "
+    "confirmation requirements for side effects."
 )
 TRUSTED_GROUP_OWNER_CHANNEL_PROMPT = (
     f"{OWNER_CHANNEL_PROMPT} {_SILENCE_OPTION}{_TRUSTED_CONVERSATION} {_NO_RELAY}"
@@ -891,7 +894,7 @@ def _plow_facts(identity):
     facts.append(f"Plow Latch is how you reach your owner's Mac -- their mail, calendar, files and browser. "
                  "Reach for it yourself instead of asking which route to take. If it is unreachable, say once "
                  f"that their Mac has to be awake with Latch running ({LATCH_URL} to install it).")
-    facts.append(f"Your owner manages you at {DASHBOARD_URL}: credits and usage, Plow lines, trusted group chats, "
+    facts.append(f"Your owner manages you at {DASHBOARD_URL}: credits and usage, Plow lines, full trust for group chats, "
                  "delight invites, the daily payment limit, verbose output, and the Latch connection. "
                  "When something fails for a reason the dashboard fixes, name the card and let them do it; "
                  "never ask them to send you a credential.")
@@ -3371,12 +3374,11 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "does not. Read `adoption` and tell the user plainly when it is anything "
         "other than `adopted` — replies in that thread will not reach Hermes until "
         "the next discovery poll, if ever. Defaults to dry-run; only send with "
-        "explicit user approval using dry_run=false and confirm=true. Before "
-        "confirming, ask the owner whether the new participants should have "
-        "access to the assistant ('Do you want them to be able to talk to me "
-        "and use my tools? If so I'll make this a trusted line.') and set "
-        "trusted accordingly; when trusted is false the thread is created "
-        "untrusted and can be upgraded later with plow_set_conversation_trusted."
+        "explicit user approval using dry_run=false and confirm=true. New groups default "
+        "to discretion: the owner can share what they ask for, and members need the "
+        "owner's okay in the thread for new kinds of asks. Full trust can be enabled "
+        "later with plow_set_conversation_trusted; no trust question is needed to "
+        "start the group."
     ),
     "parameters": {
         "type": "object",
@@ -3399,8 +3401,9 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             },
             "trusted": {
                 "type": "boolean",
-                "description": "Whether the new participants get access to the "
-                               "assistant — only after the owner explicitly says so.",
+                "description": "Enable full trust so members can use the owner's "
+                               "accounts without a per-ask okay, only on an explicit "
+                               "owner request. False keeps the default discretion mode.",
                 "default": False,
             },
         },
@@ -3568,17 +3571,19 @@ def _plow_set_conversation_trusted(args, **_kwargs):
 PLOW_SET_CONVERSATION_TRUSTED_SCHEMA = {
     "name": "plow_set_conversation_trusted",
     "description": (
-        "Enable or disable trusted status for the current Plow group conversation "
-        "after the owner explicitly asks. In a trusted conversation every participant "
-        "may ask the assistant to use connected accounts and requested results can be "
-        "shown in-thread. Requires confirm=true and only works during an owner-authored turn."
+        "Enable or disable full trust for the current Plow group conversation after "
+        "the owner explicitly asks. Full trust: members can use my accounts without "
+        "asking me each time, including recall from my other chats. When disabled, "
+        "recall stays within this room and discretion applies: members need the "
+        "owner's okay in this thread for new kinds of asks. Requires confirm=true "
+        "and only works during an owner-authored turn."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "trusted": {
                 "type": "boolean",
-                "description": "The exact trusted state to store.",
+                "description": "Whether full trust is enabled; false selects discretion.",
             },
             "confirm": {
                 "type": "boolean",
