@@ -50,7 +50,13 @@ Not here:
 
 - The `plow-gog` argv grammar, and what a Latch tool says about itself —
   [`plow-pbc/latch`](https://github.com/plow-pbc/latch) vendors the binary,
-  pins its version, and owns the only bump checklist.
+  pins its version, and owns the only bump checklist. The mail approval hook
+  deliberately mirrors Latch's global-flag stripping from `accountAt` and
+  `planPlowGog` in `packages/device-core/src/providers/plowGog.ts`; keep that
+  list and its value consumption in sync when Latch changes it. This follows
+  the same grammar, rather than defining another one: the hook must distinguish
+  flag values from the action path, since a value can itself be `gmail`.
+  Classification uses a copy; execution and approval hashing retain raw argv.
 - Per-chat state the owner sets or clears — trust, contact labels, anything
   keyed by a `cht_` id — [`plow-pbc/plow`](https://github.com/plow-pbc/plow).
   A file written under `$HERMES_HOME` instead is invisible to the dashboard

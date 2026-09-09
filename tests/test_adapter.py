@@ -3037,6 +3037,7 @@ def test_send_summary_ignores_reads_drafts_and_every_booking(
 @pytest.mark.parametrize("argv", [
     ["plow-gog", "gmail", "drafts", "send", "r-123", "--account", "so@plow.co"],
     ["plow-gog", "gmail", "draft", "post", "r-123"],
+    ["plow-gog", "--account", "so@plow.co", "gmail", "drafts", "send", "r-123"],
 ])
 @pytest.mark.parametrize("turn", [{"chat_uid": "cht_a", "owner": True, "dm": True}, None])
 def test_draft_by_id_send_is_blocked_everywhere(
@@ -3067,34 +3068,40 @@ def test_owner_send_escalates_to_the_human_gate(
     ["--confirm-conflict"],
     ["--confirm-conflict", "-a", "so@plow.co"],
 ])
-@pytest.mark.parametrize("draft", [False, True], ids=["send", "draft-send"])
-@pytest.mark.parametrize("owner", [True, False], ids=["owner-dm", "member"])
 def test_leading_global_flags_reach_mail_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    flags: list[str], draft: bool, owner: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, flags: list[str],
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": owner, "dm": owner})
-    command = ["gmail", "drafts", "send", "r-123"] if draft else _SEND_ARGV[1:-2]
-    argv = ["plow-gog", *flags, *command]
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    argv = ["plow-gog", *flags, *_SEND_ARGV[1:-2]]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
+    assert out["action"] == "approve"
+    assert all(value in out["message"] for value in (
+        "andrew@example.com", "Catching up", "Menlo Park or a video call?",
+    ))
+    digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
+    assert out["rule_key"] == f"google-send:{digest}"
+    plain = module._pre_tool_call(
+        "mcp__latch__plow_run_command", {"argv": ["plow-gog", *_SEND_ARGV[1:-2]]},
+    )
+    assert out["rule_key"] != plain["rule_key"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["plow-gog", "--account", "gmail", "--account", "a@example.com",
+     "gmail", "send", "--to", "b@example.com", "--body", "probe"],
+    ["plow-gog", "--account", "a@example.com", "gmail", "send",
+     "--to", "gmail", "--to", "b@example.com", "--body", "probe"],
+])
+def test_group_word_flag_value_cannot_hide_member_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, argv: list[str],
+) -> None:
+    """Flag values cannot choose the action path; repeated flags are last-wins."""
+    module = _load(monkeypatch, tmp_path)
+    module._ACTIVE_TURN.set({"chat_uid": "cht_group", "owner": False, "dm": False})
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert out is not None
-    assert out["action"] == ("approve" if owner and not draft else "block")
-    if draft:
-        assert "gmail send" in out["message"]
-    elif owner:
-        assert all(value in out["message"] for value in (
-            "andrew@example.com", "Catching up", "Menlo Park or a video call?",
-        ))
-        digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
-        assert out["rule_key"] == f"google-send:{digest}"
-        plain = module._pre_tool_call(
-            "mcp__latch__plow_run_command", {"argv": ["plow-gog", *command]},
-        )
-        assert out["rule_key"] != plain["rule_key"]
-    else:
-        assert "nothing was sent" in out["message"]
-    assert argv == ["plow-gog", *flags, *command]
+    assert out["action"] == "block"
 
 
 def test_rule_key_is_per_message_so_always_never_generalises(
@@ -3122,7 +3129,8 @@ def test_send_outside_the_owner_dm_is_blocked_not_escalated(
     turn at all."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV})
+    argv = ["plow-gog", "--account", "so@plow.co", *_SEND_ARGV[1:-2]]
+    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert out["action"] == "block"
     assert "nothing was sent" in out["message"]
 
