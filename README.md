@@ -314,7 +314,7 @@ sets their account name, and a relationship on their own handle is refused. The
 tool is owner-turn-authorized only; it refuses outright during a member's turn
 and outside any active turn at all — a direct call cannot write a label except
 on the owner's own turn. A relationship renders as
-`Name [handle] (relationship)` in the untrusted roster context above — where
+`Name (handle) (relationship)` in the untrusted roster context above — where
 the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
