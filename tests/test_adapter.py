@@ -2633,6 +2633,7 @@ def test_invite_owner_notification_refuses_wrong_context(
     [
         pytest.param(None, "may or may not", id="unconfirmed"),
         pytest.param(503, "may or may not", id="5xx-unconfirmed"),
+        pytest.param(424, "may or may not", id="424-reopened-for-retry"),
         pytest.param(429, "Plow declined (429)", id="4xx-declined"),
     ],
 )
@@ -2642,14 +2643,17 @@ def test_invite_workflow_reports_delivery_failure(
     status: int | None,
     expected: str,
 ) -> None:
-    """Only a 4xx is Plow itself declining -- the daily invite cap, consent
-    withdrawn -- and it is terminal: nothing was sent and every retry presents
-    the same refusal, so the model must be told what was refused rather than
-    that retrying is safe. A timeout or a 5xx still says nothing about whether
-    the invite landed, so those keep the unconfirmed wording."""
+    """A 4xx is Plow itself declining -- the daily invite cap, consent withdrawn
+    -- and it is terminal: nothing was sent and every retry presents the same
+    refusal, so the model must be told what was refused rather than that
+    retrying is safe. The exception is 424, the messaging provider rejecting
+    the send: Plow reopens the opportunity to `ready` before re-raising, so a
+    later call re-mints and re-sends. A timeout or a 5xx says nothing about
+    whether the invite landed, so those keep the unconfirmed wording too."""
     module = _load(monkeypatch, tmp_path)
     raises = (RuntimeError("HTTP 503") if status is None
-              else module._PlowSendError(status, '{"detail":"agent invite cap reached"}'))
+              else module._PlowSendError(status, '{"detail":"agent invite cap reached"}'
+                                         if status == 429 else '{"detail":"send failed"}'))
     _live_tool(module, monkeypatch, "offer_invite", raises=raises)
     module._ACTIVE_TURN.set(_invite_turn())
 
@@ -2657,8 +2661,9 @@ def test_invite_workflow_reports_delivery_failure(
 
     assert out["success"] is False
     assert expected in out["error"]
-    assert out.get("delivery_unknown", False) is (status != 429)
-    assert ("retrying is safe" in out["error"]) is (status != 429)
+    terminal = status == 429
+    assert out.get("delivery_unknown", False) is not terminal
+    assert ("retrying is safe" in out["error"]) is not terminal
     assert "do not retry" not in out["error"].lower()
 
 
@@ -2844,7 +2849,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "praise": "I love Plow. This is amazing.",
         }
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     turn = _invite_turn()
 
     result = await adapter.offer_invite(turn)
@@ -2911,7 +2916,7 @@ async def test_resolved_consent_sends_once_or_stays_declined(
             return {"status": "sent"}
         return {"status": "disabled"}
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     result = await adapter.offer_invite(_invite_turn())
 
     assert calls[0] == (
@@ -2968,7 +2973,7 @@ async def test_only_fresh_approval_resumes_original_thread(
         api_calls.append((method, path, body))
         return {"status": "sent"}
 
-    monkeypatch.setattr(adapter, "_invite_api", api)
+    monkeypatch.setattr(adapter, "_tool_json", api)
     context = {
         "opportunity_id": "agi_1",
         "participant_identity": "Taylor",

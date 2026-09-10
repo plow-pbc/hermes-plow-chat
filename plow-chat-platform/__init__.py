@@ -2059,14 +2059,14 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._quiet_until = time.monotonic() + SETTINGS_TTL_SECONDS
         return False
 
-    async def _invite_api(self, method, path, *, body=None):
-        """One invite-workflow call, decoded.
+    async def _tool_json(self, method, path, *, body=None):
+        """One Plow call a tool handler makes, decoded.
 
-        Same non-2xx convention as `_get_tool_json`: `_PlowSendError` carries
-        the status through, so `_plow_offer_invite` can tell Plow declining --
-        the daily invite cap, consent withdrawn -- from the call falling over.
-        `_auth_raise_for_status` raised aiohttp's own past 401, which reached
-        the tool as an unconfirmed delivery worth retrying; a 4xx is neither.
+        The non-2xx convention is theirs: `_PlowSendError` carries the status
+        through, so a handler can tell "Plow said no" from "the call fell
+        over". Not `_auth_raise_for_status`, which raises aiohttp's own past
+        401 -- that reaches a handler as an unconfirmed outcome worth
+        retrying, which a refusal is not.
         """
         async with aiohttp.ClientSession() as http:
             request = getattr(http, method.lower())
@@ -2085,7 +2085,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         if any(not turn.get(field) for field in required):
             raise RuntimeError("the active turn has no server participant identity")
 
-        opportunity = await self._invite_api(
+        opportunity = await self._tool_json(
             "POST",
             "/v1/auth/agent-invites/opportunities",
             body={
@@ -2148,7 +2148,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         return {"question_id": record.id}
 
     async def set_invite_consent(self, enabled):
-        data = await self._invite_api(
+        data = await self._tool_json(
             "PUT", "/v1/auth/agent-invites", body={"enabled": enabled}
         )
         if data.get("enabled") is not enabled:
@@ -2163,7 +2163,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         opportunity_id = context.get("opportunity_id")
         if not opportunity_id:
             raise RuntimeError("agent invite opportunity is missing")
-        result = await self._invite_api("POST", f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send")
+        result = await self._tool_json("POST", f"/v1/auth/agent-invites/opportunities/{opportunity_id}/send")
         status = result.get("status")
         if status != "sent":
             raise RuntimeError("agent invite response has an invalid shape")
@@ -2467,44 +2467,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         """PUT the owner's name/relationship for one handle in their contact book.
 
         No `_send_guard`: no chat to scope to; the owner-turn check is the gate.
-
-        Same non-2xx convention as `start_group_thread`: read the body once,
-        raise `_PlowSendError(status, text)` past 400 so the tool's own
-        `except` reports it, rather than `_auth_raise_for_status`'s
-        `resp.raise_for_status()` -- that raises aiohttp's own exception for
-        anything but 401, which the tool does not catch.
         """
         segment = urllib.parse.quote(handle, safe="")
-        async with aiohttp.ClientSession() as http:
-            async with http.put(f"{BASE}/v1/contacts/{segment}",
-                                json=body, headers=self.auth) as resp:
-                text = await resp.text()
-                if resp.status >= 400:
-                    raise _PlowSendError(resp.status, text)
-                return json.loads(text or "{}")
+        return await self._tool_json("PUT", f"/v1/contacts/{segment}", body=body)
 
     async def contacts(self):
-        """GET the owner's whole contact book, owner's own row first.
-
-        The read half of `name_contact`, and it shares that method's non-2xx
-        convention for the same reason: the tool catches `_PlowSendError`, not
-        aiohttp's own.
-        """
-        return await self._get_tool_json("/v1/contacts")
-
-    async def _get_tool_json(self, path):
-        """One GET the tool handlers make, decoded.
-
-        The non-2xx convention is theirs: `_PlowSendError` carries the status
-        through, so a handler can tell "Plow said no" from "the read fell
-        over".
-        """
-        async with (aiohttp.ClientSession() as http,
-                    http.get(f"{BASE}{path}", headers=self.auth) as resp):
-            text = await resp.text()
-            if resp.status >= 400:
-                raise _PlowSendError(resp.status, text)
-            return json.loads(text)
+        """GET the owner's whole contact book, owner's own row first."""
+        return await self._tool_json("GET", "/v1/contacts")
 
     async def list_chats(self):
         """Every chat this credential can send to, as a compact listing.
@@ -2535,7 +2504,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         while the old reach still stands rather than half-adopting a listing
         that could not be read.
         """
-        body = await self._get_tool_json("/v1/chats")
+        body = await self._tool_json("GET", "/v1/chats")
         listed = [_chat_summary(chat) for chat in body["data"]
                   if chat["status"] == "active"]
         # The whole payload, exactly as `_refresh_reach` passes it: reach has
@@ -4008,17 +3977,20 @@ def _plow_offer_invite(args, **_kwargs):
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
     except _PlowSendError as exc:
-        if exc.status >= 500:
+        # A 5xx says as little about delivery as a timeout does, and a 424 is
+        # the messaging provider rejecting the send: Plow reopens the
+        # opportunity to `ready` before re-raising, so a later call re-mints and
+        # re-sends. Every other 4xx is Plow itself refusing -- nothing was sent,
+        # and every retry presents the same refusal. Say what was refused: the
+        # unconfirmed wording sent the model looking for a way around it, and
+        # quoting the public signup phrase is the way around it.
+        if exc.status >= 500 or exc.status == 424:
             return json.dumps({
                 "success": False,
                 "delivery_unknown": True,
                 "error": f"could not confirm the invite workflow ({exc.status}); it may or may not "
                          "have completed; retrying is safe",
             })
-        # A 4xx is Plow itself refusing -- nothing was sent, and every retry
-        # presents the same refusal. Say what was refused: the wording below
-        # sent the model looking for a way around it, and quoting the public
-        # signup phrase is the way around it that the invite cap exists to stop.
         return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
         return json.dumps({
