@@ -14,6 +14,7 @@ import importlib.util
 import json
 import logging
 import pathlib
+import re
 import sys
 import types
 from dataclasses import dataclass
@@ -128,7 +129,16 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
         lambda source, **_kwargs: f"agent:main:{source.platform}:dm:{source.chat_id}"
     )
 
+    # Upstream's redactor, reduced to its contract: the E.164 pass reads this
+    # module global at call time.
+    redact = types.ModuleType("agent.redact")
+    redact._SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")  # type: ignore[attr-defined]
+    redact.redact_sensitive_text = lambda text: redact._SIGNAL_PHONE_RE.sub(  # type: ignore[attr-defined]
+        lambda m: m.group(1)[:4] + "****" + m.group(1)[-4:], text)
+
     modules = {
+        "agent": types.ModuleType("agent"),
+        "agent.redact": redact,
         "gateway": types.ModuleType("gateway"),
         "gateway.config": config,
         "gateway.platforms": types.ModuleType("gateway.platforms"),
@@ -2183,6 +2193,17 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     kwargs = ctx.register_platform.call_args.kwargs
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
+
+
+def test_a_reply_keeps_the_phone_numbers_it_hands_people(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Hermes masked every number in an agent's reply, so a prospect was told
+    to text a signup phrase "to +165****6415" (2026-09-10). On a phone line
+    the number is the content."""
+    _load(monkeypatch, tmp_path)
+    reply = "Text Set this up for me to +16505550100."
+    assert sys.modules["agent.redact"].redact_sensitive_text(reply) == reply
 
 
 class _ToolContext:

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import aiohttp
+import agent.redact as _hermes_redact
 from gateway.config import HomeChannel, Platform, persist_home_channel
 try:
     from gateway.deferred_questions import DeferredQuestionResult
@@ -77,6 +78,17 @@ CHECKPOINT = _STATE_ROOT / "plow_chat_last_uid"
 GOALS_DIR = _STATE_ROOT / "plow_chat_goals"
 HOME_CHAT_NAME = "Plow Chat"
 log = logging.getLogger(__name__)
+
+# TODO(remove): once the fleet image pin includes Hermes' own fix, this is dead
+# code. Hermes masks every E.164 number in the agent's replies, force=True so
+# no config reaches it: a prospect was told to text a signup phrase
+# "to +165****6415" (2026-09-10). On a phone line the number is the content.
+# This disables that one pass; every credential pattern still runs. The base
+# has no patch mechanism, so the plugin carries it, and fails its import rather
+# than re-masking if Hermes moves the pass.
+if not hasattr(_hermes_redact, "_SIGNAL_PHONE_RE"):
+    raise ImportError("agent.redact no longer has _SIGNAL_PHONE_RE; re-point the phone-number workaround")
+_hermes_redact._SIGNAL_PHONE_RE = re.compile(r"(?!)")
 
 _deferred_questions: object | None = None
 _plugin_llm: object | None = None
