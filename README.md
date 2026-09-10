@@ -16,13 +16,7 @@ The directory is named for the plugin id so the install can be a directory copy:
 `agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
 into place. Nothing else here — README, tests, justfile — reaches an agent.
 
-> **Ordering.** That contract needs `agent-mgr`'s `install-plugin` to install
-> this *directory*, which it does only from
-> [`plow-pbc/agent-mgr#10`](https://github.com/plow-pbc/agent-mgr/pull/10) onward.
-> Before that change it copied two files from the repository **root**, so a
-> `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
-> `agent-mgr` installs an empty plugin directory — an agent with no phone line.
-> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
+> **Ordering.** Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
 > and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
 > deploy both API changes before pinning this plugin, or reply context will be absent
 > or indexed media replies will remain unresolved.
@@ -37,10 +31,11 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
 > "Owner contacts"). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
-> invites, but skip the ask-owner-first invite flow. Deploy the API first,
-> then land the `agent-mgr` support above, and only then bump
-> `runtime/plow-chat-plugin.ref`. Installing this plugin before the API is
-> available fails loudly instead of silently skipping delivery.
+> invites, but skip the ask-owner-first invite flow. Deploy the API first, and
+> only then bump `PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` (and
+> `agent-mgr`'s `images.hermes_local` base tag, which can't move past it).
+> Installing this plugin before the API is available fails loudly instead of
+> silently skipping delivery.
 
 ## Where changes go
 
@@ -409,15 +404,16 @@ API the inbound path sees no `attachments` field (a `KeyError`, loud, per
 REVIEW.md) and an outbound declare returns `404`. That `KeyError` fires inside
 the frame loop on every inbound message, so the socket is torn down and
 reconnected every 5s and the phone line is mute until the API catches up:
-`agent-mgr`'s `runtime/plow-chat-plugin.ref` must not be bumped to this SHA
-until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
+`PLOW_CHAT_PLUGIN_SHA` in `plow-hermes-agent` must not be bumped to this
+commit — and `agent-mgr`'s `images.hermes_local` base tag can't move past it
+— until `plow-pbc/plow#1435` is deployed to every API the fleet's agents talk
 to.
 
 ## One implementation, two delivery paths
 
-This adapter is the only plow_chat implementation. `agent-mgr` installs it into
-Docker-fleet agents at the SHA pinned in its `runtime/plow-chat-plugin.ref`;
-`plow-pbc/plow`'s blessed exe.dev image bakes the same tree at the same pin.
+This adapter is the only plow_chat implementation; see Who consumes this
+above for the delivery paths. `plow-pbc/plow`'s blessed exe.dev image bakes
+the same tree at the same `PLOW_CHAT_PLUGIN_SHA` pin.
 The old second implementation in `plow`'s `cloud-agents/` was retired by the
 unification (`plow-pbc/plow#1420`); its multi-chat credential-scope design is
 what this adapter now is.

@@ -2403,7 +2403,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         (`provider == "linq"`), excluding chats of another provider on the
         same grant.
 
-        Status is the one narrowing, because the listing exists to source a
+        Status is the other narrowing, because the listing exists to source a
         `cht_` id for `plow_send_message`. `/v1/chats` excludes only `failed`,
         so it serves `pending` rooms too; the send path requires `active` and
         answers a pending one with `409 chat_not_ready`. Listing an id that
