@@ -5469,6 +5469,29 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     assert "not your owner" in text
 
 
+async def test_owner_turn_with_latch_prefers_plow_for_texting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    monkeypatch.setenv("PLOW_MCP_URL", "https://api.plow.co/v1/relay/devices/u/mcp")
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a")])
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u", role_authorized=True),
+        message_id="msg_1", channel_prompt=module.OWNER_CHANNEL_PROMPT,
+    )
+    await adapter.on_processing_start(event)
+    try:
+        assert adapter._active_turn.get()["owner"] is True
+        assert (
+            "Texting a person is the exception: call plow_list_chats first, and if they are in one "
+            "of your Plow chats send it with plow_send_message — only fall back to the Mac's Messages "
+            "app (plow_run_applescript, which runs outside the sandbox) when they are in none."
+        ) in module._latch_section({})
+    finally:
+        await adapter.on_processing_complete(event, None)
+
+
 def _stub_mirror(
     monkeypatch: pytest.MonkeyPatch, *, result: bool = True, raises: Exception | None = None
 ) -> list[dict[str, Any]]:
