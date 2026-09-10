@@ -88,3 +88,61 @@ async def test_reach_keeps_the_email_line_and_publishes_its_address_in_the_hint(
                                    "to you; you write as yourself, at email length.")
     assert [(uid, (await adapter.get_chat_info(uid))["type"]) for uid in adapter._chats] == [
         ("cht_m", "dm"), ("cht_n", "group")]
+
+
+@pytest.mark.parametrize(("group", "chat_type"), [(False, "dm"), (True, "group")], ids=["dm", "group"])
+async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, group: bool, chat_type: str,
+) -> None:
+    """Both adapters hold the same grant and see the same frames. A gmail
+    frame is a plow_email turn -- platform, chat_type and chat_id are the
+    three fields upstream's build_session_key (gateway/session.py:641) joins
+    into `<ns>:plow_email:<chat_type>:<chat_uid>` -- and the phone line's
+    frame is not this platform's. The prompt is the owner fact and nothing
+    else: no roster, no trust prose; the hint rides the platform entry."""
+    module, _entry = _load_email(monkeypatch, tmp_path)
+    listing = [_chat("cht_a"), _mail_chat("cht_m", group=group)]
+    chat = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    chat._set_reach(listing)
+    _mark_anchored(chat, "cht_a")
+    mail = _adapter(module)
+    mail._set_reach(listing)
+    chat_events, mail_events = _capture_events(monkeypatch, chat), _capture_events(monkeypatch, mail)
+
+    frame = _envelope("evt_1", "cht_m", "msg_1", body="Can you send the invoice?")
+    await chat._on_frame(frame, None)
+    await _settle(chat)
+    await mail._on_frame(frame, None)
+    await mail._on_frame(frame, None)                       # a redelivered event is one turn
+    await mail._on_frame(_envelope("evt_2", "cht_a", "msg_2"), None)
+
+    assert chat_events == [], "the email line's turn is never the phone line's"
+    [event] = mail_events
+    source = event["source"]
+    assert (source.platform, source.chat_type, source.chat_id) == ("plow_email", chat_type, "cht_m")
+    assert source.role_authorized is True and source.user_id == "mem_owner_cht_m"
+    assert event["text"] == "Can you send the invoice?" and event["message_id"] == "msg_1"
+    assert event["channel_prompt"] == module._owner_fact(OWNER)
+
+
+@pytest.mark.parametrize("role", ["owner", "member"])
+async def test_an_email_turn_confines_the_chat_tools_and_never_sends_from_the_owners_gmail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, role: str,
+) -> None:
+    """The tools and the Latch mail gate read one turn slot. A member's email
+    turn is refused the contact book like a member's chat turn; and on ANY
+    email turn a plow-gog send is blocked -- the reply goes out from this
+    line, which is the ghostwriting bug this design exists to end."""
+    module, _entry = _load_email(monkeypatch, tmp_path)
+    mail = _adapter(module)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="cht_m", chat_type="dm",
+                                                   role_authorized=role == "owner"))
+    await mail.on_processing_start(event)
+    assert module._ACTIVE_TURN.get() == {"chat_uid": "cht_m", "owner": role == "owner", "dm": False}
+    contacts = json.loads(module._plow_contacts({}))
+    assert contacts["success"] is False
+    assert ("member's turn" in contacts["error"]) == (role == "member")
+    gate = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
+    assert gate["action"] == "block"
+    await mail.on_processing_complete(event, None)
+    assert module._ACTIVE_TURN.get() is None

@@ -89,3 +89,83 @@ class PlowEmailAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id):
         chat = self._chats[chat_id]
         return {"name": chat.get("display_name") or chat_id, "type": _chat_type(chat), "chat_id": chat_id}
+
+    async def connect(self, *, is_reconnect=False):
+        if self._ws_task:
+            self._ws_task.cancel()
+        async with aiohttp.ClientSession() as http:
+            await self._refresh_reach(http)
+        self._ws_task = asyncio.create_task(self._listen())
+        return True
+
+    async def disconnect(self):
+        if self._ws_task:
+            self._ws_task.cancel()
+        self._mark_disconnected()
+
+    async def _listen(self):
+        first_connection = True
+
+        async def session(http):
+            nonlocal first_connection
+            if not first_connection:
+                await self._refresh_reach(http)
+            first_connection = False
+            async with _socket(http, await _ticket(http, self.auth)) as ws:
+                self._mark_connected()
+                log.info("[plow_email] websocket connected")
+                async for frame in ws:
+                    if frame.type == aiohttp.WSMsgType.TEXT:
+                        await self._on_frame(frame.json(), http)
+
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+
+    async def _on_frame(self, frame, http):
+        if frame.get("type") == "connected":
+            return
+        chat_uid = frame["chat_id"]
+        if chat_uid not in self._chats and chat_uid not in self._foreign:
+            await self._refresh_reach(http)  # a thread born since the last read
+        if chat_uid in self._foreign:
+            return                           # the phone line's room; plow_chat's turn
+        if chat_uid not in self._chats:
+            log.warning("[plow_email] dropped frame outside the grant: %s", chat_uid)
+            return
+        if frame["event_type"] != "message_received" or frame["event_id"] in self._seen_events:
+            return
+        self._seen_events.append(frame["event_id"])
+        del self._seen_events[:-512]
+        await self._on_message(frame["data"]["message"], chat_uid)
+
+    async def _on_message(self, msg, chat_uid):
+        if msg["direction"] != "inbound":
+            return                           # the echo of our own send
+        sender = msg["sender"]
+        if sender["type"] != "member":
+            log.info("[plow_email] ignored sender.type=%r", sender["type"])
+            return
+        chat = self._chats[chat_uid]
+        info = await self.get_chat_info(chat_uid)
+        await self.handle_message(MessageEvent(
+            text=msg["body"].strip() or "(empty email)",
+            source=self.build_source(chat_id=chat_uid, chat_name=info["name"], chat_type=info["type"],
+                                     user_id=sender["uid"],
+                                     user_name=sender.get("display_name") or sender["uid"],
+                                     role_authorized=sender.get("role") == "owner"),
+            message_id=msg["uid"],
+            # The owner fact and nothing else (design §5): no roster, no trust
+            # prose. The hint reaches the prompt through the platform entry.
+            channel_prompt=_owner_fact(_owner_identity(chat)),
+        ))
+
+    async def on_processing_start(self, event):
+        # The one turn slot the tool guards read (`_send_guard`,
+        # `_owner_read_tool`, `_pre_tool_call`): a member's email turn is
+        # confined like a member's chat turn. `dm` is False on purpose -- the
+        # Latch mail gate approves a plow-gog send only in the owner's own
+        # DM, and a reply here goes out from this line, never their Gmail.
+        _ACTIVE_TURN.set({"chat_uid": event.source.chat_id,
+                          "owner": bool(event.source.role_authorized), "dm": False})
+
+    async def on_processing_complete(self, event, outcome):
+        _ACTIVE_TURN.set(None)
