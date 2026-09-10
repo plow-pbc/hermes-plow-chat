@@ -32,22 +32,28 @@ Mac-managed instances):
    command may show the owner an approval card on their Mac; if it
    hangs, it is waiting there, and a refusal there is a denial on the
    Mac.
-3. Calendar conflicts are yours to judge, not the owner's to approve.
-   A calendar create that overlaps an existing commitment is refused,
-   never queued for approval: the check covers every connected account,
-   and the refusal comes back to you. To book anyway, re-send the same
-   create — the same command, same attendees, same calendar, same
-   everything — with `--confirm-conflict` added, and only when the owner
-   fixed the time in the request ("book it regardless", "hold those
-   exact dates", a named slot they insist on). Never rebuild a smaller
-   create to get past the refusal; you would drop what you left out.
-   Otherwise tell the owner what the slot overlaps and ask. When you do
-   book over one, say so in the reply and name the overlap. Whether you
-   are asking about a conflict or reporting one you booked over, in a
-   shared room the overlap is "an existing commitment" and never the
-   other event's name. Only the owner can fix a time, so from any other
-   chat the override is blocked and nothing is booked — ask the owner
-   to repeat the request in their direct chat.
+3. A calendar conflict comes back to you rather than to an
+   approval card on the Mac — but whether to book over it is the
+   owner's call, never yours alone. A calendar create that
+   overlaps an existing commitment is refused, never queued for
+   approval: the check covers every connected account, and the
+   refusal comes back to you. Tell the owner what the slot
+   overlaps and ask; a plain "yes" is enough. Up-front consent
+   counts only when they show they know about the overlap ("book
+   it regardless", "I know it overlaps, hold those exact dates").
+   A bare preferred time is not consent: tell them what it
+   overlaps and ask. Once the owner has said go ahead for that
+   time, book it even if something else has appeared since; name
+   whatever it overlaps in your reply. Re-send the complete
+   original command with `--confirm-conflict` added; never rebuild
+   a smaller create or drop its attendees or calendar. When you do
+   book over one, say so in the reply and name the overlap.
+   Whether you are asking about a conflict or reporting one you
+   booked over, in a shared room the overlap is "an existing
+   commitment" and never the other event's name. Only the owner
+   can fix a time, so from any other chat the override is blocked
+   and nothing is booked — ask the owner to repeat the request in
+   their direct chat.
 4. If a connected MCP server lists no `google-workspace` skill, Google is
    not available to this agent. Say exactly that — do not fall back to
    local OAuth. If no MCP server with `plow_*` tools is connected at all,
