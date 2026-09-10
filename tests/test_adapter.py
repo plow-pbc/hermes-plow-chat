@@ -1964,6 +1964,17 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     assert "outside the grant" not in caplog.text
 
 
+def test_set_reach_raises_when_the_self_agent_line_has_no_provider_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    broken = _chat("cht_broken")
+    del broken["participants"][0]["line"]["provider_type"]
+    with pytest.raises(RuntimeError, match="has no provider_type"):
+        adapter._set_reach([broken])
+
+
 class _SocketHTTP(_HTTP):
     def __init__(self) -> None:
         super().__init__()

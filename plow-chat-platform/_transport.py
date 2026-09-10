@@ -223,7 +223,10 @@ def _owner_fact(owner):
 
 def _provider(chat):
     # Which line this chat is, off its own agent participant.
-    return _self_agent_line(chat)["provider_type"]
+    provider_type = _self_agent_line(chat).get("provider_type")
+    if provider_type is None:
+        raise RuntimeError(f"chat {chat.get('uid')} has no provider_type")
+    return provider_type
 
 
 def _split(listing, provider):
