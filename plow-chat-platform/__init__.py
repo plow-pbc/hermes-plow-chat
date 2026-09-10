@@ -48,6 +48,9 @@ from ._transport import (
     _bearer,
     _granted_chats,
     _read_identity,
+    _serve,
+    _socket,
+    _ticket,
 )
 
 LATCH_URL = "https://plow.co/latch"
@@ -2682,110 +2685,66 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] backfilled %d missed message(s)", len(missed))
 
     async def _listen(self):
-        global _live
         first_connection = True
         # Durable across restarts, unlike `first_connection`: `connect`
-        # unconditionally refreshes reach before ever starting this loop
-        # (`__init__`'s own checkpoint read stands in for a raw `_listen`
-        # call with no `connect`), so `_anchored_chats` already reflects,
-        # by the time this runs, every chat currently granted -- including
-        # one this agent discovered in a PRIOR life and never finished
-        # anchoring. `first_connection` alone cannot tell that case apart
-        # from a genuine first-ever install: it is always true for a fresh
-        # process regardless of which life this is. The home checkpoint
-        # already existing on disk is what actually means "not the first
-        # life" -- read once, here, before anything below can change it.
+        # refreshes reach before starting this loop, so `_anchored_chats`
+        # already reflects every granted chat -- including one discovered in
+        # a PRIOR life and never finished anchoring. The home checkpoint
+        # existing on disk is what means "not the first life"; read once,
+        # here, before anything below can change it.
         first_install = not self._anchored_chats.get(self.home_chat_uid)
-        while True:
-            try:
-                async with aiohttp.ClientSession() as http:
-                    if not first_connection:
-                        await self._refresh_reach(http)
-                    # Mint immediately before connecting: the ticket lives 60s
-                    # and is single-use, and revocation is re-checked at
-                    # consume, so a cached one is a 4401 close.
-                    async with http.post(f"{BASE}/v1/ws/ticket",
-                                         json={},
-                                         headers=self.auth) as resp:
-                        _auth_raise_for_status(resp)
-                        ticket = (await resp.json(content_type=None))["ticket"]
-                    # ONE gate decides newest vs empty for every chat this
-                    # agent ever anchors: `first_connection and first_install`
-                    # -- this process's first connect, AND this agent's
-                    # genuine first-ever life. Snapshotted and
-                    # `first_connection` consumed BEFORE the loop below, not
-                    # after: a genuine first install can anchor several
-                    # chats, and `_ensure_anchor` raises on a checkpoint-write
-                    # failure partway through -- a real turn can then land
-                    # server-side in the 5s before `_listen` retries. Reading
-                    # `first_connection` again on that retry would still see
-                    # it true and newest-anchor the chats this attempt never
-                    # reached. Consumed here, a retry always anchors empty
-                    # instead, same as every other case (see `_ensure_anchor`
-                    # for why empty is always the safe default).
-                    newest_anchor = first_connection and first_install
-                    first_connection = False
-                    # `http` only when newest_anchor: `_ensure_anchor` reads
-                    # the newest uid itself, under its own lock, so a
-                    # concurrent empty anchor for the same chat_uid (a
-                    # `start_group_thread` call racing this very first
-                    # connect) can never land between a read taken here and
-                    # a write made there. Before the socket either way,
-                    # never inside it -- reading after `ws_connect` races
-                    # the frames that connection is already buffering.
+
+        async def session(http):
+            nonlocal first_connection
+            global _live
+            if not first_connection:
+                await self._refresh_reach(http)
+            ticket = await _ticket(http, self.auth)
+            # ONE gate decides newest vs empty for every chat this agent ever
+            # anchors: this process's first connect AND this agent's genuine
+            # first-ever life. Snapshotted and `first_connection` consumed
+            # BEFORE the loop: `_ensure_anchor` raises on a checkpoint-write
+            # failure partway through, and a retry must anchor the chats
+            # this attempt never reached empty, never newest.
+            newest_anchor = first_connection and first_install
+            first_connection = False
+            # `http` only when newest_anchor: `_ensure_anchor` reads the
+            # newest uid itself, under its own lock. Before the socket,
+            # never inside it -- reading after `ws_connect` races the frames
+            # that connection is already buffering.
+            for chat_uid in self.chat_uids:
+                await self._ensure_anchor(chat_uid, http if newest_anchor else None)
+            # Published only now, after every chat known at this connect has
+            # been through the anchor decision -- never in `connect`, where
+            # publishing let a tool call's bridged coroutine reach
+            # `_ensure_anchor` before this task had run. Cleared in
+            # `disconnect` and after `_serve` returns.
+            _live = (self, asyncio.get_running_loop())
+            async with _socket(http, ticket) as ws:
+                self._mark_connected()
+                log.info("[plow_chat] websocket connected")
+                try:
                     for chat_uid in self.chat_uids:
-                        await self._ensure_anchor(chat_uid, http if newest_anchor else None)
-                    # Published only now, after every chat known at this
-                    # connect has been through the anchor decision above --
-                    # never in `connect`, where publishing let the
-                    # synchronous tool handler's bridged call reach
-                    # `_ensure_anchor` before this task had even run,
-                    # racing (and potentially winning) the newest-vs-empty
-                    # decision for a chat this pass was about to
-                    # newest-anchor. Republishing the same tuple on every
-                    # reconnect is harmless -- this task's own loop, same
-                    # adapter, same event loop for its whole life. Cleared
-                    # in `disconnect` and in the auth-terminal branch below.
-                    _live = (self, asyncio.get_running_loop())
-                    url = f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}"
-                    async with http.ws_connect(url, heartbeat=30) as ws:
-                        self._mark_connected()
-                        log.info("[plow_chat] websocket connected")
-                        try:
-                            for chat_uid in self.chat_uids:
-                                await self._backfill(http, chat_uid)
-                            # Armed only now. A resumed goal's first attempt has
-                            # no backoff, and each wake waits out its own chat's
-                            # backlog before acting, so it cannot run ahead of an
-                            # offline `/goal clear` still sitting in the queue.
-                            self._goal_arm_wakes()
-                            async for frame in ws:
-                                if frame.type == aiohttp.WSMsgType.TEXT:
-                                    await self._on_frame(frame.json(), http)
-                        finally:
-                            # Paced work does not outlive the session that can
-                            # deliver instructions to stop it.
-                            self._goal_pause_wakes()
-            except _PlowAuthError:
-                # Revocation is terminal: every retry presents the same dead
-                # credential. Observed on the str agent 2026-08-27 -- one
-                # WARNING a minute, the line dead, the adapter reporting itself
-                # connected. State first, then the tool handle: a confirmed
-                # group send against a retired credential must refuse, not
-                # invoke this adapter. (Re-port of #17 onto this structure.)
-                log.error("[plow_chat] credential refused (401) -- stopping the "
-                          "listen loop; re-credential this agent")
-                self._mark_disconnected()
-                if _live is not None and _live[0] is self:
-                    _live = None
-                return
-            except Exception as exc:         # noqa: BLE001 - reconnect, never die
-                # TYPE only: the ticket is a query parameter, so a non-101
-                # handshake raises an exception carrying the whole URL, and
-                # that ticket is still live.
-                log.warning("[plow_chat] websocket error: %s", type(exc).__name__)
-                self._mark_disconnected()
-            await asyncio.sleep(5)
+                        await self._backfill(http, chat_uid)
+                    # Armed only now: each wake waits out its own chat's
+                    # backlog, so it cannot run ahead of an offline `/goal
+                    # clear` still sitting in the queue.
+                    self._goal_arm_wakes()
+                    async for frame in ws:
+                        if frame.type == aiohttp.WSMsgType.TEXT:
+                            await self._on_frame(frame.json(), http)
+                finally:
+                    # Paced work does not outlive the session that can
+                    # deliver instructions to stop it.
+                    self._goal_pause_wakes()
+
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        # Terminal. State first (`_serve` marked us disconnected), then the
+        # tool handle: a confirmed group send against a retired credential
+        # must refuse, not invoke this adapter. (Re-port of #17.)
+        global _live
+        if _live is not None and _live[0] is self:
+            _live = None
 
     async def _on_frame(self, frame, http=None):
         if frame.get("type") == "connected":

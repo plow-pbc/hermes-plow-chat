@@ -63,3 +63,44 @@ async def _read_identity(http, auth):
             return None
         _auth_raise_for_status(resp)
         raise RuntimeError(f"the identity read returned HTTP {resp.status}")
+
+
+async def _ticket(http, auth):
+    """Mint immediately before connecting: the ticket lives 60s and is
+    single-use, and revocation is re-checked at consume, so a cached one is a
+    4401 close."""
+    async with http.post(f"{BASE}/v1/ws/ticket", json={}, headers=auth) as resp:
+        _auth_raise_for_status(resp)
+        return (await resp.json(content_type=None))["ticket"]
+
+
+def _socket(http, ticket):
+    return http.ws_connect(f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}", heartbeat=30)
+
+
+async def _serve(session, on_drop, tag):
+    """The reconnect loop both platforms run.
+
+    `session(http)` is one connection attempt -- read reach, mint, connect,
+    consume frames until the socket closes or raises. Returns only on a
+    revoked credential: every retry would present the same dead token
+    (observed on the str agent 2026-08-27 -- one WARNING a minute, the line
+    dead, the adapter reporting itself connected). `on_drop` marks the
+    adapter disconnected on either exit.
+    """
+    while True:
+        try:
+            async with aiohttp.ClientSession() as http:
+                await session(http)
+        except _PlowAuthError:
+            log.error("[%s] credential refused (401) -- stopping the listen loop; "
+                      "re-credential this agent", tag)
+            on_drop()
+            return
+        except Exception as exc:              # noqa: BLE001 - reconnect, never die
+            # TYPE only: the ticket is a query parameter, so a non-101
+            # handshake raises an exception carrying the whole URL, and
+            # that ticket is still live.
+            log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
+            on_drop()
+        await asyncio.sleep(RECONNECT_SECONDS)
