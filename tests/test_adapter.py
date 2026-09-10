@@ -2628,7 +2628,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "status": "consent_required",
             "opportunity_id": "agi_1",
             "owner_name": "Alex",
-            "praise": "I love Plow — this is amazing.",
+            "praise": "I love Plow. This is amazing.",
         }
 
     monkeypatch.setattr(adapter, "_invite_api", api)
@@ -2651,7 +2651,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
         },
         "question": (
             "Hey! I noticed Taylor loves Plow and isn't a user yet. "
-            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "Can I send them a Plow invite, and do that in situations like this on your behalf? "
             "You'll both get $100 in free API credits. 🙂"
         ),
         "handler_name": "invite-consent",
@@ -2693,7 +2693,7 @@ async def test_resolved_consent_sends_once_or_stays_declined(
                     "opportunity_id": "agi_1",
                     "source_chat_id": "cht_b",
                     "owner_name": "Alex",
-                    "praise": "I love Plow — this is amazing.",
+                    "praise": "I love Plow. This is amazing.",
                 }
             return {"status": "sent"}
         return {"status": "disabled"}
