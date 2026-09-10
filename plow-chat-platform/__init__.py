@@ -3958,6 +3958,32 @@ async def _handle_invite_consent(question, response):
     return DeferredQuestionResult.done("Got it — I won’t offer Plow invites on your behalf.")
 
 
+# Plow's one 424 provider outcome that must not be retried: the send was
+# accepted but its persistence is unknown, so the code may already have reached
+# the invitee (`MESSAGE_SEND_ERROR_RESPONSES` says so in as many words).
+_ACCEPTED_UNCONFIRMED = "provider_accepted_persistence_unknown"
+
+
+def _invite_retry_safe(exc):
+    """Whether Plow left this failure in a state a later call can re-send from.
+
+    Only its 424 ever says so, and only in the body: `send_opportunity` reopens
+    the opportunity for every provider outcome except `_ACCEPTED_UNCONFIRMED`,
+    where the code may already have landed -- so that one stays closed, and
+    calling again would mint a second live invite for the same person. The
+    status alone cannot separate the two, which is what made an earlier
+    `status == 424` test wrong. A 5xx never says anything either: it can arrive
+    after Plow committed, the same "may have landed" position.
+    """
+    if exc.status != 424:
+        return False
+    try:
+        details = (json.loads(exc.detail).get("error") or {}).get("details") or {}
+    except (ValueError, AttributeError):
+        return False
+    return details.get("provider_error_code") != _ACCEPTED_UNCONFIRMED
+
+
 def _plow_offer_invite(args, **_kwargs):
     """Bridge the fixed invite workflow to the live adapter's loop."""
     if args:
@@ -3977,27 +4003,31 @@ def _plow_offer_invite(args, **_kwargs):
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
     except _PlowSendError as exc:
-        # A 5xx says as little about delivery as a timeout does, and a 424 is
-        # the messaging provider rejecting the send: Plow reopens the
-        # opportunity to `ready` before re-raising, so a later call re-mints and
-        # re-sends. Every other 4xx is Plow itself refusing -- nothing was sent,
-        # and every retry presents the same refusal. Say what was refused: the
-        # unconfirmed wording sent the model looking for a way around it, and
-        # quoting the public signup phrase is the way around it.
-        if exc.status >= 500 or exc.status == 424:
+        # Three outcomes, and the status settles only the first. A plain 4xx is
+        # Plow refusing: nothing was sent, every retry meets the same refusal,
+        # and naming what was refused is what stops the model improvising a
+        # route around it. Past that the question is whether the invite is
+        # re-sendable, which only the body answers.
+        if exc.status < 500 and exc.status != 424:
+            return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+        if _invite_retry_safe(exc):
             return json.dumps({
                 "success": False,
-                "delivery_unknown": True,
-                "error": f"could not confirm the invite workflow ({exc.status}); it may or may not "
-                         "have completed; retrying is safe",
+                "error": f"the invite did not send ({exc.status}); Plow reopened it, so calling "
+                         "again on a later turn re-sends it",
             })
-        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
-    except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
         return json.dumps({
             "success": False,
             "delivery_unknown": True,
-            "error": f"could not confirm the invite workflow ({type(exc).__name__}); it may or may not "
-                     "have completed; retrying is safe",
+            "error": f"could not confirm the invite ({exc.status}); it may already have reached "
+                     "them, so do NOT call again",
+        })
+    except Exception as exc:  # noqa: BLE001 - an unconfirmed delivery is not a failure to retry
+        return json.dumps({
+            "success": False,
+            "delivery_unknown": True,
+            "error": f"could not confirm the invite ({type(exc).__name__}); it may already have "
+                     "reached them, so do NOT call again",
         })
     return json.dumps({"success": True, **result})
 

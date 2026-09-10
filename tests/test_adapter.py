@@ -2628,32 +2628,46 @@ def test_invite_owner_notification_refuses_wrong_context(
     assert error.lower() in out["error"].lower()
 
 
+# Plow's 424 body names the provider outcome; only `send_opportunity`'s
+# accepted-but-unpersisted case leaves the invite possibly-delivered.
+_REJECTED_424 = json.dumps({"error": {"details": {"provider_error_code": "rejected"}}})
+_UNCONFIRMED_424 = json.dumps(
+    {"error": {"details": {"provider_error_code": "provider_accepted_persistence_unknown"}}}
+)
+
+
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "detail", "expected", "may_call_again"),
     [
-        pytest.param(None, "may or may not", id="unconfirmed"),
-        pytest.param(503, "may or may not", id="5xx-unconfirmed"),
-        pytest.param(424, "may or may not", id="424-reopened-for-retry"),
-        pytest.param(429, "Plow declined (429)", id="4xx-declined"),
+        pytest.param(None, None, "may already have reached", False, id="non-http-unconfirmed"),
+        pytest.param(503, "{}", "may already have reached", False, id="5xx-unconfirmed"),
+        pytest.param(424, _UNCONFIRMED_424, "may already have reached", False, id="424-accepted-unconfirmed"),
+        pytest.param(424, _REJECTED_424, "Plow reopened it", True, id="424-rejected-reopened"),
+        pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-unconfirmed"),
+        pytest.param(429, '{"error":{"message":"agent invite cap reached"}}', "Plow declined (429)", False, id="4xx-declined"),
     ],
 )
 def test_invite_workflow_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     status: int | None,
+    detail: str | None,
     expected: str,
+    may_call_again: bool,
 ) -> None:
-    """A 4xx is Plow itself declining -- the daily invite cap, consent withdrawn
-    -- and it is terminal: nothing was sent and every retry presents the same
-    refusal, so the model must be told what was refused rather than that
-    retrying is safe. The exception is 424, the messaging provider rejecting
-    the send: Plow reopens the opportunity to `ready` before re-raising, so a
-    later call re-mints and re-sends. A timeout or a 5xx says nothing about
-    whether the invite landed, so those keep the unconfirmed wording too."""
+    """Three outcomes, and the status alone settles only the refusal.
+
+    A plain 4xx is Plow refusing: terminal, and the model is told what was
+    refused so it stops improvising a route around it. Past that, whether the
+    invite is re-sendable lives in the 424 body -- Plow reopens the opportunity
+    for every provider outcome but `provider_accepted_persistence_unknown`,
+    where the code may already have reached the invitee. Anything that may have
+    landed (that case, a 5xx, a timeout) must not invite another call, or the
+    same person gets a second live invite. An undecodable body is treated as
+    the unsafe side."""
     module = _load(monkeypatch, tmp_path)
     raises = (RuntimeError("HTTP 503") if status is None
-              else module._PlowSendError(status, '{"detail":"agent invite cap reached"}'
-                                         if status == 429 else '{"detail":"send failed"}'))
+              else module._PlowSendError(status, detail))
     _live_tool(module, monkeypatch, "offer_invite", raises=raises)
     module._ACTIVE_TURN.set(_invite_turn())
 
@@ -2661,10 +2675,12 @@ def test_invite_workflow_reports_delivery_failure(
 
     assert out["success"] is False
     assert expected in out["error"]
-    terminal = status == 429
-    assert out.get("delivery_unknown", False) is not terminal
-    assert ("retrying is safe" in out["error"]) is not terminal
-    assert "do not retry" not in out["error"].lower()
+    # Only a re-sendable failure may advertise another call; everything that
+    # might already have landed says the opposite, in as many words.
+    assert ("calling again" in out["error"]) is may_call_again
+    assert ("do NOT call again" in out["error"]) is (status != 429 and not may_call_again)
+    # `delivery_unknown` marks may-have-landed only -- not a refusal, not a reopen.
+    assert out.get("delivery_unknown", False) is (status != 429 and not may_call_again)
 
 
 @pytest.mark.parametrize(

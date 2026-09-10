@@ -62,10 +62,16 @@ Never loop on the tool within this turn, and never substitute the public
 signup phrase or any other route -- the invite is the only path that carries
 the referral, so an invite that failed is not an invitation to improvise one.
 
-`delivery_unknown` means the server could not confirm the outcome: say nothing
-in either thread, since the invite may already have landed. The workflow is
-replay-safe, so you may call `plow_offer_invite` again on a later user turn.
+Read the receipt; it says which of three happened.
 
-`Plow declined (<status>)` is terminal -- nothing was sent, and calling again
+`delivery_unknown` -- the server could not confirm the outcome. The invite may
+already have reached them, so say nothing in either thread and do NOT call
+again: a second call would mint a second live invite for the same person.
+
+`Plow reopened it` -- the send definitively did not happen and Plow left the
+invite re-sendable. Say nothing now; you may call `plow_offer_invite` again on
+a later qualifying turn.
+
+`Plow declined (<status>)` -- terminal. Nothing was sent, and calling again
 gets the same answer. Tell them briefly and plainly why, in your own words,
 and leave it there.
