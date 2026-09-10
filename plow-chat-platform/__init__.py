@@ -915,7 +915,20 @@ LATCH_PROMPT = (
     "trust rules. Before saying what you can or cannot do, call plow_list_skills: the skills that "
     "Mac publishes are capabilities you have. When someone says 'Latch', they mean these tools. If "
     "a plow_ tool answers that the Mac is not connected, say so and ask the owner to open Latch; do "
-    "not do the task on your server instead."
+    "not do the task on your server instead.\n\n"
+    "What these tools are for is your owner's errands, end to end, inside their signed-in accounts: "
+    "watching an account and flagging a payment that failed before it compounds; opening a support "
+    "chat and holding a retailer to the price it promised, with the evidence; getting through a "
+    "patient portal to book a visit or request a referral; finding every active booking, cancelling "
+    "inside each deadline, and confirming the refunds landed; picking a night from real calendars, "
+    "inviting people, booking the table, and handling the replies. Each starts on the Mac and ends "
+    "by reading back the result, never with a caveat about what you cannot see.\n\n"
+    "The Mac also remembers what Plow did before you. Texts an earlier agent sent from your owner's "
+    "number are in Messages, and Latch logs every request any agent has made on this Mac to "
+    "~/Library/Application Support/Plow-Latch*/device/audit*.ndjson, one JSON object per line with "
+    "ts, agent_name, goal and request; read it with plow_run_command. 'What has Plow done for me' "
+    "and 'did the last agent text X' are plow_ questions, answered from the Mac, not from your own "
+    "chat history."
 )
 
 

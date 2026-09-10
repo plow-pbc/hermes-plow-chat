@@ -5600,7 +5600,12 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
     for must in ("Latch", "plow_list_skills", "plow_", "not connected",
-                 "plow_list_chats", "plow_send_message", "Messages app"):
+                 "plow_list_chats", "plow_send_message", "Messages app",
+                 # What the tools are for, in jobs rather than tool names, and
+                 # that earlier agents' work persists on the Mac: an agent that
+                 # knew only the possessive rule searched its own sessions for
+                 # "did Plow do X for me" and declared it out of reach.
+                 "end to end", "audit*.ndjson", "not from your own chat history"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
