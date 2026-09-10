@@ -214,3 +214,17 @@ def _owner_fact(owner):
         return f"Your owner is {name} [{handle}]."
     return (f"Your owner [{handle}] has not given their name yet: ask once and record it with "
             f"plow_name_contact(handle={handle}). {_NEVER_GUESS}")
+
+
+def _provider(chat):
+    # Absent until plow serves it on every chat (design §1); an absent key is
+    # the phone line, which is every chat there is until then.
+    return chat.get("provider", "linq")
+
+
+def _split(listing, provider):
+    """The chats this platform serves, and the uids on the same grant it does
+    not: those ride the same socket, and a frame for one is neither unknown
+    (no reach refresh) nor outside the grant (no warning)."""
+    served = {chat["uid"]: chat for chat in listing if _provider(chat) == provider}
+    return served, frozenset(chat["uid"] for chat in listing) - served.keys()

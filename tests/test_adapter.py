@@ -329,7 +329,7 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
                              "provider_key": "+15550000002"})
     return {"uid": uid, "display_name": name, "participants": participants,
-            "trusted": trusted, "status": status}
+            "trusted": trusted, "status": status, "provider": "linq"}
 
 
 def _voiced(module: Any, prompt: str) -> str:
@@ -391,6 +391,7 @@ def _peer_envelope(event_id: str, chat_id: str, message_id: str) -> dict[str, An
 def _collaboration_chat() -> dict[str, Any]:
     return {
         "uid": "cht_a",
+        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
@@ -416,6 +417,7 @@ def _dm_chat() -> dict[str, Any]:
     """A 1:1 DM as the server actually lists it: the owner and us, no peer."""
     return {
         "uid": "cht_a",
+        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
@@ -1916,6 +1918,48 @@ async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
             await adapter._refresh_reach(_ReachAndMeHTTP())
 
     assert adapter._identity == {"signup": SIGNUP, "number": NUMBER}
+
+
+async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An email thread is a chat on the same grant (design §1), listed by the
+    same `GET /v1/chats` and carried by the same socket. It must never render
+    as an SMS room: reach, the send guard, the tool listing and the alias
+    registry see only `linq` chats, and a frame for a `gmail` chat is dropped
+    without the reach refresh an unknown chat costs and without the warning
+    an out-of-grant chat earns -- it is neither."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    mail = _chat("cht_mail", name="Re: invoice", group=True) | {"provider": "gmail"}
+    listing = {"object": "list", "has_more": False, "data": [_chat("cht_a"), mail]}
+
+    class _GrantHTTP:
+        def __init__(self) -> None:
+            self.gets = 0
+
+        def get(self, url: str, **kwargs: Any) -> _Resp:
+            self.gets += 1
+            return _Resp(listing if url.endswith("/v1/chats") else {}, status=200 if url.endswith("/v1/chats") else 404)
+
+    http = _GrantHTTP()
+    await adapter._refresh_reach(http)
+    assert adapter.chat_uids == frozenset({"cht_a"})
+    assert adapter._send_guard("cht_mail") is not None, "an email thread is not a room to send to"
+    assert adapter._foreign == frozenset({"cht_mail"})
+
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _ChatResourceHTTP(_Resp(listing)))
+    assert [chat["chat_id"] for chat in await adapter.list_chats()] == ["cht_a"]
+
+    _mark_anchored(adapter, "cht_a")
+    handled = _capture_events(monkeypatch, adapter)
+    reads_before = http.gets
+    with caplog.at_level(logging.WARNING):
+        await adapter._on_frame(_envelope("evt_mail", "cht_mail", "msg_mail"), http)
+    await _settle(adapter)
+    assert handled == [], "the email line's turn is plow_email's, never plow_chat's"
+    assert http.gets == reads_before, "a known-foreign chat costs no reach refresh"
+    assert "outside the grant" not in caplog.text
 
 
 class _SocketHTTP(_HTTP):

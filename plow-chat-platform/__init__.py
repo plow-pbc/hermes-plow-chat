@@ -60,6 +60,7 @@ from ._transport import (
     _self_agent_line,
     _serve,
     _socket,
+    _split,
     _ticket,
 )
 
@@ -85,6 +86,7 @@ _WORKING_PREFIX = "⏳ Working —"
 _NO_REPLY_PREFIX = "⚠️ No reply: "
 _DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
+PROVIDER = "linq"                     # the phone line; the email line is plow_email's (design §4)
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -1039,6 +1041,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
+        self._foreign = frozenset()          # granted uids another platform serves
         self._chats = {
             self.home_chat_uid: {
                 "uid": self.home_chat_uid,
@@ -1130,7 +1133,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             self._typing_until_reply(chat_uid, initial_delay=initial_delay))
 
     def _set_reach(self, chats):
-        next_chats = {chat["uid"]: chat for chat in chats}
+        next_chats, foreign = _split(chats, PROVIDER)
         if not next_chats:
             raise RuntimeError("the credential grant has no live chats")
         # The home is where cron and default output land. A fallback to "some
@@ -1147,6 +1150,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self.home_chat_uid = next_home
         self._chats = next_chats
         self.chat_uids = frozenset(next_chats)
+        self._foreign = foreign
         self._anchored_chats = {
             chat_uid: self._checkpoint_path(chat_uid).exists()
             for chat_uid in self.chat_uids
@@ -2423,7 +2427,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # never been status-filtered, and narrowing it here would quietly
         # unsubscribe the pending rooms this tool merely declines to advertise.
         self._set_reach(body["data"])
-        return listed
+        return [chat for chat in listed if chat["chat_id"] in self.chat_uids]
 
     async def _typing_until_reply(self, chat_uid, initial_delay=0.0):
         """Hold the typing indicator for as long as the turn takes.
@@ -2656,25 +2660,20 @@ class PlowChatAdapter(BasePlatformAdapter):
         if frame.get("type") == "connected":
             return
         chat_uid = frame["chat_id"]
-        if chat_uid not in self.chat_uids:
-            # A chat this agent has never seen -- one born after connect, or
-            # a `message_received` for one never seen. One refresh re-reads
-            # the grant's reach, ahead of the event_type gate below: a
-            # chat_created frame has no message to deliver, but still needs
-            # the reach update. A refresh failure propagates to `_listen`'s
-            # existing reconnect seam -- the same recovery already in place
-            # for a dropped socket, not a second one.
-            #
-            # No anchor call here: baselining a chat discovered mid-connection
-            # is `_listen`'s per-connect loop's job now, not this call's --
-            # see its comment for why that is the one place newest-vs-empty
-            # gets decided. Until that next connect, delivery below does not
-            # need one (the queue does not check `_anchored_chats`), and a
-            # message that lands acks its own real baseline via `_deliver`.
+        if chat_uid not in self.chat_uids and chat_uid not in self._foreign:
+            # A chat this agent has never seen -- one born after connect. One
+            # refresh re-reads the grant's reach, ahead of the event_type gate
+            # below: a chat_created frame has no message to deliver, but still
+            # needs the reach update. A refresh failure propagates to
+            # `_listen`'s reconnect seam. No anchor call here: baselining a
+            # chat discovered mid-connection is `_listen`'s per-connect loop's
+            # job, and a message that lands acks its own baseline in `_deliver`.
             await self._refresh_reach(http)
-            if chat_uid not in self.chat_uids:
-                log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
-                return
+        if chat_uid in self._foreign:
+            return                           # the email line's thread; plow_email's turn
+        if chat_uid not in self.chat_uids:
+            log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)
+            return
         if frame["event_type"] != "message_received":
             return
         event_id = frame["event_id"]
