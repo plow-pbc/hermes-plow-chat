@@ -104,3 +104,113 @@ async def _serve(session, on_drop, tag):
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
             on_drop()
         await asyncio.sleep(RECONNECT_SECONDS)
+
+
+def _one_line(text):
+    """A person-supplied name, made safe to interpolate.
+
+    Whitespace collapses to single spaces -- a newline in a name opens a line
+    that reads like a fresh instruction, which matters most where the name
+    lands in system authority -- and the result is capped, so no one name can
+    crowd out the prompt it sits in. Empty is empty; each caller owns its own
+    fallback.
+    """
+    return " ".join(str(text or "").split())[:100]
+
+
+def _participant_identity(participant):
+    """Choose a one-line server identity: meaningful name, then full handle."""
+    handle = str(participant.get("provider_key") or "").strip()
+    display = _one_line(participant.get("display_name"))
+    return display if display and display != handle else handle
+
+
+def _self_agent_line(chat):
+    """The self agent participant's line dict, {} when the roster lacks one."""
+    agent = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "agent"
+                  and p.get("relationship") in (None, "self")), {})
+    return agent.get("line") or {}
+
+
+def _agent_name(chat):
+    """The line's persona name ("Elm"), or None for an unnamed line.
+
+    Read from the chat's own agent participant, so the DB stays the single
+    identity source and a rename needs no reprovision — it lands at the next
+    reach refresh (reconnect or group-send adoption), which is deliberate: a
+    rename is a rare coordinated ops event (it ships a new vCard too), not
+    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
+    of the listing readers: a pre-persona server omits `line`, and an unnamed
+    line omits `display_name`.
+    """
+    return _self_agent_line(chat).get("display_name") or None
+
+
+def _represented_member(chat, agent):
+    uid = agent.get("represents_participant_uid")
+    return next((p for p in chat.get("participants") or []
+                 if p.get("type") == "member" and p.get("uid") == uid), None)
+
+
+def _is_solo_dm(chat):
+    """A 1:1 thread: one human, and no peer agent to collaborate with.
+
+    The gate for the roster prefix. NOT "has no peer" on its own -- a
+    human-only group has several people who can speak and a current speaker
+    the model needs to tell apart, even with no other agent in the room.
+    """
+    participants = chat.get("participants") or []
+    if any(p.get("type") == "agent" and p.get("relationship") == "peer" for p in participants):
+        return False
+    return sum(1 for p in participants if p.get("type") == "member") <= 1
+
+
+def _chat_type(chat):
+    """`_is_solo_dm` is the one answer to "is anyone else in this room?", and
+    it counts a peer agent as somebody. Counting humans alone called a room
+    holding one human and another household's agent a DM, which handed its
+    scheduled wake owner authority over peer-written content."""
+    return "dm" if _is_solo_dm(chat) else "group"
+
+
+def _owner_identity(chat):
+    """The owner's name and handle, off the chat every owner turn refreshes.
+
+    The chat resource carries its owner as a participant -- name, handle and
+    role -- in a solo DM as much as a group, even though a DM renders no roster
+    BLOCK. So there is nothing to fetch: the turn already re-read the one
+    resource that answers this, and a name the owner changes lands on their
+    very next turn with no cache and no second request.
+
+    No default on the `next`: `role == "owner"` is how this turn was chosen in
+    the first place, so a chat that then has no owner participant is a broken
+    contract, not a case to render around.
+    """
+    owner = next(p for p in chat.get("participants") or []
+                 if p.get("type") == "member" and p.get("role") == "owner")
+    # `_participant_identity` already answers "named, or still a bare handle?"
+    # -- it hands back the handle itself when there is no meaningful name.
+    handle = _one_line(owner.get("provider_key"))
+    name = _participant_identity(owner)
+    return (None if name == handle else name, handle)
+
+
+_NEVER_GUESS = "Never guess a name from mail, calendar, or memory."
+
+
+def _owner_fact(owner):
+    """What an owner turn is told about its own owner.
+
+    A roster block reaches the model on an inbound burst and nowhere else, so
+    the owner's own DM -- the room onboarding actually happens in -- and every
+    goal wake have no source at all for who their owner is. _NAME_FACT does not
+    reach them either: it is gated on there being a roster to read. This is
+    that source, and when the name is still missing it carries the ask, with
+    the handle already filled in so there is nothing left to guess.
+    """
+    name, handle = owner
+    if name:
+        return f"Your owner is {name} [{handle}]."
+    return (f"Your owner [{handle}] has not given their name yet: ask once and record it with "
+            f"plow_name_contact(handle={handle}). {_NEVER_GUESS}")
