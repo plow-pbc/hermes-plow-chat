@@ -3,7 +3,7 @@
 """Hermes platform adapter for Plow Chat.
 
 Receives granted-scope WSS events and sends replies through the chat REST API.
-The transport itself -- credential, socket, reach -- is `_transport.py`, shared with the email platform.
+The transport itself -- credential, socket, reach -- is `_transport.py`, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
@@ -1136,7 +1136,7 @@ class PlowChatAdapter(BasePlatformAdapter):
     def _set_reach(self, chats):
         next_chats, foreign = _split(chats, PROVIDER)
         if not next_chats:
-            raise RuntimeError("the credential grant has no live chats")
+            raise RuntimeError("the credential grant has no live phone-line chats")
         # The home is where cron and default output land. A fallback to "some
         # granted room" pointed the owner's private deliveries at whichever
         # chat the API listed first -- refuse instead; _listen retries, and the
@@ -2398,9 +2398,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         A live read of the same `GET /v1/chats` that feeds reach, not the
         cached copy: reach is refreshed at connect, reconnect and group
         adoption only, so a room retitled or joined mid-connection is stale
-        there and current here. The grant is the scope for WHICH rooms appear
-        -- the credential cannot see a chat it does not hold -- so no
-        narrowing is done on that axis.
+        there and current here. The grant decides which rooms the credential
+        can see; the listing then narrows that to the phone line's own chats
+        (`provider == "linq"`), excluding chats of another provider on the
+        same grant.
 
         Status is the one narrowing, because the listing exists to source a
         `cht_` id for `plow_send_message`. `/v1/chats` excludes only `failed`,

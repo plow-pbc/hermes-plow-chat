@@ -1,9 +1,9 @@
 # Copyright 2026 The Plow Collective, Inc
 # SPDX-License-Identifier: Apache-2.0
-"""What both Plow platforms share: the API base and credential, the granted
-socket and its reconnect loop, the reach and identity reads, and the roster
-readers. Policy -- roster prose, trust, disclosure, tools -- stays with the
-platform that owns it (plow-pbc/hermes-plugin-plow#109).
+"""The transport the chat adapter runs -- the API base and credential, the
+granted socket and its reconnect loop, the reach and identity reads, and the
+roster readers -- written to be shared with the email platform tracked in
+plow-pbc/hermes-plugin-plow#109. Policy stays with the platform that owns it.
 """
 import asyncio
 import logging
@@ -79,7 +79,8 @@ def _socket(http, ticket):
 
 
 async def _serve(session, on_drop, tag):
-    """The reconnect loop both platforms run.
+    """The reconnect loop the chat adapter runs, written to be shared with
+    the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 
     `session(http)` is one connection attempt -- read reach, mint, connect,
     consume frames until the socket closes or raises. Returns only on a
