@@ -252,3 +252,20 @@ _DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PRE
 # platforms set it in on_processing_start and clear it in
 # on_processing_complete; it lives here so both can.
 _ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
+
+
+def _is_chatter(turn, chat_id, metadata):
+    """Is this outbound text the model working out loud, or the turn's answer?
+
+    The turn boundary is the classifier: prose the model writes while a turn
+    is open, into that turn's own chat, is its working-out. Hermes marks the
+    turn-final reply `notify` -- the key telegram, discord, mattermost and a2a
+    already read for the same distinction -- and the scheduler marks a cron
+    delivery `job_id`. Everything an adapter itself sends (the greeting, a goal
+    notice, the send_message tool) runs turn-less or cross-chat, so it falls
+    out as not-chatter without needing to say so. Both platforms read an
+    outbound message this way; what they do with the verdict is theirs.
+    """
+    meta = metadata or {}
+    return (turn is not None and chat_id == turn["chat_uid"]
+            and not meta.get("notify") and "job_id" not in meta)

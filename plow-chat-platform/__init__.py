@@ -55,6 +55,7 @@ from ._transport import (
     _bearer,
     _chat_type,
     _granted_chats,
+    _is_chatter,
     _is_solo_dm,
     _one_line,
     _owner_fact,
@@ -1810,17 +1811,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
-        # The turn boundary is the classifier: prose the model writes while a
-        # turn is open, into that turn's own chat, is its working-out. Hermes
-        # marks the turn-final reply `notify` -- the key telegram, discord,
-        # mattermost and a2a already read for the same distinction -- and the
-        # scheduler marks a cron delivery `job_id`. Everything the adapter
-        # itself sends (the greeting, a goal notice, the send_message tool)
-        # runs turn-less or cross-chat, so it falls out as not-chatter
-        # without needing to say so.
-        meta = metadata or {}
-        chatter = (turn is not None and chat_id == turn["chat_uid"]
-                   and not meta.get("notify") and "job_id" not in meta)
+        chatter = _is_chatter(turn, chat_id, metadata)
         # Matched on text because Hermes gives these no metadata of their own:
         # the heartbeat and the memory notice arrive unmarked, and the
         # turn-stop explainer arrives `notify`-marked because Hermes

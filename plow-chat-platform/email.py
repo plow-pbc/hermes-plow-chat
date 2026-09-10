@@ -24,6 +24,7 @@ from ._transport import (
     _bearer,
     _chat_type,
     _granted_chats,
+    _is_chatter,
     _owner_fact,
     _owner_identity,
     _self_agent_line,
@@ -168,6 +169,27 @@ class PlowEmailAdapter(BasePlatformAdapter):
             message_id=msg["uid"],
             channel_prompt=channel_prompt,
         ))
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if chat_id not in self._chats:
+            return SendResult(success=False, error=f"Plow Email {chat_id!r} is not one of this line's threads")
+        turn, body = _ACTIVE_TURN.get(), content.strip()
+        if turn is not None and not turn["owner"] and chat_id != turn["chat_uid"]:
+            return SendResult(success=False, error=f"Plow Email member turn is confined to {turn['chat_uid']!r}")
+        # Every send here is an email, so the classifier's verdict is final:
+        # no verbose read and no owner-DM carve-out, unlike the phone line.
+        if _is_chatter(turn, chat_id, metadata) or body.startswith(_DIAGNOSTIC_PREFIXES):
+            log.info("[plow_email] dropped mid-turn text for %s", chat_id)
+            return SendResult(success=True)
+        # The chat send endpoint: plow dispatches on the chat's own provider
+        # (design §3), so an email leaves by the same door as a text.
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f"{BASE}/v1/chats/{chat_id}/messages",
+                                 json={"body": body}, headers=self.auth) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    return SendResult(success=False, error=f"Plow Email {resp.status}: {data}")
+        return SendResult(success=True, message_id=data.get("uid"))
 
     async def on_processing_start(self, event):
         # `dm` is False on purpose -- the Latch mail gate approves a plow-gog

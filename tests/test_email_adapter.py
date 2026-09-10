@@ -13,7 +13,6 @@ import sys
 import types
 from types import SimpleNamespace
 from typing import Any
-from unittest import mock
 
 import pytest
 
@@ -160,3 +159,42 @@ async def test_an_email_turn_confines_the_chat_tools_and_never_sends_from_the_ow
     assert gate["action"] == "block"
     await mail.on_processing_complete(event, None)
     assert module._ACTIVE_TURN.get() is None
+
+
+@pytest.mark.parametrize(
+    ("target", "turn", "metadata", "body", "posted", "success"),
+    [
+        pytest.param("cht_m", None, None, "Attached below.", True, True, id="turn-less"),
+        pytest.param("cht_m", ("cht_m", True), {"notify": True}, "Attached below.", True, True, id="the-answer"),
+        pytest.param("cht_m", None, {"job_id": "j1"}, "Weekly digest", True, True, id="cron"),
+        pytest.param("cht_m", ("cht_m", True), None, "Looking that up now.", False, True, id="mid-turn-prose"),
+        pytest.param("cht_m", None, {"notify": True}, "⏳ Working — still on it", False, True, id="diagnostic"),
+        pytest.param("cht_m", ("cht_m", False), {"notify": True}, "Here it is.", True, True, id="member-reply"),
+        pytest.param("cht_n", ("cht_m", False), {"notify": True}, "Here it is.", False, False, id="member-cross-thread"),
+        pytest.param("cht_a", None, {"notify": True}, "Hi", False, False, id="not-an-email-thread"),
+    ],
+)
+async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    target: str, turn: tuple[str, bool] | None, metadata: dict[str, Any] | None,
+    body: str, posted: bool, success: bool,
+) -> None:
+    """Every send here is an email, so only the turn's answer (`notify`), a
+    cron delivery (`job_id`) or a turn-less send goes out -- the model's
+    working-out and Hermes' own diagnostics never do, and there is no verbose
+    carve-out. The endpoint is the chat send; plow dispatches on the chat's
+    provider (design §3). A member's turn is confined to its own thread."""
+    module, _entry = _load_email(monkeypatch, tmp_path)
+    mail = _adapter(module)
+    mail._set_reach([_chat("cht_a"), _mail_chat("cht_m"), _mail_chat("cht_n")])
+    http = _HTTP()
+    monkeypatch.setattr(module.plow_email.aiohttp, "ClientSession", lambda *a, **k: http)
+    if turn:
+        module._ACTIVE_TURN.set({"chat_uid": turn[0], "owner": turn[1], "dm": False})
+
+    result = await mail.send(target, body, metadata=metadata)
+
+    assert result.success is success
+    assert http.posts == ([(f"{module.BASE}/v1/chats/{target}/messages", {"body": body})] if posted else [])
+    if posted:
+        assert result.message_id == "msg_sent"
