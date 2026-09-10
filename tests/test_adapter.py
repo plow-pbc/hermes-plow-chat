@@ -5478,18 +5478,11 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
-
-
-def test_latch_prompt_leaves_authorship_to_the_base_persona(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """The base persona (plow-hermes-agent image/seed/SOUL.md § Your own lines,
-    and your owner's accounts) owns the rule; a second copy here is a second
-    owner to drift."""
-    module = _load(monkeypatch, tmp_path)
-    assert "authorship as well as authority" not in module.LATCH_PROMPT
-    assert "plow_list_skills" in module.LATCH_PROMPT
+    # Owned by the base persona now (plow-hermes-agent image/seed/SOUL.md
+    # § Your own lines, and your owner's accounts) — a second copy here would
+    # be a second owner to drift.
+    for must_not in ("authorship as well as authority", "as yourself"):
+        assert must_not not in text
 
 
 def _stub_mirror(
