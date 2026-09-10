@@ -222,15 +222,15 @@ def _owner_fact(owner):
 
 
 def _provider(chat):
-    # Absent until plow serves it on every chat (plow-pbc/hermes-plugin-plow#109); an absent key is
-    # the phone line, which is every chat there is until then.
-    return chat.get("provider", "linq")
+    # Which line this chat is, off its own agent participant. Absent only on a
+    # plow that predates the field, where every chat is a phone chat anyway.
+    return _self_agent_line(chat).get("provider_type", "imessage")
 
 
 def _split(listing, provider):
     """The chats this platform serves, and the uids on the same grant it does
-    not: those ride the same socket, and a frame for one is neither unknown
-    (no reach refresh) nor outside the grant (no warning)."""
+    not: plow fans a frame to both platforms, so one for the other's chat is
+    neither unknown (no reach refresh) nor outside the grant (no warning)."""
     served = {chat["uid"]: chat for chat in listing if _provider(chat) == provider}
     return served, frozenset(chat["uid"] for chat in listing) - served.keys()
 

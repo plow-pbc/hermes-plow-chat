@@ -6,10 +6,11 @@ kind: platform
 version: 2.1.0
 description: >
   Plow gateway adapters for Hermes Agent. Registers two Hermes platforms on
-  one transport: plow_chat, the agent's phone line, and plow_email, the
-  agent's own email line. Both are backed by the Plow Chat REST API and a
-  granted-scope WebSocket stream: chat membership comes from the
-  credential's grants, not client-side configuration.
+  one credential: plow_chat, the agent's phone line, and plow_email, the
+  agent's own email line. Both are backed by the Plow Chat REST API and share
+  the transport helpers, each holding its own granted-scope WebSocket stream:
+  chat membership comes from the credential's grants, not client-side
+  configuration.
 author: Plow / Hermes Agent seed
 capabilities:
   - gateway.platform_actions

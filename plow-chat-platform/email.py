@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The agent's own email line as a Hermes platform.
 
-A Gmail thread is a Plow chat with provider `gmail`, on the same grant and
-the same socket as the phone line (design §1); this adapter serves those
-and nothing else. Its identity -- platform name, session namespace, the
-static hint -- is the registry entry `register` makes for it. Mail is
-addressed to the agent, so there is no approval gate and no roster policy:
-the agent writes as itself, from this line.
+A mail thread is a Plow chat whose line serves `provider_type: "email"`, on
+the same grant as the phone line and over the same transport helpers (design
+§1) -- but on this platform's own socket; this adapter serves those chats and
+nothing else. Its identity -- platform name, session namespace, the static
+hint -- is the registry entry `register` makes for it. Mail is addressed to
+the agent, so there is no approval gate and no roster policy: the agent
+writes as itself, from this line.
 """
 import asyncio
 import logging
@@ -35,7 +36,7 @@ from ._transport import (
 )
 
 PLATFORM_NAME = "plow_email"
-PROVIDER = "gmail"
+PROVIDER = "email"
 log = logging.getLogger(__name__)
 
 
@@ -56,8 +57,8 @@ class PlowEmailAdapter(BasePlatformAdapter):
         config.extra["group_sessions_per_user"] = False
         config.typing_indicator = False  # the base's 2s typing loop is a no-op on email
         self.auth = _bearer()
-        self.address = None                  # the line's address, off the first gmail chat
-        self._chats = {}                     # uid -> chat resource, gmail only
+        self.address = None                  # the line's address, off the first mail chat
+        self._chats = {}                     # uid -> chat resource, mail only
         self._foreign = frozenset()          # the phone line's uids on the same grant
         self._seen_events = []
         self._ws_task = None

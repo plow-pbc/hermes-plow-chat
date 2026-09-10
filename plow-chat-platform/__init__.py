@@ -81,7 +81,7 @@ LATCH_URL = "https://plow.co/latch"
 SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
 PLATFORM_NAME = "plow_chat"
-PROVIDER = "linq"                     # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
+PROVIDER = "imessage"                 # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -2383,8 +2383,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         adoption only, so a room retitled or joined mid-connection is stale
         there and current here. The grant decides which rooms the credential
         can see; the listing then narrows that to the phone line's own chats
-        (`provider == "linq"`), excluding chats of another provider on the
-        same grant.
+        (the line's `provider_type` is `imessage`), excluding chats on another
+        line of the same grant.
 
         Status is the other narrowing, because the listing exists to source a
         `cht_` id for `plow_send_message`. `/v1/chats` excludes only `failed`,

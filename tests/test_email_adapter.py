@@ -35,18 +35,19 @@ OWNER = ("Sam", "sam@example.com")
 
 
 def _mail_chat(uid: str, *, group: bool = False) -> dict[str, Any]:
-    """A gmail thread as the listing serves it (design §1): the line is the
+    """A mail thread as the listing serves it (design §1): the line is the
     email line, the owner is on it, and any other address is a member."""
     participants = [
         {"type": "agent", "relationship": "self",
-         "line": {"uid": "ln_mail", "provider_key": ADDRESS, "display_name": "Elm"}},
+         "line": {"uid": "ln_mail", "provider_key": ADDRESS, "display_name": "Elm",
+                  "provider_type": "email"}},
         {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner",
          "display_name": OWNER[0], "provider_key": OWNER[1]},
     ]
     if group:
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
                              "display_name": "Dana", "provider_key": "dana@example.com"})
-    return {"uid": uid, "provider": "gmail", "display_name": "Re: invoice",
+    return {"uid": uid, "display_name": "Re: invoice",
             "participants": participants, "trusted": False, "status": "active"}
 
 
@@ -70,7 +71,7 @@ async def test_reach_keeps_the_email_line_and_publishes_its_address_in_the_hint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """The hint is static per platform and the address is per agent, so the
-    entry is written in place the first time reach reveals a gmail chat.
+    entry is written in place the first time reach reveals a mail chat.
     Zero threads is the normal first state of a new line: reach holds
     empty, nothing is published, and the address-less hint stands -- no turn
     can arrive on this platform before a thread exists."""
@@ -104,12 +105,12 @@ async def test_reach_keeps_the_email_line_and_publishes_its_address_in_the_hint(
                      id="attachment-only"),
     ],
 )
-async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
+async def test_a_mail_thread_is_plow_emails_turn_and_never_plow_chats(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     caplog: pytest.LogCaptureFixture, group: bool, chat_type: str, role: str,
     body: str, attachments: list[dict[str, Any]] | None, expected_text: str,
 ) -> None:
-    """Both adapters hold the same grant and see the same frames. A gmail
+    """Both adapters hold the same grant and see the same frames. A mail
     frame is a plow_email turn -- platform, chat_type and chat_id are the
     three fields upstream's build_session_key (gateway/session.py:641) joins
     into `<ns>:plow_email:<chat_type>:<chat_uid>` -- and the phone line's
@@ -148,7 +149,9 @@ async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
     if attachments:
         assert "cht_m: attachment-only mail (1 attachment(s))" in caplog.text
 
-    mail._set_reach([{**_mail_chat("cht_x"), "participants": []}])
+    ownerless = _mail_chat("cht_x")
+    del ownerless["participants"][1:]        # the email line stays; the owner is gone
+    mail._set_reach([ownerless])
     with pytest.raises(RuntimeError, match="cht_x has no owner participant"):
         await mail._on_frame(_envelope("evt_3", "cht_x", "msg_3"), None)
     # `_serve` logs the TYPE only -- an aiohttp handshake error stringifies a

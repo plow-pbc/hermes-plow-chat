@@ -105,7 +105,7 @@ URL in git.
 | var | required | meaning |
 |---|---|---|
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
-| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (provider `linq`). Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (the line's `provider_type` is `imessage`). Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
@@ -184,10 +184,11 @@ comes from the message frame; no parent-message lookup is made.
 ### The email line (`plow_email`)
 
 The agent's `@plow.co` address is its own Hermes platform, registered by this
-same plugin on the same credential and socket. Plow stores each Gmail thread
-as a chat with provider `gmail`; this adapter serves those and the phone-line
-adapter serves the `linq` ones, so a mail never renders as an SMS room and a
-text never renders as an email. Sessions are keyed
+same plugin on the same credential and the same transport helpers, each
+platform holding its own socket. Every chat resource names its line's
+`provider_type`; this adapter serves the `email` ones and the phone-line
+adapter serves the `imessage` ones, so a mail never renders as an SMS room
+and a text never renders as an email. Sessions are keyed
 `plow_email:<dm|group>:<cht_id>`; the platform hint names the line's
 address, read off the thread's own agent participant at connect. Replies go
 out through the same chat send endpoint — plow dispatches on the provider —
