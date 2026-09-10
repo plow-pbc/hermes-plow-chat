@@ -2085,15 +2085,22 @@ class PlowChatAdapter(BasePlatformAdapter):
         if any(not turn.get(field) for field in required):
             raise RuntimeError("the active turn has no server participant identity")
 
-        opportunity = await self._tool_json(
-            "POST",
-            "/v1/auth/agent-invites/opportunities",
-            body={
-                "chat_id": turn["chat_uid"],
-                "participant_id": turn["participant_uid"],
-                "message_id": turn["source_message_id"],
-            },
-        )
+        try:
+            opportunity = await self._tool_json(
+                "POST",
+                "/v1/auth/agent-invites/opportunities",
+                body={
+                    "chat_id": turn["chat_uid"],
+                    "participant_id": turn["participant_uid"],
+                    "message_id": turn["source_message_id"],
+                },
+            )
+        except _PlowSendError as exc:
+            if exc.status < 500:
+                raise
+            raise _InviteNotSent(exc.status) from exc
+        except Exception as exc:
+            raise _InviteNotSent(type(exc).__name__) from exc
         status = opportunity.get("status")
         if status == "disabled":
             return {"skipped": "consent_declined"}
@@ -3964,6 +3971,20 @@ async def _handle_invite_consent(question, response):
 _ACCEPTED_UNCONFIRMED = "provider_accepted_persistence_unknown"
 
 
+class _InviteNotSent(Exception):
+    """A non-refusal failure on the opportunity POST, before `/send` ever ran.
+
+    `offer_invite` makes two calls and only the second delivers anything, so a
+    failure in the first means nothing reached the invitee -- and the POST is
+    replay-safe by source message, so a later turn resumes cleanly. The tool
+    handler cannot tell that from a status: it sees one exception for two
+    calls, and would otherwise report a possibly-delivered invite and forbid
+    the retry that would have worked. This frame is the one that knows which
+    call it was in. A refusal is left alone; it reads the same wherever it
+    lands.
+    """
+
+
 def _invite_retry_safe(exc):
     """Whether Plow left this failure in a state a later call can re-send from.
 
@@ -4008,6 +4029,12 @@ def _plow_offer_invite(args, **_kwargs):
     try:
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
+    except _InviteNotSent as exc:
+        return json.dumps({
+            "success": False,
+            "error": f"the invite never started ({exc}); nothing was sent, so calling again on a "
+                     "later turn is safe",
+        })
     except _PlowSendError as exc:
         # Three outcomes, and the status settles only the first. A plain 4xx is
         # Plow refusing: nothing was sent, every retry meets the same refusal,

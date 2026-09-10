@@ -68,9 +68,9 @@ Read the receipt; it says which of three happened.
 already have reached them, so say nothing in either thread and do NOT call
 again: a second call would mint a second live invite for the same person.
 
-`Plow reopened it` -- the send definitively did not happen and Plow left the
-invite re-sendable. Say nothing now; you may call `plow_offer_invite` again on
-a later qualifying turn.
+`calling again ... is safe` -- the send definitively did not happen, whether it
+never started or Plow reopened it. Say nothing now; you may call
+`plow_offer_invite` again on a later qualifying turn.
 
 `Plow declined (<status>)` -- terminal. Nothing was sent, and calling again
 gets the same answer. Tell them briefly and plainly why, in your own words,

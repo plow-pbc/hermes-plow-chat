@@ -2978,6 +2978,40 @@ async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
     assert http.calls[0][1] == f"{module.BASE}{INVITE_SEND_CALL[1]}"
 
 
+@pytest.mark.parametrize(
+    ("status", "raises_not_sent"),
+    [
+        pytest.param(503, True, id="5xx-on-create-never-started"),
+        pytest.param(404, False, id="4xx-on-create-is-still-a-refusal"),
+    ],
+)
+async def test_a_failed_opportunity_post_is_definitively_not_sent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int, raises_not_sent: bool
+) -> None:
+    """`offer_invite` makes two calls and only the second delivers anything.
+
+    A non-refusal failure on the first means nothing reached the invitee and the
+    POST is replay-safe by source message, so the tool must say retry-safe rather
+    than the may-have-landed wording it gives a failed `/send`. A refusal on the
+    same call is still a refusal and passes through untouched."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
+    http = _ChatResourceHTTP(_Resp({"detail": "nope"}, status=status))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    expected = module._InviteNotSent if raises_not_sent else module._PlowSendError
+    with pytest.raises(expected) as err:
+        await adapter.offer_invite(_invite_turn())
+
+    if raises_not_sent:
+        assert str(err.value) == str(status)
+    else:
+        assert err.value.status == status
+    # Whichever it is, the send endpoint was never reached.
+    assert all(INVITE_SEND_CALL[1] not in call[1] for call in http.calls)
+
+
 @pytest.mark.parametrize("hours_old", [23, 25])
 async def test_only_fresh_approval_resumes_original_thread(
     monkeypatch: pytest.MonkeyPatch,
