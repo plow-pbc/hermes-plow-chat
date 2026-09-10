@@ -133,7 +133,7 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
     # module global at call time.
     redact = types.ModuleType("agent.redact")
     redact._SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")  # type: ignore[attr-defined]
-    redact.redact_sensitive_text = lambda text: redact._SIGNAL_PHONE_RE.sub(  # type: ignore[attr-defined]
+    redact.redact_sensitive_text = lambda text, force=False: redact._SIGNAL_PHONE_RE.sub(  # type: ignore[attr-defined]
         lambda m: m.group(1)[:4] + "****" + m.group(1)[-4:], text)
 
     modules = {

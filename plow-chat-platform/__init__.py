@@ -85,10 +85,10 @@ log = logging.getLogger(__name__)
 # "to +165****6415" (2026-09-10). On a phone line the number is the content.
 # This disables that one pass; every credential pattern still runs. The base
 # has no patch mechanism, so the plugin carries it, and fails its import rather
-# than re-masking if Hermes moves the pass.
-if not hasattr(_hermes_redact, "_SIGNAL_PHONE_RE"):
-    raise ImportError("agent.redact no longer has _SIGNAL_PHONE_RE; re-point the phone-number workaround")
+# than re-masking if Hermes moves or captures the pass.
 _hermes_redact._SIGNAL_PHONE_RE = re.compile(r"(?!)")
+if _hermes_redact.redact_sensitive_text("+16505550100", force=True) != "+16505550100":
+    raise ImportError("Hermes still masks phone numbers; re-point the workaround in plow_chat")
 
 _deferred_questions: object | None = None
 _plugin_llm: object | None = None
