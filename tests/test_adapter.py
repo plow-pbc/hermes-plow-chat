@@ -551,14 +551,16 @@ async def test_reply_quote_is_untrusted_and_cannot_close_its_block(monkeypatch, 
     assert quoted.split(': "', 1)[1].rsplit('"', 1)[0] == hostile
     assert f"Quoted message from {module._speaker_name(sender, adapter._chats['cht_a'])[0]} at 2026-09-09T12:00:00Z" in quoted
     assert "quoted part:" not in quoted
+    assert quoted.endswith('".')
     assert spoken == event.recall_text == "What about this?"
     assert event["media_urls"] == []
 
 
 @pytest.mark.parametrize("part_index, own_media, indexed, expected, expected_label", [
+    (0, False, None, [], None),
     (3, False, True, ["two"], "photo 2 of 2"),
-    (0, False, True, ["one", "two"], None),
-    (0, True, True, ["own"], None),
+    (0, False, True, ["one", "two"], "media (unresolved)"),
+    (0, True, True, ["own"], "media (unresolved)"),
     (None, False, True, ["one", "two"], "media (unresolved)"),
     (3, False, False, ["one", "two"], "media (unresolved)"),
     (3, True, True, ["own"], "photo 2 of 2"),
@@ -573,7 +575,7 @@ async def test_reply_delivers_parent_media_only_without_own_media(
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
     handled = _capture_events(monkeypatch, adapter)
     attachments = [_attachment(uid=name, url=f"/{name}", **({"part_index": index} if indexed else {}))
-                   for name, index in [("one", 1), ("two", 3)]]
+                   for name, index in [("one", 1), ("two", 3)]] if indexed is not None else []
     frame = _envelope("evt_reply", "cht_a", "msg_reply", body="This photo?",
                       attachments=[_attachment(uid="own", url="/own")] if own_media else [])
     frame["data"]["message"]["reply_to"] = {
@@ -587,7 +589,7 @@ async def test_reply_delivers_parent_media_only_without_own_media(
     assert http.gets == [(module.BASE + "/" + name, None) for name in expected]
     assert len(event["media_urls"]) == len(expected)
     assert all(pathlib.Path(path).read_bytes() == b"\x89PNG" for path in event["media_urls"])
-    assert event["message_type"].value == "photo"
+    assert event["message_type"].value == ("photo" if expected else "text")
     if expected_label is None:
         assert "quoted part:" not in event["text"]
     else:
