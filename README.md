@@ -7,7 +7,8 @@ back through the chat REST API.
 ```
 plow-chat-platform/     exactly what gets installed, and nothing else
   plugin.yaml           the manifest -- registers the platform id
-  __init__.py           the adapter; Hermes loads it from the plugin root
+  __init__.py           the chat adapter and the tools; Hermes loads it from the plugin root
+  _transport.py         what every Plow platform shares: credential, socket, reach, roster readers
 tests/                  the adapter suite
 ```
 

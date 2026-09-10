@@ -3,6 +3,7 @@
 """Hermes platform adapter for Plow Chat.
 
 Receives granted-scope WSS events and sends replies through the chat REST API.
+The transport itself -- credential, socket, reach -- is `_transport.py`, shared with the email platform.
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
