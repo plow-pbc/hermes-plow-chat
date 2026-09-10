@@ -1375,11 +1375,18 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
 
     (event,) = handled
     expected = getattr(module, base)
+    identity = adapter._identity
     if role == "owner":
         expected = _owned(module, expected, chat)
+    else:
+        identity = {**identity, "signup": None}
     if group:
         expected = _voiced(module, expected)
-    assert event["channel_prompt"] == _rendered(module, expected, agent_name, adapter._identity)
+    assert event["channel_prompt"] == _rendered(module, expected, agent_name, identity)
+    # The phrase is the owner's to share. Shown to a member's turn, the model
+    # pasted it instead of calling plow_offer_invite (Elm, 2026-09-10).
+    for offer in (SIGNUP["phrase"], NUMBER):
+        assert (offer in event["channel_prompt"]) == (role == "owner")
 
 
 # The dashboard cards the prefix names, in the order it names them.

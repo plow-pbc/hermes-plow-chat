@@ -657,6 +657,11 @@ def _channel_prompt(chat, role, roster, identity):
         # it is the owner's own; the INVITER's name is theirs, so it arrives as
         # turn data instead -- see _referrer_block.
         prompt = f"{prompt} {_owner_fact(_owner_identity(roster))}"
+    else:
+        # The signup phrase is the owner's to share. Shown to a member's turn,
+        # the model pasted it rather than call plow_offer_invite (Elm,
+        # 2026-09-10), so for anyone else the tool is the only route in.
+        identity = {**identity, "signup": None}
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
     return f"{_collaboration_prompt(prompt, roster, identity)} {_ANSWER_LAST}"
@@ -1001,8 +1006,8 @@ def _plow_facts(identity):
     The signup phrase and this agent's number come from /v1/agents/cloud/me
     at reach refresh; the URLs are Plow's own. None of it is sender-supplied
     text, so carrying it in the prompt is not the injection seam a sender name
-    would be. A deployment whose API serves no signup block simply omits the
-    offer sentence.
+    would be. A member's turn, or a deployment whose API serves no signup
+    block, omits the offer sentence.
 
     The variant name belongs HERE, not in the who-sentence: the resolver falls
     back to the Life row for any provider with no phrase of its own, so it
@@ -1013,7 +1018,8 @@ def _plow_facts(identity):
     if signup.get("name") and signup.get("phrase") and identity.get("number"):
         facts.append(f'Anyone can get their own Plow {signup["name"]} by texting '
                      f'"{signup["phrase"]}" to {identity["number"]}.')
-    facts.append("If someone other than your owner asks how to get one, call plow_offer_invite instead of quoting that.")
+    facts.append("If someone other than your owner asks how to get a Plow agent of their own, "
+                 "call plow_offer_invite; never give them a number or phrase yourself.")
     # Both Latch clauses come from transcript evidence; see the PR for counts.
     # The install link is a parenthetical because an unreachable Latch is
     # usually a sleeping Mac, not a missing app.
