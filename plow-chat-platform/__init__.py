@@ -113,25 +113,40 @@ def _resolve_chat_names(chats, home_uid):
     return names
 
 
+def _self_agent(chat):
+    """The self agent participant, {} when the roster lacks one."""
+    return next((p for p in chat.get("participants") or []
+                 if p.get("type") == "agent"
+                 and p.get("relationship") in (None, "self")), {})
+
+
 def _self_agent_line(chat):
     """The self agent participant's line dict, {} when the roster lacks one."""
-    agent = next((p for p in chat.get("participants") or []
-                  if p.get("type") == "agent"
-                  and p.get("relationship") in (None, "self")), {})
-    return agent.get("line") or {}
+    return _self_agent(chat).get("line") or {}
 
 
-def _agent_name(chat):
+def _agent_name(chat, override=None):
     """The line's persona name ("Elm"), or None for an unnamed line.
 
-    Read from the chat's own agent participant, so the DB stays the single
-    identity source and a rename needs no reprovision — it lands at the next
-    reach refresh (reconnect or group-send adoption), which is deliberate: a
-    rename is a rare coordinated ops event (it ships a new vCard too), not
-    worth an HTTP fetch per delivered message. `.get`-tolerant like the rest
-    of the listing readers: a pre-persona server omits `line`, and an unnamed
-    line omits `display_name`.
+    `override`, if a non-empty value, takes priority in every text surface
+    this function feeds — the collaboration prompt and (via the mapping loop
+    in `_collaboration_turn_context`) the roster line. Callers pass
+    `self._identity["name"]`: `agent.name` from `GET /v1/agents/me`, set by
+    the owner with `PATCH /v1/agents/{uid}` and read back at reach refresh, no
+    reprovision or dotenv access needed. It does not change `line.display_name`
+    itself, and it does not reach the iMessage contact card, which the server
+    delivers directly to the phone before this plugin's gateway ever connects.
+
+    With no override, read from the chat's own agent participant, so the DB
+    stays the single identity source and a rename needs no reprovision — it
+    lands at the next reach refresh (reconnect or group-send adoption), which
+    is deliberate: a rename is a rare coordinated ops event (it ships a new
+    vCard too), not worth an HTTP fetch per delivered message. `.get`-tolerant
+    like the rest of the listing readers: a pre-persona server omits `line`,
+    and an unnamed line omits `display_name`.
     """
+    if override:
+        return override
     return _self_agent_line(chat).get("display_name") or None
 
 
@@ -278,7 +293,7 @@ def _collaboration_prompt(prompt, chat, identity):
         if peer.get("type") == "agent" and peer.get("relationship") == "peer"
     ]
     if not peers:
-        return _with_identity(prompt, _agent_name(chat), identity)
+        return _with_identity(prompt, _agent_name(chat, identity["name"]), identity)
 
     peer_fact = ", ".join(peers)
     collaboration = (
@@ -288,10 +303,10 @@ def _collaboration_prompt(prompt, chat, identity):
         "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
         f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
     )
-    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat), identity)
+    return _with_identity(f"{collaboration} {prompt}", _agent_name(chat, identity["name"]), identity)
 
 
-def _collaboration_turn_context(chat, sender):
+def _collaboration_turn_context(chat, sender, agent_name):
     """Roster labels are user-role data, never channel/system instructions.
 
     A 1:1 DM has no roster to disambiguate. Gating on our own presence
@@ -314,12 +329,16 @@ def _collaboration_turn_context(chat, sender):
         return f"{label} (your owner)" if p.get("role") == "owner" else label
 
     humans = [_human_label(p) for p in participants if p.get("type") == "member"]
+    self_agent = _self_agent(chat)
     mappings = []
     for agent in (p for p in participants if p.get("type") == "agent"):
         human = _represented_member(chat, agent)
         if human is not None:
-            agent_name = (agent.get("line") or {}).get("display_name") or "unnamed agent"
-            mappings.append(f"{agent_name} represents {_participant_identity(human)}")
+            name = (
+                _agent_name(chat, agent_name) if agent is self_agent
+                else (agent.get("line") or {}).get("display_name") or "unnamed agent"
+            )
+            mappings.append(f"{name} represents {_participant_identity(human)}")
     speaker_name, speaker_kind = _speaker_name(sender, chat)
     return _untrusted("chat roster labels", (
         f"Humans: {', '.join(str(name) for name in humans)}. "
@@ -713,21 +732,39 @@ def _goal_turn_line(record):
             f"{_goal_encode(record['text'])}]")
 
 
-def _goal_peer_should_stay_silent(sender, chat, text, goal):
-    """True when a peer agent's message must not draw a reply.
+def _goal_peer_should_stay_silent(sender, chat, text, goal, agent_name):
+    r"""True when a peer agent's message must not draw a reply.
 
     With no active goal an agent answers humans and stays out of the way of
     other agents; being named is the one thing that overrides that. The goal is
     what unlocks agent-to-agent traffic, so the dangerous capability is never
     ambient. Reads `type == "agent"`, so it is only as good as peer
     classification (plow-pbc/plow#1741).
+
+    Checks both names this line can be addressed by: `_agent_name(chat,
+    agent_name)` (the persona override, if set) and the server's own
+    `display_name`. A peer has no way to know about a local override, so it
+    keeps saying the server name -- checking only the override would read
+    every peer-addressed message as unaddressed and silence a reply that was
+    owed.
+
+    Matched with lookaround, not `\b` and not a bare substring test: a short
+    name like "Al" sits inside plenty of ordinary words ("alternatives"), so a
+    raw substring check would read every one of them as this line being named
+    -- but `\b` itself needs a *word* character right at the name's own edge,
+    which a persona name is never guaranteed to have (an owner-set `agent.name`
+    only requires a non-empty string, so "@Jessie", "A.J." or an emoji-only
+    name all have a non-word edge, and `\b` would silently never match them).
+    `(?<!\w)`/`(?!\w)` assert on the surrounding text only, not on the name's
+    own first/last character, so it works for either shape.
     """
     if (sender or {}).get("type") != "agent":
         return False
     if _goal_active(goal):
         return False
-    name = _agent_name(chat)
-    return not (name and name.lower() in (text or "").lower())
+    text_lower = (text or "").lower()
+    names = {n for n in (_agent_name(chat, agent_name), _self_agent_line(chat).get("display_name")) if n}
+    return not any(re.search(rf"(?<!\w){re.escape(name.lower())}(?!\w)", text_lower) for name in names)
 
 
 def _sender_key(sender):
@@ -1002,7 +1039,7 @@ TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT = (
 def _plow_facts(identity):
     """What every Plow agent should know about Plow, as prompt prose.
 
-    The signup phrase and this agent's number come from /v1/agents/cloud/me
+    The signup phrase and this agent's number come from /v1/agents/me
     at reach refresh; the URLs are Plow's own. None of it is sender-supplied
     text, so carrying it in the prompt is not the injection seam a sender name
     would be. A deployment whose API serves no signup block simply omits the
@@ -1129,7 +1166,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
         self.home_chat_uid = self._configured_home_chat_uid
         self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
-        self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
+        self._identity = {"signup": None, "number": None, "name": None}   # read at reach refresh, see _refresh_reach and _agent_name
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
         self.chat_uids = frozenset({self.home_chat_uid})
@@ -1270,15 +1307,26 @@ class PlowChatAdapter(BasePlatformAdapter):
             if body["has_more"]:
                 raise RuntimeError("the granted chat listing is truncated")
             self._set_reach(body["data"])
-            # Who this agent is, for the prompt prefix. Only a 200 sets it:
-            # refresh has no timer (connect, group creation, an unknown-chat
-            # frame), so overwriting on a failure would let one blip strip the
-            # offer for the life of a healthy socket.
-            async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
+            # Who this agent is, for the prompt prefix, and its operator-set
+            # persona name (see _agent_name) -- one record serves both, so one
+            # request reads it. Only a 200 sets either: refresh has no timer
+            # (connect, group creation, an unknown-chat frame), so overwriting
+            # on a failure would let one blip strip the offer for the life of
+            # a healthy socket.
+            async with http.get(f"{BASE}/v1/agents/me", headers=self.auth) as resp:
                 if resp.status == 200:
                     me = await resp.json(content_type=None)
+                    # `name` is `_one_line`-guarded like every other
+                    # person-supplied value that reaches system authority:
+                    # unlike the ops-seeded `line.display_name` fallback, this
+                    # one is owner-set (PATCH /v1/agents/{uid}), so a newline
+                    # or an instruction-shaped value must not ride straight
+                    # into the who-sentence _with_identity builds. The whole
+                    # dict is replaced, not patched -- a 200 is the answer for
+                    # THIS read, so a cleared name must clear the cache too.
                     self._identity = {"signup": me.get("signup"),
-                                      "number": (me.get("line") or {}).get("provider_key")}
+                                      "number": (me.get("line") or {}).get("provider_key"),
+                                      "name": _one_line((me.get("agent") or {}).get("name")) or None}
                 elif resp.status != 404:
                     # 404 is the documented "this token is not one agent" -- a
                     # wildcard or multi-line grant -- and keeps what we hold.
@@ -2949,8 +2997,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         # read as one at all. Authorization is unchanged -- the gateway still
         # decides who may run what from the source we build below. The burst
         # boundary already puts a command first and alone, so burst[0] is it.
+        agent_name = self._identity["name"]
         turn_context = ("" if burst[0].starts_slash_command
-                        else _collaboration_turn_context(roster, sender))
+                        else _collaboration_turn_context(roster, sender, agent_name))
         if not burst[0].starts_slash_command:
             quotes = [_quoted_reply_context(m.reply_to, roster) for m in burst if m.reply_to]
             if quotes:
@@ -2969,7 +3018,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
         # that capability is never ambient.
-        if _goal_peer_should_stay_silent(sender, roster, spoken, goal):
+        if _goal_peer_should_stay_silent(sender, roster, spoken, goal, agent_name):
             channel_prompt = f"{_GOAL_PEER_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,

@@ -30,11 +30,14 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
 > `POST /v1/chats` (outbound thread creation — `plow_start_group_message`
 > 404s against an older API, so that API change deploys before any
-> `agent-mgr` SHA advance), and
+> `agent-mgr` SHA advance),
 > `PUT /v1/contacts/{handle}` (`plow_name_contact` — the handle-keyed contact
 > book, superseding the per-participant contact route of
 > [`plow-pbc/plow#1752`](https://github.com/plow-pbc/plow/pull/1752),
-> "Owner contacts"). Hermes hosts
+> "Owner contacts"), and
+> `GET /v1/agents/me` returning an `agent` object (identity and persona name —
+> the legacy `/v1/agents/cloud/me` alias serves neither, and its 404 reads as
+> "not one agent" and runs on quietly rather than failing loudly). Hermes hosts
 > without deferred-question support still run Plow Chat and standing-consent
 > invites, but skip the ask-owner-first invite flow. Deploy the API first,
 > then land the `agent-mgr` support above, and only then bump
@@ -118,6 +121,12 @@ URL in git.
 | `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
+
+The persona name shown to the model is read from `GET /v1/agents/me`'s
+`agent.name` at reach refresh, not from a dotenv var — the owner sets it
+server-side (`PATCH /v1/agents/{uid}`). Falls back to the line's own
+`display_name` when unset; either way, the server-assigned line name and
+the iMessage contact card are untouched.
 
 Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running
 heartbeats, ⚠️ turn-stop warnings — are dropped in **every** room unless the
