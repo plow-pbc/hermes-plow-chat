@@ -35,20 +35,17 @@ OWNER = ("Sam", "sam@example.com")
 
 
 def _mail_chat(uid: str, *, group: bool = False) -> dict[str, Any]:
-    """A mail thread as the listing serves it (design §1): the line is the
-    email line, the owner is on it, and any other address is a member."""
-    participants = [
-        {"type": "agent", "relationship": "self",
-         "line": {"uid": "ln_mail", "provider_key": ADDRESS, "display_name": "Elm",
-                  "provider_type": "email"}},
-        {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner",
-         "display_name": OWNER[0], "provider_key": OWNER[1]},
-    ]
-    if group:
-        participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
-                             "display_name": "Dana", "provider_key": "dana@example.com"})
-    return {"uid": uid, "display_name": "Re: invoice",
-            "participants": participants, "trusted": False, "status": "active"}
+    """A mail thread as the listing serves it (design §1): a phone-line chat
+    but for its line and its addresses -- the line is the email line, the
+    owner is on it, and any other address is a member."""
+    chat = _chat(uid, name="Re: invoice", group=group, owner_name=OWNER[0])
+    agent, owner, *others = chat["participants"]
+    agent["line"] = {"uid": "ln_mail", "provider_key": ADDRESS, "display_name": "Elm",
+                     "provider_type": "email"}
+    owner["provider_key"] = OWNER[1]
+    for other in others:
+        other.update(display_name="Dana", provider_key="dana@example.com")
+    return chat
 
 
 def _load_email(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> tuple[Any, Any]:
