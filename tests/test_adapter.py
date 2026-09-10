@@ -554,15 +554,15 @@ async def test_reply_quote_is_untrusted_and_cannot_close_its_block(monkeypatch, 
     assert event["media_urls"] == []
 
 
-@pytest.mark.parametrize("part_index, own_media, indexed, expected", [
-    (3, False, True, ["two"]),
-    (0, False, True, ["one", "two"]),
-    (None, False, True, ["one", "two"]),
-    (3, False, False, ["one", "two"]),
-    (3, True, True, ["own"]),
+@pytest.mark.parametrize("part_index, own_media, indexed, expected, expected_label", [
+    (3, False, True, ["two"], "photo 2 of 2"),
+    (0, False, True, ["one", "two"], "text"),
+    (None, False, True, ["one", "two"], "media (unresolved)"),
+    (3, False, False, ["one", "two"], "media (unresolved)"),
+    (3, True, True, ["own"], "photo 2 of 2"),
 ])
 async def test_reply_delivers_parent_media_only_without_own_media(
-    monkeypatch, tmp_path, part_index, own_media, indexed, expected,
+    monkeypatch, tmp_path, part_index, own_media, indexed, expected, expected_label,
 ):
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -586,11 +586,7 @@ async def test_reply_delivers_parent_media_only_without_own_media(
     assert len(event["media_urls"]) == len(expected)
     assert all(pathlib.Path(path).read_bytes() == b"\x89PNG" for path in event["media_urls"])
     assert event["message_type"].value == "photo"
-    if part_index == 3 and indexed:
-        assert "quoted part: photo 2 of 2" in event["text"]
-    elif part_index is not None and not indexed:
-        assert "quoted part: media (unresolved)" in event["text"]
-        assert "quoted part: text" not in event["text"]
+    assert f"quoted part: {expected_label}" in event["text"]
     assert event["text"].endswith("This photo?")
 
 

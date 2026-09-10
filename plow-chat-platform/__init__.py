@@ -707,7 +707,7 @@ def _reply_parts(reply):
         if index is not None and item.get("part_index") == index:
             kind = "photo" if (item["content_type"] or "").startswith("image/") else "attachment"
             return [item], f"{kind} {number} of {len(attachments)}"
-    if index is not None and any(item.get("part_index") is None for item in attachments):
+    if attachments and (index is None or any(item.get("part_index") is None for item in attachments)):
         return attachments, "media (unresolved)"
     return attachments, "text"
 
