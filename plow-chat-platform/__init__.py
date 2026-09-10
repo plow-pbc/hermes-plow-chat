@@ -3642,7 +3642,8 @@ PLOW_NAME_CONTACT_SCHEMA = {
         "type": "object",
         "properties": {
             "handle": {"type": "string",
-                       "description": "The person's handle, as shown in the roster (a phone number, +1...)."},
+                       "description": "The person's handle, as shown in the roster (a phone number, "
+                                       "+1..., or an email address)."},
             "display_name": {"type": "string"},
             "relationship": {"type": "string"},
         },

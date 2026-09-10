@@ -8,6 +8,7 @@ same package loader serve both platforms.
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import sys
 import types
@@ -20,6 +21,7 @@ import pytest
 from test_adapter import (
     _HTTP,
     _SEND_ARGV,
+    _attachment,
     _capture_events,
     _chat,
     _envelope,
@@ -90,12 +92,22 @@ async def test_reach_keeps_the_email_line_and_publishes_its_address_in_the_hint(
         ("cht_m", "dm"), ("cht_n", "group")]
 
 
-@pytest.mark.parametrize(("group", "chat_type", "role"),
-                         [(False, "dm", "owner"), (True, "group", "member")],
-                         ids=["owner-dm", "member-group"])
+@pytest.mark.parametrize(
+    ("group", "chat_type", "role", "body", "attachments", "expected_text"),
+    [
+        pytest.param(False, "dm", "owner", "Can you send the invoice?", None,
+                     "Can you send the invoice?", id="owner-dm"),
+        pytest.param(True, "group", "member", "Can you send the invoice?", None,
+                     "Can you send the invoice?", id="member-group"),
+        pytest.param(False, "dm", "owner", "", [_attachment()],
+                     "(email with 1 attachment(s); attachments are not delivered on this line yet)",
+                     id="attachment-only"),
+    ],
+)
 async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     caplog: pytest.LogCaptureFixture, group: bool, chat_type: str, role: str,
+    body: str, attachments: list[dict[str, Any]] | None, expected_text: str,
 ) -> None:
     """Both adapters hold the same grant and see the same frames. A gmail
     frame is a plow_email turn -- platform, chat_type and chat_id are the
@@ -104,9 +116,12 @@ async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
     frame is not this platform's. The prompt is the owner fact and nothing
     else: no roster, no trust prose; the hint rides the platform entry. On a
     member's mail it is still the line's owner who is named, and only an
-    owner's mail carries owner authority. A thread whose roster has no owner
-    at all is the one shape that cannot be rendered: it must name itself on
-    the way out, because the frame is already deduped and the mail is gone."""
+    owner's mail carries owner authority. An attachment-only mail is not
+    silently "(empty email)": the placeholder names the count and one line is
+    logged. A thread whose roster has no owner at all is the one shape that
+    cannot be rendered: it must name itself on the way out, because the
+    frame is already deduped and the mail is gone."""
+    caplog.set_level(logging.INFO)
     module, _entry = _load_email(monkeypatch, tmp_path)
     listing = [_chat("cht_a"), _mail_chat("cht_m", group=group)]
     chat = module.PlowChatAdapter(SimpleNamespace(extra={}))
@@ -116,7 +131,7 @@ async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
     mail._set_reach(listing)
     chat_events, mail_events = _capture_events(monkeypatch, chat), _capture_events(monkeypatch, mail)
 
-    frame = _envelope("evt_1", "cht_m", "msg_1", body="Can you send the invoice?", role=role)
+    frame = _envelope("evt_1", "cht_m", "msg_1", body=body, attachments=attachments, role=role)
     await chat._on_frame(frame, None)
     await _settle(chat)
     await mail._on_frame(frame, None)
@@ -128,8 +143,10 @@ async def test_a_gmail_thread_is_plow_emails_turn_and_never_plow_chats(
     source = event["source"]
     assert (source.platform, source.chat_type, source.chat_id) == ("plow_email", chat_type, "cht_m")
     assert source.role_authorized is (role == "owner") and source.user_id == f"mem_{role}_cht_m"
-    assert event["text"] == "Can you send the invoice?" and event["message_id"] == "msg_1"
+    assert event["text"] == expected_text and event["message_id"] == "msg_1"
     assert event["channel_prompt"] == module._owner_fact(OWNER)
+    if attachments:
+        assert "cht_m: attachment-only mail (1 attachment(s))" in caplog.text
 
     mail._set_reach([{**_mail_chat("cht_x"), "participants": []}])
     with pytest.raises(RuntimeError, match="cht_x has no owner participant"):

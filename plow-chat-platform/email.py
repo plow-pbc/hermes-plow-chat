@@ -54,6 +54,7 @@ class PlowEmailAdapter(BasePlatformAdapter):
     def __init__(self, config):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
         config.extra["group_sessions_per_user"] = False
+        config.typing_indicator = False  # the base's 2s typing loop is a no-op on email
         self.auth = _bearer()
         self.address = None                  # the line's address, off the first gmail chat
         self._chats = {}                     # uid -> chat resource, gmail only
@@ -69,8 +70,8 @@ class PlowEmailAdapter(BasePlatformAdapter):
 
     def _set_reach(self, listing):
         self._chats, self._foreign = _split(listing, PROVIDER)
-        first = next(iter(self._chats.values()), None)
-        address = _self_agent_line(first).get("provider_key") if first else None
+        address = next((k for c in self._chats.values()
+                        if (k := _self_agent_line(c).get("provider_key"))), None)
         if address and address != self.address:
             self.address = address
             self._publish_hint()
@@ -79,11 +80,9 @@ class PlowEmailAdapter(BasePlatformAdapter):
         self._set_reach(await _granted_chats(http, self.auth))
 
     def _publish_hint(self):
-        """The gateway reads `platform_registry.get(name).platform_hint` on
-        every prompt build (agent/system_prompt.py `_platform_hint`), and the
-        entry is a plain dataclass: writing the address onto it here is the
-        whole mechanism. Imported lazily -- the registry is a runtime module
-        the gateway supplies, like everything under `gateway.`."""
+        """Writes the address onto the platform registry entry the gateway
+        reads on every prompt build. Imported lazily -- `gateway.` is a
+        runtime module the gateway supplies, not a dependency of this repo."""
         from gateway.platform_registry import platform_registry
         platform_registry.get(PLATFORM_NAME).platform_hint = hint(self.address)
 
@@ -138,6 +137,8 @@ class PlowEmailAdapter(BasePlatformAdapter):
             return
         if frame["event_type"] != "message_received" or frame["event_id"] in self._seen_events:
             return
+        # Recorded before _on_message, unlike the chat adapter -- there is no
+        # backfill on this line, so a raise can't be replayed either way.
         self._seen_events.append(frame["event_id"])
         del self._seen_events[:-512]
         await self._on_message(frame["data"]["message"], chat_uid)
@@ -154,14 +155,16 @@ class PlowEmailAdapter(BasePlatformAdapter):
         try:
             channel_prompt = _owner_fact(_owner_identity(chat))
         except RuntimeError as exc:
-            # `_serve` logs the exception TYPE only -- an aiohttp handshake
-            # error stringifies the ws URL, live ticket and all -- so the one
-            # line naming the broken roster has to be logged here, and this
-            # mail is already event-deduped: unlogged, it just disappears.
+            # `_serve` logs the exception type only, so log the message here --
+            # this mail is already event-deduped and would otherwise vanish silently.
             log.error("[plow_email] %s", exc)
             raise
+        body, count = msg["body"].strip(), len(msg["attachments"])
+        if not body and count:
+            log.info("[plow_email] %s: attachment-only mail (%d attachment(s))", chat_uid, count)
+            body = f"(email with {count} attachment(s); attachments are not delivered on this line yet)"
         await self.handle_message(MessageEvent(
-            text=msg["body"].strip() or "(empty email)",
+            text=body or "(empty email)",
             source=self.build_source(chat_id=chat_uid, chat_name=info["name"], chat_type=info["type"],
                                      user_id=sender["uid"],
                                      user_name=sender.get("display_name") or sender["uid"],

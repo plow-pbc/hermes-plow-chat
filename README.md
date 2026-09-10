@@ -188,14 +188,16 @@ same plugin on the same credential and socket. Plow stores each Gmail thread
 as a chat with provider `gmail`; this adapter serves those and the phone-line
 adapter serves the `linq` ones, so a mail never renders as an SMS room and a
 text never renders as an email. Sessions are keyed
-`plow_email:<dm|group>:<cht_ id>`; the platform hint names the line's
+`plow_email:<dm|group>:<cht_id>`; the platform hint names the line's
 address, read off the thread's own agent participant at connect. Replies go
 out through the same chat send endpoint — plow dispatches on the provider —
 with no approval gate: this is the agent's own line, like its number. Only
 the turn's answer, a cron delivery, or a turn-less send is ever mailed;
 mid-turn prose and the runtime's diagnostics are dropped. No cron home
 (`PLOW_HOME_CHANNEL` stays the phone line's), no roster policy on
-multi-address threads, and no backfill across a socket gap in v1.
+multi-address threads, no backfill across a socket gap, and no delivered
+attachments in v1 — an attachment-only mail arrives as a placeholder naming
+the count ([hermes-plugin-plow#119](https://github.com/plow-pbc/hermes-plugin-plow/issues/119)).
 
 `plow_email` needs no dotenv entry of its own: it reads the same
 `PLOW_AGENT_TOKEN` as `plow_chat`, and Hermes's `_enable_plugin_platform`
