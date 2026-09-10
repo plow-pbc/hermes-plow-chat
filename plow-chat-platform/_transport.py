@@ -185,12 +185,15 @@ def _owner_identity(chat):
     resource that answers this, and a name the owner changes lands on their
     very next turn with no cache and no second request.
 
-    No default on the `next`: `role == "owner"` is how this turn was chosen in
-    the first place, so a chat that then has no owner participant is a broken
-    contract, not a case to render around.
+    A chat with no owner participant is a broken contract, not a case to
+    render around. The raise names the chat because the email line reads this
+    on every turn, not only an owner's, and `_serve` logs the exception TYPE
+    only -- so an unnamed StopIteration there reads as a network blip.
     """
-    owner = next(p for p in chat.get("participants") or []
-                 if p.get("type") == "member" and p.get("role") == "owner")
+    owner = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "member" and p.get("role") == "owner"), None)
+    if owner is None:
+        raise RuntimeError(f"chat {chat.get('uid')} has no owner participant")
     # `_participant_identity` already answers "named, or still a bare handle?"
     # -- it hands back the handle itself when there is no meaningful name.
     handle = _one_line(owner.get("provider_key"))

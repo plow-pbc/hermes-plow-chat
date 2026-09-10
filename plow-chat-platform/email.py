@@ -93,6 +93,10 @@ class PlowEmailAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect=False):
         if self._ws_task:
             self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
         async with aiohttp.ClientSession() as http:
             await self._refresh_reach(http)
         self._ws_task = asyncio.create_task(self._listen())
@@ -146,6 +150,15 @@ class PlowEmailAdapter(BasePlatformAdapter):
             return
         chat = self._chats[chat_uid]
         info = await self.get_chat_info(chat_uid)
+        try:
+            channel_prompt = _owner_fact(_owner_identity(chat))
+        except RuntimeError as exc:
+            # `_serve` logs the exception TYPE only -- an aiohttp handshake
+            # error stringifies the ws URL, live ticket and all -- so the one
+            # line naming the broken roster has to be logged here, and this
+            # mail is already event-deduped: unlogged, it just disappears.
+            log.error("[plow_email] %s", exc)
+            raise
         await self.handle_message(MessageEvent(
             text=msg["body"].strip() or "(empty email)",
             source=self.build_source(chat_id=chat_uid, chat_name=info["name"], chat_type=info["type"],
@@ -153,17 +166,13 @@ class PlowEmailAdapter(BasePlatformAdapter):
                                      user_name=sender.get("display_name") or sender["uid"],
                                      role_authorized=sender.get("role") == "owner"),
             message_id=msg["uid"],
-            # The owner fact and nothing else (design §5): no roster, no trust
-            # prose. The hint reaches the prompt through the platform entry.
-            channel_prompt=_owner_fact(_owner_identity(chat)),
+            channel_prompt=channel_prompt,
         ))
 
     async def on_processing_start(self, event):
-        # The one turn slot the tool guards read (`_send_guard`,
-        # `_owner_read_tool`, `_pre_tool_call`): a member's email turn is
-        # confined like a member's chat turn. `dm` is False on purpose -- the
-        # Latch mail gate approves a plow-gog send only in the owner's own
-        # DM, and a reply here goes out from this line, never their Gmail.
+        # `dm` is False on purpose -- the Latch mail gate approves a plow-gog
+        # send only in the owner's own DM, and a reply here goes out from this
+        # line, never their Gmail.
         _ACTIVE_TURN.set({"chat_uid": event.source.chat_id,
                           "owner": bool(event.source.role_authorized), "dm": False})
 
