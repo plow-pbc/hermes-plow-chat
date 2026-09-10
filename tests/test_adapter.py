@@ -147,9 +147,18 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("PLOW_HOME_CHANNEL", "cht_a")
     monkeypatch.setenv("PLOW_AGENT_TOKEN", "plow_tok")  # pragma: allowlist secret — a fixture string
-    spec = importlib.util.spec_from_file_location("plow_chat_under_test", PLUGIN)
+    # The plugin directory is one package (hermes_cli.plugins_loader passes
+    # submodule_search_locations), so `__init__` may import its siblings
+    # relatively. Register the package before its body runs -- that is where
+    # a relative import looks -- and evict the previous test's submodules
+    # first, or `from ._transport import` would keep serving that test's copy.
+    for name in [name for name in sys.modules if name.startswith("plow_chat_under_test.")]:
+        monkeypatch.delitem(sys.modules, name)
+    spec = importlib.util.spec_from_file_location(
+        "plow_chat_under_test", PLUGIN, submodule_search_locations=[str(PLUGIN.parent)])
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "plow_chat_under_test", module)
     spec.loader.exec_module(module)
     # Most adapter tests isolate a different seam and drive an already-cached
     # chat directly, without a REST server. Keep that canonical resource as
