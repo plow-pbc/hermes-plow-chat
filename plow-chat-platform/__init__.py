@@ -3100,10 +3100,6 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     if not isinstance(argv, list):
         return None
     argv = [str(arg) for arg in argv]
-    # Mirror latch's own isHelpInvocation: help is a trailing --help/-h with
-    # no -- terminator anywhere; it mints no token and reaches nothing.
-    if argv and argv[-1] in ("--help", "-h") and "--" not in argv:
-        return None
     # Mirror latch's accountAt/planPlowGog stripping for classification only.
     # Keep the original argv for the approval key and execution.
     classified = argv[:1]
@@ -3118,6 +3114,10 @@ def _pre_tool_call(tool_name, args, **_kwargs):
             confirm_conflict = True
         else:
             classified.append(arg)
+    # Mirror latch's own isHelpInvocation: help is a trailing --help/-h with
+    # no -- terminator anywhere; it mints no token and reaches nothing.
+    if classified and classified[-1] in ("--help", "-h") and "--" not in classified:
+        return None
     if _is_draft_send(classified):
         return {"action": "block",
                 "message": "a draft sent by id shows the owner nothing; send it as one "

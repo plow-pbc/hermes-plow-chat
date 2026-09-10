@@ -3183,6 +3183,7 @@ def test_conflict_override_requires_owner_dm(
     ("mcp__latch__plow_run_command", {}),
     ("mcp__latch__plow_run_command", None),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help"]}),
+    ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "--help", "--account", "a@x"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "send", "-h"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "drafts", "send", "--help"]}),
     ("mcp__latch__plow_run_command", {"argv": ["plow-gog", "gmail", "draft", "post", "-h"]}),
