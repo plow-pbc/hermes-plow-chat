@@ -3983,6 +3983,31 @@ def _verbose_adapter(module: Any, http: Any, monkeypatch: pytest.MonkeyPatch) ->
     return adapter
 
 
+@pytest.mark.parametrize("prefix", ["", "Billing or credits exhausted: "])
+async def test_plow_credit_exhaustion_sends_one_plain_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    prefix: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    http = _SettingsHTTP(_me(verbose=False))
+    adapter = _verbose_adapter(module, http, monkeypatch)
+    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True, "dm": True})
+    error = prefix + 'HTTP 402: {"detail":"You\'re out of Plow credits. Top up at https://app.plow.co/dashboard to keep going."}'
+    error += (
+        "\n\nplow reported that billing, credits, or account entitlement is exhausted for anthropic/claude-sonnet-5."
+        "\nAdd credits or update billing with that provider, then retry."
+        "\nYou can switch providers temporarily with /model <model> --provider <provider>."
+    )
+
+    result = await adapter.send("cht_a", error, metadata={"notify": True})
+
+    assert result.success
+    assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {
+        "body": "I've run out of Plow credit for now — top up in the portal and I'll pick this back up.",
+    })]
+
+
 @pytest.mark.parametrize("enabled", [False, True], ids=["quiet", "verbose"])
 async def test_status_frames_follow_verbose_preference(
     monkeypatch: pytest.MonkeyPatch,
