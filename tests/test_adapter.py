@@ -286,6 +286,10 @@ class _ChatResourceHTTP:
         self.calls.append(("get", url, kwargs))
         return self.response
 
+    def post(self, url: str, **kwargs: Any) -> _Resp:
+        self.calls.append(("post", url, kwargs))
+        return self.response
+
     def put(self, url: str, **kwargs: Any) -> _Resp:
         self.calls.append(("put", url, kwargs))
         return self.response
@@ -2624,24 +2628,37 @@ def test_invite_owner_notification_refuses_wrong_context(
     assert error.lower() in out["error"].lower()
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        pytest.param(None, "may or may not", id="unconfirmed"),
+        pytest.param(503, "may or may not", id="5xx-unconfirmed"),
+        pytest.param(429, "Plow declined (429)", id="4xx-declined"),
+    ],
+)
 def test_invite_workflow_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
+    status: int | None,
+    expected: str,
 ) -> None:
+    """Only a 4xx is Plow itself declining -- the daily invite cap, consent
+    withdrawn -- and it is terminal: nothing was sent and every retry presents
+    the same refusal, so the model must be told what was refused rather than
+    that retrying is safe. A timeout or a 5xx still says nothing about whether
+    the invite landed, so those keep the unconfirmed wording."""
     module = _load(monkeypatch, tmp_path)
-    _live_tool(
-        module,
-        monkeypatch,
-        "offer_invite",
-        raises=RuntimeError("HTTP 503"),
-    )
+    raises = (RuntimeError("HTTP 503") if status is None
+              else module._PlowSendError(status, '{"detail":"agent invite cap reached"}'))
+    _live_tool(module, monkeypatch, "offer_invite", raises=raises)
     module._ACTIVE_TURN.set(_invite_turn())
 
     out = json.loads(module._plow_offer_invite({}))
 
     assert out["success"] is False
-    assert out["delivery_unknown"] is True
-    assert "may or may not" in out["error"]
+    assert expected in out["error"]
+    assert out.get("delivery_unknown", False) is (status != 429)
+    assert ("retrying is safe" in out["error"]) is (status != 429)
     assert "do not retry" not in out["error"].lower()
 
 
@@ -2909,6 +2926,30 @@ async def test_resolved_consent_sends_once_or_stays_declined(
         assert result == {"skipped": "consent_declined"}
         assert len(calls) == 1
     assert ctx.deferred_questions.enqueued == []
+
+
+async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Non-2xx follows the contact book's convention -- `_PlowSendError`
+    carrying the status -- so the tool can tell the daily cap declining from
+    the call falling over. `_auth_raise_for_status` raised aiohttp's own past
+    401, which the tool reads as an unconfirmed delivery it should retry."""
+    from datetime import datetime, timezone
+
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    http = _ChatResourceHTTP(_Resp({"detail": "agent invite cap reached"}, status=429))
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    with pytest.raises(module._PlowSendError) as err:
+        await adapter.resume_invite({"opportunity_id": "agi_1",
+                                     "triggered_at": datetime.now(timezone.utc).isoformat()})
+
+    assert err.value.status == 429
+    assert "agent invite cap reached" in err.value.detail
+    assert http.calls[0][0] == "post"
+    assert http.calls[0][1] == f"{module.BASE}{INVITE_SEND_CALL[1]}"
 
 
 @pytest.mark.parametrize("hours_old", [23, 25])

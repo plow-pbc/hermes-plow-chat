@@ -2060,14 +2060,24 @@ class PlowChatAdapter(BasePlatformAdapter):
         return False
 
     async def _invite_api(self, method, path, *, body=None):
+        """One invite-workflow call, decoded.
+
+        Same non-2xx convention as `_get_tool_json`: `_PlowSendError` carries
+        the status through, so `_plow_offer_invite` can tell Plow declining --
+        the daily invite cap, consent withdrawn -- from the call falling over.
+        `_auth_raise_for_status` raised aiohttp's own past 401, which reached
+        the tool as an unconfirmed delivery worth retrying; a 4xx is neither.
+        """
         async with aiohttp.ClientSession() as http:
             request = getattr(http, method.lower())
             kwargs = {"headers": self.auth}
             if body is not None:
                 kwargs["json"] = body
             async with request(f"{BASE}{path}", **kwargs) as resp:
-                _auth_raise_for_status(resp)
-                return await resp.json(content_type=None)
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise _PlowSendError(resp.status, text)
+                return json.loads(text or "{}")
 
     async def offer_invite(self, turn):
         """Run the one participant-aware invite workflow for a delight turn."""
@@ -3997,6 +4007,19 @@ def _plow_offer_invite(args, **_kwargs):
     try:
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
+    except _PlowSendError as exc:
+        if exc.status >= 500:
+            return json.dumps({
+                "success": False,
+                "delivery_unknown": True,
+                "error": f"could not confirm the invite workflow ({exc.status}); it may or may not "
+                         "have completed; retrying is safe",
+            })
+        # A 4xx is Plow itself refusing -- nothing was sent, and every retry
+        # presents the same refusal. Say what was refused: the wording below
+        # sent the model looking for a way around it, and quoting the public
+        # signup phrase is the way around it that the invite cap exists to stop.
+        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
     except Exception as exc:  # noqa: BLE001 - report no unconfirmed delivery as success
         return json.dumps({
             "success": False,
