@@ -25,6 +25,12 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
 > deploy both API changes before pinning this plugin, or reply context will be absent
 > or indexed media replies will remain unresolved.
+> Invite retry receipts require
+> [`plow-pbc/plow#1869`](https://github.com/plow-pbc/plow/pull/1869): without it
+> a reopened invite carries no `invite_reopened` marker, so this plugin reads it
+> as possibly-delivered and declines the retry that would have worked. It fails
+> safe, never sending a duplicate, but deploy that API change before pinning
+> this plugin or recoverable invites are silently dropped.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,

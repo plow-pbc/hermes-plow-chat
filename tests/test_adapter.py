@@ -2655,16 +2655,7 @@ def test_invite_workflow_reports_delivery_failure(
     expected: str,
     may_call_again: bool,
 ) -> None:
-    """Three outcomes; the status settles only the refusal, Plow says the rest.
-
-    A plain 4xx is Plow refusing: terminal, and the model is told what was
-    refused so it stops improvising a route around it. Past that, re-sendability
-    is `invite_reopened`, written only after Plow's recovery commits -- so its
-    absence covers both a send that may have reached the invitee and a recovery
-    that failed with the opportunity still closed. Anything not marked must not
-    invite another call, or the same person gets a second live invite. A body we
-    cannot read, and an API not sending the marker yet, land on that same safe
-    side rather than each needing their own case."""
+    """Unmarked means not re-sendable, so a duplicate invite is unreachable."""
     module = _load(monkeypatch, tmp_path)
     raises = (RuntimeError("HTTP 503") if status is None
               else module._PlowSendError(status, detail))
@@ -2677,11 +2668,8 @@ def test_invite_workflow_reports_delivery_failure(
 
     assert out["success"] is False
     assert expected in out["error"]
-    # Only a re-sendable failure may advertise another call; everything that
-    # might already have landed says the opposite, in as many words.
     assert ("calling again" in out["error"]) is may_call_again
     assert ("do NOT call again" in out["error"]) is not (terminal or may_call_again)
-    # `delivery_unknown` marks may-have-landed only -- not a refusal, not a reopen.
     assert out.get("delivery_unknown", False) is not (terminal or may_call_again)
 
 
@@ -2986,19 +2974,14 @@ async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
 async def test_a_failed_opportunity_post_is_definitively_not_sent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, status: int, raises_not_sent: bool
 ) -> None:
-    """`offer_invite` makes two calls and only the second delivers anything.
-
-    A non-refusal failure on the first means nothing reached the invitee and the
-    POST is replay-safe by source message, so the tool must say retry-safe rather
-    than the may-have-landed wording it gives a failed `/send`. A refusal on the
-    same call is still a refusal and passes through untouched."""
+    """Only `/send` can deliver, so a failure before it is definitively not sent."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=True)])
     http = _ChatResourceHTTP(_Resp({"detail": "nope"}, status=status))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
-    expected = module._InviteNotSent if raises_not_sent else module._PlowSendError
+    expected = module._PlowPreflightError if raises_not_sent else module._PlowSendError
     with pytest.raises(expected) as err:
         await adapter.offer_invite(_invite_turn())
 

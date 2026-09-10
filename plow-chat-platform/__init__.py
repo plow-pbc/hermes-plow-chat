@@ -2096,11 +2096,14 @@ class PlowChatAdapter(BasePlatformAdapter):
                 },
             )
         except _PlowSendError as exc:
+            # A refusal reads the same wherever it lands. Anything else on this
+            # call is preflight: `/send` has not run, and the POST is replay-safe
+            # by source message, so a later turn resumes cleanly.
             if _is_refusal(exc.status):
                 raise
-            raise _InviteNotSent(exc.status) from exc
+            raise _PlowPreflightError(str(exc.status)) from exc
         except Exception as exc:
-            raise _InviteNotSent(type(exc).__name__) from exc
+            raise _PlowPreflightError(type(exc).__name__) from exc
         status = opportunity.get("status")
         if status == "disabled":
             return {"skipped": "consent_declined"}
@@ -3106,12 +3109,14 @@ class _PlowSendError(Exception):
 
 
 class _PlowPreflightError(Exception):
-    """A failure before the create POST was ever issued.
+    """A failure before any delivery POST was issued.
 
     Distinct from the generic post-POST bucket because it is definitive:
-    nothing was sent, there is no thread to check, and retrying after the
+    nothing was sent, there is nothing to check, and retrying after the
     underlying problem is fixed is safe — the opposite of what the
-    delivery-unknown message tells the model.
+    delivery-unknown message tells the model. Thread creation raises it before
+    its create POST; the invite workflow raises it on the opportunity POST,
+    which runs before `/send` and so cannot have delivered anything.
     """
 
 
@@ -3977,20 +3982,6 @@ def _is_refusal(status):
     return status < 500 and status != 424
 
 
-class _InviteNotSent(Exception):
-    """A non-refusal failure on the opportunity POST, before `/send` ever ran.
-
-    `offer_invite` makes two calls and only the second delivers anything, so a
-    failure in the first means nothing reached the invitee -- and the POST is
-    replay-safe by source message, so a later turn resumes cleanly. The tool
-    handler cannot tell that from a status: it sees one exception for two
-    calls, and would otherwise report a possibly-delivered invite and forbid
-    the retry that would have worked. This frame is the one that knows which
-    call it was in. A refusal is left alone; it reads the same wherever it
-    lands.
-    """
-
-
 def _invite_retry_safe(exc):
     """Whether Plow says it left the invite re-sendable.
 
@@ -4030,7 +4021,7 @@ def _plow_offer_invite(args, **_kwargs):
     try:
         operation = adapter.offer_invite(turn)
         result = asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=20)
-    except _InviteNotSent as exc:
+    except _PlowPreflightError as exc:
         return json.dumps({
             "success": False,
             "error": f"the invite never started ({exc}); nothing was sent, so calling again on a "
