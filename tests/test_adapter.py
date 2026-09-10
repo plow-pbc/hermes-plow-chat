@@ -1964,24 +1964,6 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     assert "outside the grant" not in caplog.text
 
 
-def test_a_listing_without_a_provider_type_is_served_as_the_phone_line(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """`_provider` defaults an absent `provider_type` to `imessage` -- the
-    shape a plow older than the field serves, and that default governs every
-    chat on such a deployment. Pin the observable outcome: a listing whose
-    lines carry no `provider_type` at all is served as the phone line entire,
-    none of it foreign."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    legacy = [_chat(uid) for uid in ("cht_a", "cht_b")]
-    for chat in legacy:
-        del chat["participants"][0]["line"]["provider_type"]
-    adapter._set_reach(legacy)
-    assert adapter.chat_uids == frozenset({"cht_a", "cht_b"})
-    assert adapter._foreign == frozenset()
-
-
 class _SocketHTTP(_HTTP):
     def __init__(self) -> None:
         super().__init__()
@@ -2496,7 +2478,8 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     peer_room = _chat("cht_peer")
-    peer_room["participants"] = [{"type": "agent", "relationship": "peer"},
+    peer_room["participants"] = [{"type": "agent", "relationship": "self", "line": {"provider_type": "imessage"}},
+                                 {"type": "agent", "relationship": "peer"},
                                  {"type": "member", "role": "owner",
                                   "display_name": "Sam", "provider_key": "+15550000001"}]
     unnamed = _chat("cht_u", name="+15550000001, +15550000002", group=True)

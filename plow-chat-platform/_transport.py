@@ -222,9 +222,8 @@ def _owner_fact(owner):
 
 
 def _provider(chat):
-    # Which line this chat is, off its own agent participant. Absent only on a
-    # plow that predates the field, where every chat is a phone chat anyway.
-    return _self_agent_line(chat).get("provider_type", "imessage")
+    # Which line this chat is, off its own agent participant.
+    return _self_agent_line(chat)["provider_type"]
 
 
 def _split(listing, provider):

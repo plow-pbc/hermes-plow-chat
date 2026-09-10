@@ -37,6 +37,11 @@ The directory is named for the plugin id so the install can be a directory copy:
 > `agent-mgr`'s `images.hermes_local` base tag, which can't move past it).
 > Installing this plugin before the API is available fails loudly instead of
 > silently skipping delivery.
+> `plow_email` carries a further prerequisite: until plow lists Gmail threads
+> as chats in `GET /v1/chats` and dispatches `POST /v1/chats/{uid}/messages`
+> by provider, the adapter gets no inbound turns and its replies fail. That
+> work is tracked by [`hermes-plugin-plow#109`](https://github.com/plow-pbc/hermes-plugin-plow/issues/109) —
+> don't bump the plugin pin to a SHA where `plow_email` is registered until it ships.
 
 ## Where changes go
 
