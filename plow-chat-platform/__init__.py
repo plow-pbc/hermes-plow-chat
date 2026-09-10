@@ -1959,7 +1959,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         identity = turn["participant_identity"]
         question = (
             f"Hey! I noticed {identity} loves Plow and isn't a user yet. "
-            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "Can I send them a Plow invite, and do that in situations like this on your behalf? "
             "You'll both get $100 in free API credits. 🙂"
         )
         record = _deferred_questions.enqueue(
