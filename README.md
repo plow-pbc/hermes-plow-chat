@@ -13,8 +13,8 @@ tests/                  the adapter suite
 ```
 
 The directory is named for the plugin id so the install can be a directory copy:
-`agent-mgr` snapshots this repo at the pinned SHA and swaps `plow-chat-platform/`
-into place. Nothing else here — README, tests, justfile — reaches an agent.
+`plow-hermes-agent`'s Dockerfile fetches this repo at the pinned SHA and bakes
+`plow-chat-platform/` into the image. Nothing else here — README, tests, justfile — reaches an agent.
 
 > **Ordering.** Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
 > and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
