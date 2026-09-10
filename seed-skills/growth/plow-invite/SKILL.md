@@ -6,7 +6,7 @@ version: 1.5.0
 
 # Plow invite: delight-triggered referral
 
-<!-- The only hand-edited copy: plow-pbc/hermes-plow-chat
+<!-- The only hand-edited copy: plow-pbc/hermes-plugin-plow
      seed-skills/growth/plow-invite. The base image stages this file out of
      this repo's tarball at the plugin SHA it pins, so there is nothing to copy
      by hand. Configuration comes only from the environment (PLOW_API_BASE /

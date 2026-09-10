@@ -1,4 +1,4 @@
-# Review instructions — hermes-plow-chat
+# Review instructions — hermes-plugin-plow
 
 Repo-specific reviewer policy. The universal voice posture (Broken-Glass,
 pro-simplification, and the don't-propose list) is supplied by the reviewers

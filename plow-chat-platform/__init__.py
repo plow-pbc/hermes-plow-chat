@@ -864,7 +864,7 @@ REPLY_TARGET_PROMPT = (
 # in rooms with a third party in them, but the gate cannot tell an answer
 # written mid-turn from the working-out around it -- withholding on that guess
 # lost the intended answer in live trials, twice; see README and
-# plow-pbc/hermes-plow-chat#89. So the ordering is asked for here rather than
+# plow-pbc/hermes-plugin-plow#89. So the ordering is asked for here rather than
 # inferred there, and it is what keeps the answer out of the withheld set.
 _ANSWER_LAST = (
     "Write your answer LAST. Whatever you write last is what this turn is "

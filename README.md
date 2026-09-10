@@ -1,4 +1,4 @@
-# hermes-plow-chat
+# hermes-plugin-plow
 
 The **Plow Chat platform plugin for Hermes** — an agent's phone line. Inbound
 arrives over a WebSocket the plugin dials out on; outbound and cron delivery go
@@ -73,11 +73,11 @@ Examples:
 
 - Adheres: #61 deleted `_invite_message_template` — the `$100 in cloud credits`
   line and the activation-code placeholders — so plow composes the whole invite,
-  net −32 LOC: https://github.com/plow-pbc/hermes-plow-chat/pull/61
+  net −32 LOC: https://github.com/plow-pbc/hermes-plugin-plow/pull/61
 - Violates: #64 put ~110 lines of `plow-gog` verb tables, flag parsing and an
   explicit re-implementation of latch's `isHelpInvocation` in this plugin — a
   second copy latch's pin-bump checklist does not know about:
-  https://github.com/plow-pbc/hermes-plow-chat/pull/64
+  https://github.com/plow-pbc/hermes-plugin-plow/pull/64
 
 ## Who consumes this
 
