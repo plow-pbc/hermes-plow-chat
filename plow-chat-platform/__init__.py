@@ -41,7 +41,15 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
-BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
+from ._transport import (
+    BASE,
+    _PlowAuthError,
+    _auth_raise_for_status,
+    _bearer,
+    _granted_chats,
+    _read_identity,
+)
+
 LATCH_URL = "https://plow.co/latch"
 # How long a QUIET answer from /v1/agents/me serves the gate below. Only the
 # quiet answer is cached: withholding while the owner has already turned
@@ -1094,22 +1102,6 @@ class _Inbound:
     reply_to: dict | None = None
 
 
-class _PlowAuthError(Exception):
-    """The credential itself was refused (401). Terminal: every retry presents
-    the same revoked token, so the caller must stop, not sleep."""
-
-
-def _auth_raise_for_status(resp):
-    """The one status seam for every request that presents the credential.
-
-    Status BEFORE parse (a proxy 401 is not JSON), and 401 ONLY -- a 403 is
-    resource-scoped (removed from one chat) and keeps warn-and-retry.
-    """
-    if resp.status == 401:
-        raise _PlowAuthError
-    resp.raise_for_status()
-
-
 def _platform():
     """Resolve the Platform member LAZILY, never at import.
 
@@ -1128,7 +1120,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=_platform())
         self._configured_home_chat_uid = os.environ["PLOW_HOME_CHANNEL"]
         self.home_chat_uid = self._configured_home_chat_uid
-        self.auth = {"Authorization": "Bearer " + os.environ["PLOW_AGENT_TOKEN"]}
+        self.auth = _bearer()
         self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
@@ -1264,30 +1256,15 @@ class PlowChatAdapter(BasePlatformAdapter):
         """Discover the token's grant-scoped reach. The home is fixed by
         PLOW_HOME_CHANNEL -- a grant that drops it is refused in _set_reach."""
         try:
-            async with http.get(f"{BASE}/v1/chats", headers=self.auth) as resp:
-                _auth_raise_for_status(resp)
-                body = await resp.json(content_type=None)
-            if body["has_more"]:
-                raise RuntimeError("the granted chat listing is truncated")
-            self._set_reach(body["data"])
-            # Who this agent is, for the prompt prefix. Only a 200 sets it:
-            # refresh has no timer (connect, group creation, an unknown-chat
-            # frame), so overwriting on a failure would let one blip strip the
-            # offer for the life of a healthy socket.
-            async with http.get(f"{BASE}/v1/agents/cloud/me", headers=self.auth) as resp:
-                if resp.status == 200:
-                    me = await resp.json(content_type=None)
-                    self._identity = {"signup": me.get("signup"),
-                                      "number": (me.get("line") or {}).get("provider_key")}
-                elif resp.status != 404:
-                    # 404 is the documented "this token is not one agent" -- a
-                    # wildcard or multi-line grant -- and keeps what we hold.
-                    # Anything else is not an answer about identity: through the
-                    # credential seam (a 401 is terminal), then fail the refresh
-                    # like the grant read above so _listen retries, rather than
-                    # silently running without the offer.
-                    _auth_raise_for_status(resp)
-                    raise RuntimeError(f"the identity read returned HTTP {resp.status}")
+            self._set_reach(await _granted_chats(http, self.auth))
+            # Who this agent is, for the prompt prefix. Only a 200 sets it
+            # (`_read_identity` answers None on the documented 404): refresh
+            # has no timer (connect, group creation, an unknown-chat frame),
+            # so overwriting on a failure would let one blip strip the offer
+            # for the life of a healthy socket.
+            me = await _read_identity(http, self.auth)
+            if me is not None:
+                self._identity = me
         except _PlowAuthError:
             raise                              # terminal; _listen owns the stop
         except Exception as exc:              # noqa: BLE001 - the caller reconnects
