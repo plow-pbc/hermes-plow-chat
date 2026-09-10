@@ -2631,7 +2631,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
             "status": "consent_required",
             "opportunity_id": "agi_1",
             "owner_name": "Alex",
-            "praise": "I love Plow — this is amazing.",
+            "praise": "I love Plow. This is amazing.",
         }
 
     monkeypatch.setattr(adapter, "_invite_api", api)
@@ -2654,7 +2654,7 @@ async def test_offer_checks_consent_and_eligibility_before_fixed_question(
         },
         "question": (
             "Hey! I noticed Taylor loves Plow and isn't a user yet. "
-            "Can I send them a Plow invite—and do that in situations like this on your behalf? "
+            "Can I send them a Plow invite, and do that in situations like this on your behalf? "
             "You'll both get $100 in free API credits. 🙂"
         ),
         "handler_name": "invite-consent",
@@ -2696,7 +2696,7 @@ async def test_resolved_consent_sends_once_or_stays_declined(
                     "opportunity_id": "agi_1",
                     "source_chat_id": "cht_b",
                     "owner_name": "Alex",
-                    "praise": "I love Plow — this is amazing.",
+                    "praise": "I love Plow. This is amazing.",
                 }
             return {"status": "sent"}
         return {"status": "disabled"}
@@ -5571,6 +5571,87 @@ async def test_completed_sequence_suppresses_final_reply_only_in_its_live_turn(m
     adapter._sequence_turns[id(next_turn)] = next_turn
     assert (await adapter.send('cht_a', 'Next turn', metadata={'notify': True})).success
     assert http.posts == posts + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handoff', ['message', 'goal'])
+@pytest.mark.parametrize('timing', ['before', 'during', 'after_no_reply', 'after_final'])
+async def test_queued_inbound_reply_before_processing_complete(
+    monkeypatch, tmp_path, handoff, timing,
+):
+    """Hermes can recurse into a queued model turn inside one adapter lifecycle."""
+    module, adapter, turn, root, http = _sequence_fixture(monkeypatch, tmp_path)
+    _mark_anchored(adapter, 'cht_a')
+    handed_off = []
+    other_turn = dict(chat_uid='cht_b', sequence_completed=True)
+    adapter._sequence_turns[id(other_turn)] = other_turn
+
+    async def queue_in_hermes(event):
+        handed_off.append(event)
+
+    monkeypatch.setattr(adapter, 'handle_message', queue_in_hermes)
+
+    async def inbound():
+        # The socket task has its own ContextVar context, but must invalidate
+        # the suppression held by the still-running model task.
+        adapter._active_turn.set(None)
+        if handoff == 'goal':
+            await adapter._goal_fire('cht_a', dict(generation='queued', text='Learn the city'))
+        else:
+            await adapter._deliver(
+                [SimpleNamespace(uid='msg_city', starts_slash_command=False,
+                                 sender=dict(type='member', role='owner', uid='owner'))],
+                [([], [], 'Sacramento')], 'cht_a',
+            )
+
+    original_post = adapter._sequence_post
+
+    async def post_with_queued_inbound(*args):
+        result = await original_post(*args)
+        if timing == 'during':
+            await asyncio.create_task(inbound())
+        return result
+
+    if timing == 'before':
+        await asyncio.create_task(inbound())
+    monkeypatch.setattr(adapter, '_sequence_post', post_with_queued_inbound)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='City?')]}, turn))['success']
+    delivered = http.posts
+    if timing.startswith('after'):
+        if timing == 'after_final':
+            assert (await adapter.send('cht_a', 'Intro delivered. NO_REPLY')).success
+            assert http.posts == delivered, 'suppression holds until the handoff'
+        # Otherwise Hermes consumed exact NO_REPLY without calling send().
+        await asyncio.create_task(inbound())
+    else:
+        # The handoff has already lifted suppression, so the intro's own tail
+        # reaches the chat instead of being dropped behind the sequence.
+        intro_tail = 'Intro delivered. NO_REPLY'
+        assert (await adapter.send('cht_a', intro_tail, metadata={'notify': True})).success
+        delivered += 1
+        assert http.posts == delivered
+        assert http.calls[-1][2]['json'] == {'body': intro_tail}
+
+    assert len(handed_off) == 1
+    assert other_turn['sequence_completed'], 'handoff must not invalidate another chat'
+    assert adapter._active_turn.get() is turn
+    assert adapter._sequence_turns[id(turn)] is turn
+    reply = 'Sacramento, Pacific time, got it. Sports?'
+    assert (await adapter.send('cht_a', reply, metadata={'notify': True})).success
+    delivered += 1
+    assert http.posts == delivered, 'queued model reply must post before on_processing_complete'
+    assert http.calls[-1][2]['json'] == {'body': reply}
+
+    # Once a handoff makes the lifecycle ambiguous, even another sequence
+    # cannot re-arm suppression. This deliberately permits duplicate prose
+    # from the intro rather than silently losing a later model turn's reply.
+    monkeypatch.setattr(adapter, '_sequence_post', original_post)
+    assert (await adapter.send_sequence({'items': [dict(type='text', body='Next question')]}, turn))['success']
+    tail = 'Question delivered. NO_REPLY'
+    assert (await adapter.send('cht_a', tail, metadata={'notify': True})).success
+    delivered += 2
+    assert http.posts == delivered
+    assert http.calls[-1][2]['json'] == {'body': tail}
 
 
 @pytest.mark.asyncio
