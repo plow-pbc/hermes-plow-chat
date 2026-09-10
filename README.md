@@ -95,11 +95,12 @@ repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
 agent-mgr install-plugin <name>     # or as part of `agent-mgr restore <name>`
 ```
 
-It lands as two files in the agent's own home, and nothing else:
+It lands as three files in the agent's own home, and nothing else:
 
 ```
 ~/.hermes-<name>/plugins/plow-chat-platform/
   __init__.py
+  _transport.py
   plugin.yaml
 ```
 
@@ -439,7 +440,7 @@ reference for the underlying Hermes behaviour.
 just test
 ```
 
-The suite loads `__init__.py` by path and stubs the `gateway.*` modules Hermes
+The suite loads the plugin directory as a package and stubs the `gateway.*` modules Hermes
 supplies at runtime, so it needs no Hermes install and touches no network.
 
 ## Provenance

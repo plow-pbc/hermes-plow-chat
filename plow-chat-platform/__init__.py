@@ -87,7 +87,7 @@ _WORKING_PREFIX = "⏳ Working —"
 _NO_REPLY_PREFIX = "⚠️ No reply: "
 _DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
-PROVIDER = "linq"                     # the phone line; the email line is plow_email's (design §4)
+PROVIDER = "linq"                     # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -207,7 +207,7 @@ def _owner_dm(chat):
 def _chat_summary(chat):
     """One chat resource, reduced to what picking a room actually takes.
 
-    `kind` is `_is_solo_dm`'s answer, so a room holding one human and a peer
+    `kind` is `_chat_type`'s answer, so a room holding one human and a peer
     agent reads as a group -- the same call every other gate here makes, and
     the reason it is not "count the humans".
 
@@ -2596,6 +2596,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.info("[plow_chat] backfilled %d missed message(s)", len(missed))
 
     async def _listen(self):
+        global _live
         first_connection = True
         # Durable across restarts, unlike `first_connection`: `connect`
         # refreshes reach before starting this loop, so `_anchored_chats`
@@ -2620,16 +2621,20 @@ class PlowChatAdapter(BasePlatformAdapter):
             newest_anchor = first_connection and first_install
             first_connection = False
             # `http` only when newest_anchor: `_ensure_anchor` reads the
-            # newest uid itself, under its own lock. Before the socket,
-            # never inside it -- reading after `ws_connect` races the frames
-            # that connection is already buffering.
+            # newest uid itself, under its own lock, so a concurrent
+            # `start_group_thread` empty anchor for the same chat_uid cannot
+            # land between a read taken here and a write made there. Before
+            # the socket, never inside it -- reading after `ws_connect` races
+            # the frames that connection is already buffering.
             for chat_uid in self.chat_uids:
                 await self._ensure_anchor(chat_uid, http if newest_anchor else None)
             # Published only now, after every chat known at this connect has
             # been through the anchor decision -- never in `connect`, where
             # publishing let a tool call's bridged coroutine reach
             # `_ensure_anchor` before this task had run. Cleared in
-            # `disconnect` and after `_serve` returns.
+            # `disconnect` and after `_serve` returns. Republishing the same
+            # `_live` tuple on every reconnect is harmless: same adapter, same
+            # loop for its whole life.
             _live = (self, asyncio.get_running_loop())
             async with _socket(http, ticket) as ws:
                 self._mark_connected()
@@ -2653,7 +2658,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Terminal. State first (`_serve` marked us disconnected), then the
         # tool handle: a confirmed group send against a retired credential
         # must refuse, not invoke this adapter. (Re-port of #17.)
-        global _live
         if _live is not None and _live[0] is self:
             _live = None
 
@@ -2671,6 +2675,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # job, and a message that lands acks its own baseline in `_deliver`.
             await self._refresh_reach(http)
         if chat_uid in self._foreign:
+            log.debug("[plow_chat] frame for %s belongs to another platform", chat_uid)
             return                           # the email line's thread; plow_email's turn
         if chat_uid not in self.chat_uids:
             log.warning("[plow_chat] dropped frame outside the grant: %s", chat_uid)

@@ -1923,7 +1923,7 @@ async def test_reach_refresh_reads_the_signup_facts_and_only_a_200_speaks(
 async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An email thread is a chat on the same grant (design §1), listed by the
+    """An email thread is a chat on the same grant (plow-pbc/hermes-plugin-plow#109), listed by the
     same `GET /v1/chats` and carried by the same socket. It must never render
     as an SMS room: reach, the send guard, the tool listing and the alias
     registry see only `linq` chats, and a frame for a `gmail` chat is dropped
@@ -1960,6 +1960,23 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     assert handled == [], "the email line's turn is plow_email's, never plow_chat's"
     assert http.gets == reads_before, "a known-foreign chat costs no reach refresh"
     assert "outside the grant" not in caplog.text
+
+
+def test_a_listing_without_provider_is_served_as_the_phone_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """`_provider` defaults an absent key to `linq` -- today's actual shape,
+    since plow does not yet serve the field on any chat, and this default
+    governs every chat on every deployed agent until it does. Pin the
+    observable outcome: a listing with no `provider` key at all is served as
+    the phone line entire, none of it foreign."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    legacy = [{k: v for k, v in _chat(uid).items() if k != "provider"}
+              for uid in ("cht_a", "cht_b")]
+    adapter._set_reach(legacy)
+    assert adapter.chat_uids == frozenset({"cht_a", "cht_b"})
+    assert adapter._foreign == frozenset()
 
 
 class _SocketHTTP(_HTTP):

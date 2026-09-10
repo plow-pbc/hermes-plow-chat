@@ -3,7 +3,7 @@
 """What both Plow platforms share: the API base and credential, the granted
 socket and its reconnect loop, the reach and identity reads, and the roster
 readers. Policy -- roster prose, trust, disclosure, tools -- stays with the
-platform that owns it (design §4).
+platform that owns it (plow-pbc/hermes-plugin-plow#109).
 """
 import asyncio
 import logging
@@ -217,7 +217,7 @@ def _owner_fact(owner):
 
 
 def _provider(chat):
-    # Absent until plow serves it on every chat (design §1); an absent key is
+    # Absent until plow serves it on every chat (plow-pbc/hermes-plugin-plow#109); an absent key is
     # the phone line, which is every chat there is until then.
     return chat.get("provider", "linq")
 
