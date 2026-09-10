@@ -2628,12 +2628,11 @@ def test_invite_owner_notification_refuses_wrong_context(
     assert error.lower() in out["error"].lower()
 
 
-# Plow's 424 body names the provider outcome; only `send_opportunity`'s
-# accepted-but-unpersisted case leaves the invite possibly-delivered.
-_REJECTED_424 = json.dumps({"error": {"details": {"provider_error_code": "rejected"}}})
-_UNCONFIRMED_424 = json.dumps(
-    {"error": {"details": {"provider_error_code": "provider_accepted_persistence_unknown"}}}
-)
+# Plow marks a committed reopen and nothing else (plow#1869), so every other
+# body -- an unconfirmed send, a failed recovery, an older API, a drifted
+# envelope -- is the same "not re-sendable" answer rather than its own case.
+_REOPENED = json.dumps({"error": {"details": {"invite_reopened": True}}})
+_NOT_REOPENED = json.dumps({"error": {"details": {"provider_error_code": "rejected"}}})
 
 
 @pytest.mark.parametrize(
@@ -2641,11 +2640,10 @@ _UNCONFIRMED_424 = json.dumps(
     [
         pytest.param(None, None, "may already have reached", False, id="non-http-unconfirmed"),
         pytest.param(503, "{}", "may already have reached", False, id="5xx-unconfirmed"),
-        pytest.param(424, _UNCONFIRMED_424, "may already have reached", False, id="424-accepted-unconfirmed"),
-        pytest.param(424, _REJECTED_424, "Plow reopened it", True, id="424-rejected-reopened"),
-        pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-unconfirmed"),
-        pytest.param(424, '{"error":{"details":{"other":"x"}}}', "may already have reached", False,
-                     id="424-unrecognized-envelope-is-unconfirmed"),
+        pytest.param(424, _REOPENED, "calling again", True, id="424-marked-reopened"),
+        pytest.param(424, _NOT_REOPENED, "may already have reached", False, id="424-unmarked-is-not-resendable"),
+        pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-not-resendable"),
+        pytest.param(500, _REOPENED, "calling again", True, id="marker-is-read-at-any-status"),
         pytest.param(403, '{"error":{"message":"agent invites not enabled"}}', "Plow declined (403)", False, id="4xx-declined"),
     ],
 )
@@ -2657,17 +2655,16 @@ def test_invite_workflow_reports_delivery_failure(
     expected: str,
     may_call_again: bool,
 ) -> None:
-    """Three outcomes, and the status alone settles only the refusal.
+    """Three outcomes; the status settles only the refusal, Plow says the rest.
 
     A plain 4xx is Plow refusing: terminal, and the model is told what was
-    refused so it stops improvising a route around it. Past that, whether the
-    invite is re-sendable lives in the 424 body -- Plow reopens the opportunity
-    for every provider outcome but `provider_accepted_persistence_unknown`,
-    where the code may already have reached the invitee. Anything that may have
-    landed (that case, a 5xx, a timeout) must not invite another call, or the
-    same person gets a second live invite. Only a code we positively recognize
-    as something else earns a retry -- an undecodable body, and equally a
-    decodable one whose envelope we do not recognize, take the unsafe side."""
+    refused so it stops improvising a route around it. Past that, re-sendability
+    is `invite_reopened`, written only after Plow's recovery commits -- so its
+    absence covers both a send that may have reached the invitee and a recovery
+    that failed with the opportunity still closed. Anything not marked must not
+    invite another call, or the same person gets a second live invite. A body we
+    cannot read, and an API not sending the marker yet, land on that same safe
+    side rather than each needing their own case."""
     module = _load(monkeypatch, tmp_path)
     raises = (RuntimeError("HTTP 503") if status is None
               else module._PlowSendError(status, detail))

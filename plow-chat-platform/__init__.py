@@ -3965,12 +3965,6 @@ async def _handle_invite_consent(question, response):
     return DeferredQuestionResult.done("Got it — I won’t offer Plow invites on your behalf.")
 
 
-# Plow's one 424 provider outcome that must not be retried: the send was
-# accepted but its persistence is unknown, so the code may already have reached
-# the invitee (`MESSAGE_SEND_ERROR_RESPONSES` says so in as many words).
-_ACCEPTED_UNCONFIRMED = "provider_accepted_persistence_unknown"
-
-
 class _InviteNotSent(Exception):
     """A non-refusal failure on the opportunity POST, before `/send` ever ran.
 
@@ -3986,29 +3980,24 @@ class _InviteNotSent(Exception):
 
 
 def _invite_retry_safe(exc):
-    """Whether Plow left this failure in a state a later call can re-send from.
+    """Whether Plow says it left the invite re-sendable.
 
-    Only its 424 ever says so, and only in the body: `send_opportunity` reopens
-    the opportunity for every provider outcome except `_ACCEPTED_UNCONFIRMED`,
-    where the code may already have landed -- so that one stays closed, and
-    calling again would mint a second live invite for the same person. The
-    status alone cannot separate the two, which is what made an earlier
-    `status == 424` test wrong. A 5xx never says anything either: it can arrive
-    after Plow committed, the same "may have landed" position.
+    `send_opportunity` sets `invite_reopened` only after its recovery has
+    COMMITTED (plow#1869), so the marker's absence already covers both states a
+    retry must not touch: a send that may have reached the invitee, and a
+    recovery that failed with the opportunity still closed. Nothing is inferred
+    from the status or the provider code -- which could not separate those two,
+    since a failed recovery re-raises the original error unchanged.
 
-    Only a code we positively recognize as something else earns a retry. An
-    absent one is not evidence of a reopen: an envelope that drifts, or a shape
-    we do not know, would otherwise read as retry-safe and re-mint a live
-    invite -- the single outcome this function exists to prevent.
+    An undecodable body, an older API that does not send the marker, and a
+    drifted envelope all read the same way: not re-sendable. That is the safe
+    side, so this does not depend on which side deploys first.
     """
-    if exc.status != 424:
-        return False
     try:
         details = (json.loads(exc.detail).get("error") or {}).get("details") or {}
     except (ValueError, AttributeError):
         return False
-    code = details.get("provider_error_code")
-    return code is not None and code != _ACCEPTED_UNCONFIRMED
+    return details.get("invite_reopened") is True
 
 
 def _plow_offer_invite(args, **_kwargs):
