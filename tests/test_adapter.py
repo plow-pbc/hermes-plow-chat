@@ -2646,7 +2646,7 @@ _UNCONFIRMED_424 = json.dumps(
         pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-unconfirmed"),
         pytest.param(424, '{"error":{"details":{"other":"x"}}}', "may already have reached", False,
                      id="424-unrecognized-envelope-is-unconfirmed"),
-        pytest.param(429, '{"error":{"message":"agent invite cap reached"}}', "Plow declined (429)", False, id="4xx-declined"),
+        pytest.param(403, '{"error":{"message":"agent invites not enabled"}}', "Plow declined (403)", False, id="4xx-declined"),
     ],
 )
 def test_invite_workflow_reports_delivery_failure(
@@ -2676,14 +2676,16 @@ def test_invite_workflow_reports_delivery_failure(
 
     out = json.loads(module._plow_offer_invite({}))
 
+    terminal = expected.startswith("Plow declined")
+
     assert out["success"] is False
     assert expected in out["error"]
     # Only a re-sendable failure may advertise another call; everything that
     # might already have landed says the opposite, in as many words.
     assert ("calling again" in out["error"]) is may_call_again
-    assert ("do NOT call again" in out["error"]) is (status != 429 and not may_call_again)
+    assert ("do NOT call again" in out["error"]) is not (terminal or may_call_again)
     # `delivery_unknown` marks may-have-landed only -- not a refusal, not a reopen.
-    assert out.get("delivery_unknown", False) is (status != 429 and not may_call_again)
+    assert out.get("delivery_unknown", False) is not (terminal or may_call_again)
 
 
 @pytest.mark.parametrize(
@@ -2956,22 +2958,22 @@ async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """Non-2xx follows the contact book's convention -- `_PlowSendError`
-    carrying the status -- so the tool can tell the daily cap declining from
-    the call falling over. `_auth_raise_for_status` raised aiohttp's own past
+    carrying the status -- so the tool can tell Plow declining from the call
+    falling over. `_auth_raise_for_status` raised aiohttp's own past
     401, which the tool reads as an unconfirmed delivery it should retry."""
     from datetime import datetime, timezone
 
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    http = _ChatResourceHTTP(_Resp({"detail": "agent invite cap reached"}, status=429))
+    http = _ChatResourceHTTP(_Resp({"detail": "agent invites not enabled"}, status=403))
     monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
 
     with pytest.raises(module._PlowSendError) as err:
         await adapter.resume_invite({"opportunity_id": "agi_1",
                                      "triggered_at": datetime.now(timezone.utc).isoformat()})
 
-    assert err.value.status == 429
-    assert "agent invite cap reached" in err.value.detail
+    assert err.value.status == 403
+    assert "agent invites not enabled" in err.value.detail
     assert http.calls[0][0] == "post"
     assert http.calls[0][1] == f"{module.BASE}{INVITE_SEND_CALL[1]}"
 
