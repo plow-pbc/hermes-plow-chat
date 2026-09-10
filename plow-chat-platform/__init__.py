@@ -895,6 +895,10 @@ LATCH_PROMPT = (
     "start with plow_ (plow_run_command, plow_read_file, plow_browser_open, plow_list_skills, "
     "and the rest). Those tools act on the Mac as the owner: their files, apps, signed-in browser "
     "and accounts, contacts, messages, calendar, clipboard, and speakers.\n\n"
+    "That is authorship as well as authority: anything you send from their accounts — mail from "
+    "their mailbox, a text from their number — goes out under their name, in their voice, signed "
+    "as them. Never introduce yourself, never sign as an assistant, and never send a message "
+    "through their channels as yourself.\n\n"
     "These tools act with your owner's authority, so they obey the same trust rule as everything "
     "else in this chat: your owner may direct work on the Mac; members may ask within what the "
     "owner has okayed in this thread, or without a per-ask okay when full trust is enabled. "
@@ -3280,10 +3284,12 @@ def _argv_flag(argv, name):
     return value
 
 
-def _google_send_summary(argv):
+def _google_send_summary(argv, account=None):
     """What `argv` would mail out, as the owner reads it in the approval
     prompt — or None when it sends no mail. `argv` has latch-owned global
-    flags removed, so group and verb are positional.
+    flags removed, so group and verb are positional; `account` is the one
+    latch stripped, and is rendered because the mailbox a send leaves from is
+    the one thing about it the body never says.
     Calendar is not here: booking over a conflict is the agent's judgment to
     make (it can be undone by deleting the event), and the hook cannot read
     the chat the owner already fixed the time in."""
@@ -3295,6 +3301,7 @@ def _google_send_summary(argv):
     lines = [f"Send email ({verb})"]
     if verb != "send" and len(argv) > 3 and not argv[3].startswith("-"):
         lines.append(f"on message {argv[3]}")
+    lines.append(f"from: {account}" if account else "from: your default account")
     for flag in ("to", "cc", "bcc", "subject"):
         value = _argv_flag(argv, flag)
         if value:
@@ -3338,12 +3345,18 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     # Keep the original argv for the approval key and execution.
     classified = argv[:1]
     confirm_conflict = False
+    account = None
     tokens = iter(argv[1:])
     for arg in tokens:
+        # Last-wins, as gog resolves a repeated global flag. The value is kept
+        # rather than dropped: it is the only place the sending mailbox is
+        # named, and the owner cannot read it off the body.
         if arg in ("--account", "-a"):
-            next(tokens, None)
-        elif arg.startswith(("--account=", "-a")):
-            continue
+            account = next(tokens, None)
+        elif arg.startswith("--account="):
+            account = arg[len("--account="):]
+        elif arg.startswith("-a"):
+            account = arg[2:].lstrip("=")
         elif arg == "--confirm-conflict":
             confirm_conflict = True
         else:
@@ -3356,7 +3369,7 @@ def _pre_tool_call(tool_name, args, **_kwargs):
         return {"action": "block",
                 "message": "a draft sent by id shows the owner nothing; send it as one "
                            "gmail send command with recipients, subject and body"}
-    summary = _google_send_summary(classified)
+    summary = _google_send_summary(classified, account)
     # The marker, not the command shape. gog takes --account (and every other
     # global flag) before the group as well as after, so a classifier that
     # expects `calendar` at argv[1] answers no to a real override and waves it
@@ -4034,7 +4047,8 @@ def register(ctx):
         cron_deliver_env_var="PLOW_HOME_CHANNEL",
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
-                      "but skip code blocks and tables.",
+                      "but skip code blocks and tables. This thread is your own line — "
+                      "the number is yours, and here you write as yourself.",
     )
     # A Hermes without this API (older fleet pins) must still get its phone
     # line: the section is guidance, the platform is the product.

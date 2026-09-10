@@ -2158,11 +2158,18 @@ def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "owner" in module.OWNER_CHANNEL_PROMPT.lower()
 
 
-def test_platform_declares_cron_delivery_home_channel(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """Cron's delivery target, and the hint Hermes injects into the prompt —
+    which is where this channel says it is the agent's own line, the one place
+    a per-channel identity fact has to live."""
     module = _load(monkeypatch, tmp_path)
     ctx = mock.Mock()
     module.register(ctx)
-    assert ctx.register_platform.call_args.kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
+    kwargs = ctx.register_platform.call_args.kwargs
+    assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
+    assert "your own line" in kwargs["platform_hint"]
 
 
 class _ToolContext:
@@ -3267,6 +3274,10 @@ def test_leading_global_flags_reach_mail_gate(
     assert all(value in out["message"] for value in (
         "andrew@example.com", "Catching up", "Menlo Park or a video call?",
     ))
+    # The card always names a mailbox; which one depends on whether the send
+    # named it. Whose account it leaves from is not derivable from the body.
+    named_account = any(flag.startswith(("--account", "-a")) for flag in flags)
+    assert ("from: so@plow.co" if named_account else "from: your default account") in out["message"]
     digest = hashlib.sha256(json.dumps(argv).encode("utf-8")).hexdigest()
     assert out["rule_key"] == f"google-send:{digest}"
     plain = module._pre_tool_call(
@@ -5463,7 +5474,11 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
     text = render({})
     assert text == module.LATCH_PROMPT
     assert len(text) <= 4000, "Hermes skips a section over max_chars"
-    for must in ("Latch", "plow_list_skills", "plow_", "not connected"):
+    for must in ("Latch", "plow_list_skills", "plow_", "not connected",
+                 # Authority over the owner's accounts is authorship too: what
+                 # leaves their mailbox or their number leaves as them.
+                 "under their name",
+                 "never send a message through their channels as yourself"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
