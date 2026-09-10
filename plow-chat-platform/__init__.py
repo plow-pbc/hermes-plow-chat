@@ -3417,11 +3417,11 @@ def _plow_send_message(args, **_kwargs):
 
     The adapter's send() is the authority on reach: outside the grant, or a
     cross-chat send during a member's turn, comes back refused and is
-    relayed as-is. Nothing here is a second gate. Sent notify-marked: this is
-    a deliberate agent action on a tool call, not a turn's mid-turn chatter --
-    it also runs on another thread via run_coroutine_threadsafe, where
-    self._active_turn.get() reads None, so an unmarked send here would be
-    held nowhere and just silently never leave while still reporting success."""
+    relayed as-is. Nothing here is a second gate, and none is needed on this
+    side of the hop: run_coroutine_threadsafe copies the calling context onto
+    the task it starts, so _send_guard on the adapter's loop reads the same
+    active turn this thread does -- a member's turn is confined there, on
+    whichever line opened it."""
     chat_id = (args.get("chat_id") or "").strip()
     body = (args.get("body") or "").strip()
     if not chat_id or not body:

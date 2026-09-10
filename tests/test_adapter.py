@@ -2353,7 +2353,8 @@ def _live_tool(
             raise raises
         return result(*args, **kwargs) if callable(result) else result
 
-    setattr(adapter, method, stub)
+    if method is not None:  # None keeps the real send(), for the loop-hop pin below
+        setattr(adapter, method, stub)
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
@@ -5795,6 +5796,30 @@ def test_plow_send_message_reports_the_adapter_refusal_and_mirrors_nothing(
     out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": "hi"}))
     assert out["success"] is False and "confined" in out["error"]
     assert calls == []
+
+
+def test_a_member_email_turn_cannot_steer_a_send_into_a_phone_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The turn survives the hop onto the adapter's loop: the tool bridges with
+    run_coroutine_threadsafe, which copies the calling context, so _send_guard
+    confines a member turn opened on the email line exactly as it confines one
+    opened on the phone line -- one guard, both platforms, no second check
+    beside it. Driven through the real send() and a real loop thread, because a
+    stubbed send is precisely what cannot prove the context crossed."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _live_tool(module, monkeypatch, None)
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    # Exactly what the email line's on_processing_start records for a
+    # non-owner participant on a Gmail thread.
+    module._ACTIVE_TURN.set({"chat_uid": "cht_mail", "owner": False, "dm": False})
+
+    out = json.loads(module._plow_send_message({"chat_id": "cht_b", "body": "steer"}))
+
+    assert out["success"] is False and "confined to 'cht_mail'" in out["error"]
+    assert http.posts == [], "a refusal must not reach Plow at all"
 
 
 @pytest.mark.parametrize("args", [{"chat_id": "", "body": "hi"}, {"chat_id": "cht_x", "body": "  "}])
