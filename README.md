@@ -88,21 +88,12 @@ the base image every hosted Plow agent boots, pins one commit of this repo as
 build time. That is the production consumer. The Docker fleet below is the
 deprecated one.
 
-[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr) pins a SHA of this
-repo in `runtime/plow-chat-plugin.ref` and installs it into every agent's home:
-
-```sh
-agent-mgr install-plugin <name>     # or as part of `agent-mgr restore <name>`
-```
-
-It lands as three files in the agent's own home, and nothing else:
-
-```
-~/.hermes-<name>/plugins/plow-chat-platform/
-  __init__.py
-  _transport.py
-  plugin.yaml
-```
+[`plow-pbc/agent-mgr`](https://github.com/plow-pbc/agent-mgr)'s Docker fleet
+gets this plugin the same way — bundled in that base image, not installed
+separately. Bumping `PLOW_CHAT_PLUGIN_SHA` there, pointing `runtime/stack.json`'s
+`images.hermes_local` at the new base, and running `agent-mgr deploy` moves the
+fleet. It lands at `/opt/hermes/plugins/plow_chat/` on the image, as the same
+three files and nothing else: `__init__.py`, `_transport.py`, `plugin.yaml`.
 
 **Pinned by SHA, never vendored.** A branch ref would silently re-point a running
 agent on the next push here, and this plugin holds the chat token. A vendored
@@ -117,7 +108,7 @@ URL in git.
 | var | required | meaning |
 |---|---|---|
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
-| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land. Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (provider `linq`). Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 

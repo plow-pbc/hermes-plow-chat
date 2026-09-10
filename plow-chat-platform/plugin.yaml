@@ -19,7 +19,7 @@ requires_env:
     secret: true
     password: true
   - name: PLOW_HOME_CHANNEL
-    description: "Home chat uid (cht_...) used for cron and default delivery"
+    description: "Home chat uid (cht_...) used for cron and default delivery; must be a phone-line chat"
     prompt: "Home chat uid"
     secret: false
     password: false
