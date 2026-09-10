@@ -13,6 +13,7 @@ import sys
 import types
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -200,3 +201,23 @@ async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
     assert http.posts == ([(f"{module.BASE}/v1/chats/{target}/messages", {"body": body})] if posted else [])
     assert result.message_id == ("msg_sent" if posted and success else None)
     assert success or result.error.startswith("Plow Email")
+
+
+def test_register_declares_both_platforms_on_one_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """One plugin, two registry entries: the identity split -- name, label,
+    hint, session namespace -- lives there, not in the directory layout
+    (design §4). The email line declares no cron home: it has no standing
+    thread for a delivery to land in."""
+    module = _load(monkeypatch, tmp_path)
+    ctx = mock.Mock()
+    module.register(ctx)
+    entries = {call.kwargs["name"]: call.kwargs for call in ctx.register_platform.call_args_list}
+    assert list(entries) == ["plow_chat", "plow_email"]
+    email = entries["plow_email"]
+    assert email["label"] == "Plow Email"
+    assert email["platform_hint"] == module.plow_email.hint()
+    assert "cron_deliver_env_var" not in email
+    assert email["check_fn"]()
+    assert isinstance(email["adapter_factory"](SimpleNamespace(extra={})), module.plow_email.PlowEmailAdapter)

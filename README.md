@@ -9,6 +9,7 @@ plow-chat-platform/     exactly what gets installed, and nothing else
   plugin.yaml           the manifest -- registers the platform id
   __init__.py           the chat adapter and the tools; Hermes loads it from the plugin root
   _transport.py         the transport the chat adapter runs, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109
+  email.py              the email-line adapter: plow_email, on the same transport
 tests/                  the adapter suite
 ```
 
@@ -178,6 +179,28 @@ turn data. If the reply has no attachments of its own, the adapter delivers the
 quoted parent's media through the normal attachment path: the matching provider
 part when its index is available, otherwise all parent attachments. Everything
 comes from the message frame; no parent-message lookup is made.
+
+### The email line (`plow_email`)
+
+The agent's `@plow.co` address is its own Hermes platform, registered by this
+same plugin on the same credential and socket. Plow stores each Gmail thread
+as a chat with provider `gmail`; this adapter serves those and the phone-line
+adapter serves the `linq` ones, so a mail never renders as an SMS room and a
+text never renders as an email. Sessions are keyed
+`plow_email:<dm|group>:<cht_ id>`; the platform hint names the line's
+address, read off the thread's own agent participant at connect. Replies go
+out through the same chat send endpoint — plow dispatches on the provider —
+with no approval gate: this is the agent's own line, like its number. Only
+the turn's answer, a cron delivery, or a turn-less send is ever mailed;
+mid-turn prose and the runtime's diagnostics are dropped. No cron home
+(`PLOW_HOME_CHANNEL` stays the phone line's), no roster policy on
+multi-address threads, and no backfill across a socket gap in v1.
+
+`plow_email` needs no dotenv entry of its own: it reads the same
+`PLOW_AGENT_TOKEN` as `plow_chat`, and Hermes's `_enable_plugin_platform`
+auto-enables every registered plugin platform whose `check_fn` passes, with
+no `is_connected` gate — so it comes up on the pin bump alone, same as the
+phone line.
 
 ### Group discretion and full trust
 

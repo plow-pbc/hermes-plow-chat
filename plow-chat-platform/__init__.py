@@ -3881,6 +3881,17 @@ def register(ctx):
                       "but skip code blocks and tables. This thread is your own line — "
                       "the number is yours, and here you write as yourself.",
     )
+    # The agent's own email line, on the same transport (design §5). The
+    # hint's address is written onto this entry by the adapter once reach
+    # has read it -- see PlowEmailAdapter._publish_hint. No cron home: an
+    # email line has no standing thread for a delivery to land in.
+    ctx.register_platform(
+        name=plow_email.PLATFORM_NAME,
+        label="Plow Email",
+        adapter_factory=lambda cfg: plow_email.PlowEmailAdapter(cfg),
+        check_fn=plow_email.check_requirements,
+        platform_hint=plow_email.hint(),
+    )
     # A Hermes without this API (older fleet pins) must still get its phone
     # line: the section is guidance, the platform is the product.
     register_section = getattr(ctx, "register_system_prompt_section", None)

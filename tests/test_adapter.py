@@ -2238,7 +2238,7 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     module = _load(monkeypatch, tmp_path)
     ctx = mock.Mock()
     module.register(ctx)
-    kwargs = ctx.register_platform.call_args.kwargs
+    [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
 
