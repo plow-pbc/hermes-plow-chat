@@ -2096,7 +2096,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                 },
             )
         except _PlowSendError as exc:
-            if exc.status < 500:
+            if _is_refusal(exc.status):
                 raise
             raise _InviteNotSent(exc.status) from exc
         except Exception as exc:
@@ -3965,6 +3965,18 @@ async def _handle_invite_consent(question, response):
     return DeferredQuestionResult.done("Got it — I won’t offer Plow invites on your behalf.")
 
 
+def _is_refusal(status):
+    """Plow saying no, as opposed to a send that failed.
+
+    Every 4xx but 424: that one is a delivery status, so it answers "did it
+    arrive", never "may I". Both invite call sites ask this same question, and
+    the bug that named this was them drifting -- only one of them knew about
+    424, so a 424 on the opportunity POST was reported as possibly-delivered by
+    a call that had not sent anything yet.
+    """
+    return status < 500 and status != 424
+
+
 class _InviteNotSent(Exception):
     """A non-refusal failure on the opportunity POST, before `/send` ever ran.
 
@@ -4030,7 +4042,7 @@ def _plow_offer_invite(args, **_kwargs):
         # and naming what was refused is what stops the model improvising a
         # route around it. Past that the question is whether the invite is
         # re-sendable, which only the body answers.
-        if exc.status < 500 and exc.status != 424:
+        if _is_refusal(exc.status):
             return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
         if _invite_retry_safe(exc):
             return json.dumps({

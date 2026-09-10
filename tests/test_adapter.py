@@ -2979,6 +2979,7 @@ async def test_a_declined_invite_send_reaches_the_tool_as_a_decline(
     ("status", "raises_not_sent"),
     [
         pytest.param(503, True, id="5xx-on-create-never-started"),
+        pytest.param(424, True, id="424-on-create-never-started"),
         pytest.param(404, False, id="4xx-on-create-is-still-a-refusal"),
     ],
 )
