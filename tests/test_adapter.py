@@ -2644,6 +2644,10 @@ _UNCONFIRMED_424 = json.dumps(
         pytest.param(424, _UNCONFIRMED_424, "may already have reached", False, id="424-accepted-unconfirmed"),
         pytest.param(424, _REJECTED_424, "Plow reopened it", True, id="424-rejected-reopened"),
         pytest.param(424, "not json", "may already have reached", False, id="424-undecodable-is-unconfirmed"),
+        pytest.param(424, "{}", "may already have reached", False, id="424-empty-envelope-is-unconfirmed"),
+        pytest.param(424, '{"error":{}}', "may already have reached", False, id="424-no-details-is-unconfirmed"),
+        pytest.param(424, '{"error":{"details":{"other":"x"}}}', "may already have reached", False,
+                     id="424-unrecognized-envelope-is-unconfirmed"),
         pytest.param(429, '{"error":{"message":"agent invite cap reached"}}', "Plow declined (429)", False, id="4xx-declined"),
     ],
 )
@@ -2663,8 +2667,9 @@ def test_invite_workflow_reports_delivery_failure(
     for every provider outcome but `provider_accepted_persistence_unknown`,
     where the code may already have reached the invitee. Anything that may have
     landed (that case, a 5xx, a timeout) must not invite another call, or the
-    same person gets a second live invite. An undecodable body is treated as
-    the unsafe side."""
+    same person gets a second live invite. Only a code we positively recognize
+    as something else earns a retry -- an undecodable body, and equally a
+    decodable one whose envelope we do not recognize, take the unsafe side."""
     module = _load(monkeypatch, tmp_path)
     raises = (RuntimeError("HTTP 503") if status is None
               else module._PlowSendError(status, detail))

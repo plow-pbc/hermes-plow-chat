@@ -3974,6 +3974,11 @@ def _invite_retry_safe(exc):
     status alone cannot separate the two, which is what made an earlier
     `status == 424` test wrong. A 5xx never says anything either: it can arrive
     after Plow committed, the same "may have landed" position.
+
+    Only a code we positively recognize as something else earns a retry. An
+    absent one is not evidence of a reopen: an envelope that drifts, or a shape
+    we do not know, would otherwise read as retry-safe and re-mint a live
+    invite -- the single outcome this function exists to prevent.
     """
     if exc.status != 424:
         return False
@@ -3981,7 +3986,8 @@ def _invite_retry_safe(exc):
         details = (json.loads(exc.detail).get("error") or {}).get("details") or {}
     except (ValueError, AttributeError):
         return False
-    return details.get("provider_error_code") != _ACCEPTED_UNCONFIRMED
+    code = details.get("provider_error_code")
+    return code is not None and code != _ACCEPTED_UNCONFIRMED
 
 
 def _plow_offer_invite(args, **_kwargs):
