@@ -3190,6 +3190,7 @@ def test_start_group_does_not_require_a_trust_question(
     assert "Do you want them to be able to talk to me" not in (
         module.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
     )
+    assert "returned `trusted` value is authoritative: read it and tell the owner if it differs" in module.PLOW_START_GROUP_MESSAGE_SCHEMA["description"]
 
 
 def test_disconnected_gateway_sends_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:

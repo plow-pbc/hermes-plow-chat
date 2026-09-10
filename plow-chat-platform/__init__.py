@@ -3379,7 +3379,10 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "to discretion: the owner can share what they ask for, and members need the "
         "owner's okay in the thread for new kinds of asks. Full trust can be enabled "
         "later with plow_set_conversation_trusted; no trust question is needed to "
-        "start the group."
+        "start the group. `trusted` applies only to newly created threads "
+        "(created=true). When adopting an existing thread (created=false), the "
+        "returned `trusted` value is authoritative: read it and tell the owner "
+        "if it differs from what they requested."
     ),
     "parameters": {
         "type": "object",
