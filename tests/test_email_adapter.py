@@ -172,6 +172,7 @@ async def test_an_email_turn_confines_the_chat_tools_and_never_sends_from_the_ow
         pytest.param("cht_m", ("cht_m", False), {"notify": True}, "Here it is.", True, True, id="member-reply"),
         pytest.param("cht_n", ("cht_m", False), {"notify": True}, "Here it is.", False, False, id="member-cross-thread"),
         pytest.param("cht_a", None, {"notify": True}, "Hi", False, False, id="not-an-email-thread"),
+        pytest.param("cht_m", None, {"notify": True}, "Attached below.", True, False, id="plow-refused-it"),
     ],
 )
 async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
@@ -183,11 +184,12 @@ async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
     cron delivery (`job_id`) or a turn-less send goes out -- the model's
     working-out and Hermes' own diagnostics never do, and there is no verbose
     carve-out. The endpoint is the chat send; plow dispatches on the chat's
-    provider (design §3). A member's turn is confined to its own thread."""
+    provider (design §3). A member's turn is confined to its own thread, and
+    a send plow refuses fails loudly rather than reading as delivered."""
     module, _entry = _load_email(monkeypatch, tmp_path)
     mail = _adapter(module)
     mail._set_reach([_chat("cht_a"), _mail_chat("cht_m"), _mail_chat("cht_n")])
-    http = _HTTP()
+    http = _HTTP(status=400 if posted and not success else 200)
     monkeypatch.setattr(module.plow_email.aiohttp, "ClientSession", lambda *a, **k: http)
     if turn:
         module._ACTIVE_TURN.set({"chat_uid": turn[0], "owner": turn[1], "dm": False})
@@ -196,5 +198,5 @@ async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
 
     assert result.success is success
     assert http.posts == ([(f"{module.BASE}/v1/chats/{target}/messages", {"body": body})] if posted else [])
-    if posted:
-        assert result.message_id == "msg_sent"
+    assert result.message_id == ("msg_sent" if posted and success else None)
+    assert success or result.error.startswith("Plow Email")

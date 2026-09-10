@@ -1839,7 +1839,8 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
 
 
 class _HTTP:
-    def __init__(self) -> None:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
         self.posts: list[tuple[str, dict[str, Any]]] = []
 
     async def __aenter__(self) -> _HTTP:
@@ -1849,7 +1850,7 @@ class _HTTP:
 
     def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
         self.posts.append((url, json))
-        return _Resp({"uid": "msg_sent"})
+        return _Resp({"uid": "msg_sent"} if self.status < 400 else {"detail": "nope"}, self.status)
 
 
 async def test_a_grant_that_drops_the_configured_home_is_refused(

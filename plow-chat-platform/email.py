@@ -178,8 +178,10 @@ class PlowEmailAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Plow Email member turn is confined to {turn['chat_uid']!r}")
         # Every send here is an email, so the classifier's verdict is final:
         # no verbose read and no owner-DM carve-out, unlike the phone line.
-        if _is_chatter(turn, chat_id, metadata) or body.startswith(_DIAGNOSTIC_PREFIXES):
-            log.info("[plow_email] dropped mid-turn text for %s", chat_id)
+        diagnostic = body.startswith(_DIAGNOSTIC_PREFIXES)
+        if diagnostic or _is_chatter(turn, chat_id, metadata):
+            log.info("[plow_email] dropped %s for %s",
+                     "diagnostic" if diagnostic else "mid-turn prose", chat_id)
             return SendResult(success=True)
         # The chat send endpoint: plow dispatches on the chat's own provider
         # (design §3), so an email leaves by the same door as a text.
