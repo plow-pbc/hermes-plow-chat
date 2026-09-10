@@ -3988,6 +3988,7 @@ async def test_plow_credit_exhaustion_sends_one_plain_sentence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     prefix: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     http = _SettingsHTTP(_me(verbose=False))
@@ -4006,6 +4007,10 @@ async def test_plow_credit_exhaustion_sends_one_plain_sentence(
     assert http.posts == [(f"{module.BASE}/v1/chats/cht_a/messages", {
         "body": "I've run out of Plow credit for now — top up in the portal and I'll pick this back up.",
     })]
+
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, f"[plow_chat] replaced Plow credit error: {error}"),
+    ]
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["quiet", "verbose"])

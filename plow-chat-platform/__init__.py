@@ -1909,6 +1909,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # Hermes renders the proxy's billing failure as the final reply,
         # including its JSON body and provider-switching advice.
         if re.match(r"^(?:Billing or credits exhausted: )?HTTP 402: \{\"detail\":\s*\"You're out of Plow credits\.", body):
+            log.warning("[plow_chat] replaced Plow credit error: %s", body)
             body = "I've run out of Plow credit for now — top up in the portal and I'll pick this back up."
         turn = self._active_turn.get()
         if (body == NO_REPLY_SENTINEL and turn is not None
