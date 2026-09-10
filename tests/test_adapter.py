@@ -5782,9 +5782,17 @@ def _sequence_fixture(monkeypatch, tmp_path):
     adapter._sequence_turns[id(turn)] = turn
     root = tmp_path / 'assets'
     root.mkdir(mode=0o755)
+    # Explicit mode rather than the runner's umask: _sequence_stat rejects a
+    # group- or other-writable asset, so on a umask of 002 — Ubuntu's default,
+    # where a user has their own group — every sequence test fails on mode
+    # alone, before any behaviour under test runs.
     for i in range(4):
-        (root / f'{i}.png').write_bytes(b'\x89PNG\r\n\x1a\nfixture')
-    (root / 'manifest.json').write_text(json.dumps({'version': 1, 'assets': {f'p{i}': f'{i}.png' for i in range(4)}}))
+        asset = root / f'{i}.png'
+        asset.write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+        asset.chmod(0o644)
+    manifest = root / 'manifest.json'
+    manifest.write_text(json.dumps({'version': 1, 'assets': {f'p{i}': f'{i}.png' for i in range(4)}}))
+    manifest.chmod(0o644)
     monkeypatch.setattr(module, 'SEQUENCE_ASSET_ROOT', root)
     monkeypatch.setattr(module, 'SEQUENCE_ASSET_OWNER', os.getuid())
     check = module._sequence_stat
