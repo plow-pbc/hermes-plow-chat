@@ -89,7 +89,8 @@ gets this plugin the same way — bundled in that base image, not installed
 separately. Bumping `PLOW_CHAT_PLUGIN_SHA` there, pointing `runtime/stack.json`'s
 `images.hermes_local` at the new base, and running `agent-mgr deploy` moves the
 fleet. It lands at `/opt/hermes/plugins/plow_chat/` on the image, as the same
-three files and nothing else: `__init__.py`, `_transport.py`, `plugin.yaml`.
+four files and nothing else: `__init__.py`, `_transport.py`, `email.py`,
+`plugin.yaml`.
 
 **Pinned by SHA, never vendored.** A branch ref would silently re-point a running
 agent on the next push here, and this plugin holds the chat token. A vendored
