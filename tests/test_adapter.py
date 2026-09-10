@@ -2154,44 +2154,38 @@ def test_tools_register_with_optional_deferred_questions(
         "plow_offer_invite",
         "plow_send_sequence",
     ]
-    tool = ctx.tools[0]
-    assert tool["schema"]["name"] == "plow_start_group_message"
+    tools = {tool["name"]: tool for tool in ctx.tools}
+    tool = tools["plow_start_group_message"]
     assert tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert tool["check_fn"]()
 
-    send_message_tool = ctx.tools[1]
-    assert send_message_tool["schema"]["name"] == "plow_send_message"
+    send_message_tool = tools["plow_send_message"]
     assert send_message_tool["toolset"] == module.PLATFORM_NAME
     assert send_message_tool["handler"] is module._plow_send_message
     assert send_message_tool["schema"]["parameters"]["required"] == ["chat_id", "body"]
     assert send_message_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert send_message_tool["check_fn"]()
 
-    list_chats_tool = ctx.tools[2]
-    assert list_chats_tool["schema"]["name"] == "plow_list_chats"
+    list_chats_tool = tools["plow_list_chats"]
     assert list_chats_tool["schema"]["parameters"]["properties"] == {}
     assert list_chats_tool["handler"] is module._plow_list_chats
     assert list_chats_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert list_chats_tool["check_fn"]()
 
-    name_contact_tool = ctx.tools[3]
-    assert name_contact_tool["schema"]["name"] == "plow_name_contact"
+    name_contact_tool = tools["plow_name_contact"]
     assert name_contact_tool["schema"]["parameters"]["required"] == ["handle"]
     assert name_contact_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert name_contact_tool["check_fn"]()
 
-    contacts_tool = ctx.tools[4]
-    assert contacts_tool["schema"]["name"] == "plow_contacts"
+    contacts_tool = tools["plow_contacts"]
     assert contacts_tool["schema"]["parameters"]["properties"] == {}
     assert contacts_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
     assert contacts_tool["check_fn"]()
 
-    trust_tool = ctx.tools[5]
-    assert trust_tool["schema"]["name"] == "plow_set_conversation_trusted"
+    trust_tool = tools["plow_set_conversation_trusted"]
     assert trust_tool["requires_env"] == ["PLOW_AGENT_TOKEN"]
 
-    invite_tool = ctx.tools[6]
-    assert invite_tool["schema"]["name"] == "plow_offer_invite"
+    invite_tool = tools["plow_offer_invite"]
     assert invite_tool["schema"]["parameters"] == {
         "type": "object",
         "properties": {},
@@ -2324,8 +2318,9 @@ def test_the_contact_book_reads_on_the_owners_turn_and_on_no_turn_but_never_a_me
     assert record == ([()] if read else []), "a refusal must not reach Plow at all"
 
 
+@pytest.mark.parametrize("title", ["Cabin Cleaning", "+15550000001"])
 async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, title: str
 ) -> None:
     """The listing exists so a cht_ id has somewhere to come from, so every
     field is one a model needs to choose a room: the id, whether it is a 1:1
@@ -2358,11 +2353,11 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
     peer_room["participants"] = [{"type": "agent", "relationship": "peer"},
                                  {"type": "member", "role": "owner",
                                   "display_name": "Sam", "provider_key": "+15550000001"}]
-    unnamed = _chat("cht_u", name="+15550000002, +15550000001", group=True)
+    unnamed = _chat("cht_u", name="+15550000001, +15550000002", group=True)
     http = _ChatResourceHTTP(_Resp({
         "object": "list", "has_more": False,
         "data": [_chat("cht_a"),
-                 _chat("cht_g", name="Cabin Cleaning", group=True, trusted=True),
+                 _chat("cht_g", name=title, group=True, trusted=True),
                  _chat("cht_pending", name="Still Activating", group=True,
                        status="pending"),
                  peer_room, unnamed],
@@ -2382,7 +2377,7 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
         {"chat_id": "cht_a", "kind": "dm", "trusted": False,
          "participants": [{"name": "+15550000001", "handle": "+15550000001"}]},
         {"chat_id": "cht_g", "kind": "group", "trusted": True,
-         "title": "Cabin Cleaning",
+         "title": title,
          "participants": [{"name": "+15550000001", "handle": "+15550000001"},
                           {"name": "+15550000002", "handle": "+15550000002"}]},
         {"chat_id": "cht_peer", "kind": "group", "trusted": False,

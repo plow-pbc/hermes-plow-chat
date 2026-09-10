@@ -229,13 +229,10 @@ def _chat_summary(chat):
     `title` is Plow's own `display_name`, which the API omits entirely for an
     unnamed thread -- but the provider fills that column with a comma-joined
     list of participant handles when nobody has named the group, and the API
-    says in as many words to treat a value matching the roster as unnamed. So
-    a title built only out of handles this room already lists is dropped: it
-    is the provider's default, not a name, and passing it through would
-    publish the same handles twice while reading as somebody's choice.
+    says to treat a value matching the complete provider roster as unnamed.
     """
     members = [p for p in chat["participants"] if p.get("type") == "member"]
-    handles = {p["provider_key"] for p in members}
+    provider_roster = ", ".join(p["provider_key"] for p in members)
     summary = {
         "chat_id": chat["uid"],
         "kind": "dm" if _is_solo_dm(chat) else "group",
@@ -244,11 +241,7 @@ def _chat_summary(chat):
                          for p in members],
     }
     title = (chat.get("display_name") or "").strip()
-    parts = {part.strip() for part in title.split(",") if part.strip()}
-    # Conservative on purpose: only a title made ENTIRELY of handles this room
-    # lists is the provider's default. One the provider built from a handle we
-    # cannot see stays a title rather than being guessed away.
-    if title and not (parts and parts <= handles):
+    if title and title != provider_roster:
         summary["title"] = title
     return summary
 
@@ -2332,22 +2325,21 @@ class PlowChatAdapter(BasePlatformAdapter):
         convention for the same reason: the tool catches `_PlowSendError`, not
         aiohttp's own.
         """
-        return await self._get_tool_json("/v1/contacts", "[]")
+        return await self._get_tool_json("/v1/contacts")
 
-    async def _get_tool_json(self, path, empty):
+    async def _get_tool_json(self, path):
         """One GET the tool handlers make, decoded.
 
         The non-2xx convention is theirs: `_PlowSendError` carries the status
         through, so a handler can tell "Plow said no" from "the read fell
-        over". `empty` is what an empty body decodes as, which differs by
-        route -- a listing is an object, the contact book an array.
+        over".
         """
         async with (aiohttp.ClientSession() as http,
                     http.get(f"{BASE}{path}", headers=self.auth) as resp):
             text = await resp.text()
             if resp.status >= 400:
                 raise _PlowSendError(resp.status, text)
-            return json.loads(text or empty)
+            return json.loads(text)
 
     async def list_chats(self):
         """Every chat this credential can send to, as a compact listing.
@@ -2378,7 +2370,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         while the old reach still stands rather than half-adopting a listing
         that could not be read.
         """
-        body = await self._get_tool_json("/v1/chats", "{}")
+        body = await self._get_tool_json("/v1/chats")
         listed = [_chat_summary(chat) for chat in body["data"]
                   if chat["status"] == "active"]
         # The whole payload, exactly as `_refresh_reach` passes it: reach has
@@ -3452,6 +3444,22 @@ PLOW_SEND_MESSAGE_SCHEMA = {
 }
 
 
+def _owner_read_tool(operation, success, member_error, failure):
+    turn = _ACTIVE_TURN.get()
+    if turn is not None and not turn.get("owner"):
+        return json.dumps({"success": False, "error": member_error})
+    if _live is None:
+        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
+    adapter, loop = _live
+    try:
+        value = asyncio.run_coroutine_threadsafe(operation(adapter), loop).result(timeout=30)
+    except _PlowSendError as exc:
+        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
+    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty collection
+        return json.dumps({"success": False, "error": f"could not {failure} ({type(exc).__name__})"})
+    return json.dumps({"success": True, **success(value)})
+
+
 def _plow_list_chats(_args, **_kwargs):
     """List the granted chats, so a cht_ id has a sanctioned place to come from.
 
@@ -3465,21 +3473,9 @@ def _plow_list_chats(_args, **_kwargs):
     No new API and no second scope check: the credential's grant is the reach,
     and `GET /v1/chats` is the same read that establishes it.
     """
-    turn = _ACTIVE_TURN.get()
-    if turn is not None and not turn.get("owner"):
-        return json.dumps({"success": False,
-                           "error": "your owner's other chats are not listable on a member's turn"})
-    if _live is None:
-        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
-    adapter, loop = _live
-    try:
-        chats = asyncio.run_coroutine_threadsafe(adapter.list_chats(), loop).result(timeout=30)
-    except _PlowSendError as exc:
-        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
-    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty grant
-        return json.dumps({"success": False,
-                           "error": f"could not list the chats ({type(exc).__name__})"})
-    return json.dumps({"success": True, "note": _CHAT_LISTING_MARK, "chats": chats})
+    return _owner_read_tool(
+        lambda adapter: adapter.list_chats(), lambda chats: {"note": _CHAT_LISTING_MARK, "chats": chats},
+        "your owner's other chats are not listable on a member's turn", "list the chats")
 
 
 # Titles and participant names are written by the people in those rooms, so
@@ -3645,21 +3641,9 @@ def _plow_contacts(_args, **_kwargs):
     a member's own open turn is refused, since that is the one context where
     somebody else's words are steering the agent.
     """
-    turn = _ACTIVE_TURN.get()
-    if turn is not None and not turn.get("owner"):
-        return json.dumps({"success": False,
-                           "error": "your owner's contact book is not readable on a member's turn"})
-    if _live is None:
-        return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
-    adapter, loop = _live
-    try:
-        contacts = asyncio.run_coroutine_threadsafe(adapter.contacts(), loop).result(timeout=30)
-    except _PlowSendError as exc:
-        return json.dumps({"success": False, "error": f"Plow declined ({exc.status}): {exc.detail}"})
-    except Exception as exc:  # noqa: BLE001 - a failed read is not an empty book
-        return json.dumps({"success": False,
-                           "error": f"could not read the contact book ({type(exc).__name__})"})
-    return json.dumps({"success": True, "contacts": contacts})
+    return _owner_read_tool(
+        lambda adapter: adapter.contacts(), lambda contacts: {"contacts": contacts},
+        "your owner's contact book is not readable on a member's turn", "read the contact book")
 
 
 PLOW_CONTACTS_SCHEMA = {
