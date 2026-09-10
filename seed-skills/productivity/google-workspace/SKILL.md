@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: "Gmail and Google Calendar through the owner's Mac."
-version: 2.1.0
+version: 2.4.0
 ---
 
 # Google Workspace — through the owner's Mac
@@ -21,19 +21,34 @@ Mac-managed instances):
    only source for the command and its arguments — do not carry a
    spelling from memory or from this file. The Mac mints its own
    short-lived Google token; you never see or need one.
-2. Sending an email, or booking over a busy slot with
-   `--confirm-conflict`, is stopped first in the owner's direct chat
-   with you: the gateway posts the command and waits for the owner to
-   reply `/approve`. Compose the whole message — recipients, subject,
-   body — in the one `gmail send` command; that command is all the
-   owner sees. A draft sent by id is refused, because the owner would
-   see only the id. A refusal there means the owner declined; nothing
-   was sent. From any other chat those two commands are blocked
-   outright and nothing is sent — ask the owner to repeat the request
-   in their direct chat. Any other command may show the owner an
-   approval card on their Mac; if it hangs, it is waiting there, and
-   a refusal there is a denial on the Mac.
-3. If a connected MCP server lists no `google-workspace` skill, Google is
+2. Sending an email is stopped first in the owner's direct chat with
+   you: the gateway posts the command and waits for the owner to reply
+   `/approve`. Compose the whole message — recipients, subject, body —
+   in the one `gmail send` command; that command is all the owner sees.
+   A draft sent by id is refused, because the owner would see only the
+   id. A refusal there means the owner declined; nothing was sent. From
+   any other chat a send is blocked outright and nothing is sent — ask
+   the owner to repeat the request in their direct chat. Any other
+   command may show the owner an approval card on their Mac; if it
+   hangs, it is waiting there, and a refusal there is a denial on the
+   Mac.
+3. Calendar conflicts are yours to judge, not the owner's to approve.
+   A calendar create that overlaps an existing commitment is refused,
+   never queued for approval: the check covers every connected account,
+   and the refusal comes back to you. To book anyway, re-send the same
+   create — the same command, same attendees, same calendar, same
+   everything — with `--confirm-conflict` added, and only when the owner
+   fixed the time in the request ("book it regardless", "hold those
+   exact dates", a named slot they insist on). Never rebuild a smaller
+   create to get past the refusal; you would drop what you left out.
+   Otherwise tell the owner what the slot overlaps and ask. When you do
+   book over one, say so in the reply and name the overlap. Whether you
+   are asking about a conflict or reporting one you booked over, in a
+   shared room the overlap is "an existing commitment" and never the
+   other event's name. Only the owner can fix a time, so from any other
+   chat the override is blocked and nothing is booked — ask the owner
+   to repeat the request in their direct chat.
+4. If a connected MCP server lists no `google-workspace` skill, Google is
    not available to this agent. Say exactly that — do not fall back to
    local OAuth. If no MCP server with `plow_*` tools is connected at all,
    that is not the same thing: Latch is unreachable, so say the owner's Mac

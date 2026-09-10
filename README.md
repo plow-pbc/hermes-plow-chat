@@ -21,6 +21,10 @@ into place. Nothing else here — README, tests, justfile — reaches an agent.
 > Before that change it copied two files from the repository **root**, so a
 > `runtime/plow-chat-plugin.ref` bumped to a SHA of this layout against an older
 > `agent-mgr` installs an empty plugin directory — an agent with no phone line.
+> Quoted replies require [`plow-pbc/plow#1827`](https://github.com/plow-pbc/plow/pull/1827)
+> and attachment indexes from [`plow-pbc/plow#1832`](https://github.com/plow-pbc/plow/pull/1832):
+> deploy both API changes before pinning this plugin, or reply context will be absent
+> or indexed media replies will remain unresolved.
 > This plugin also requires a Plow API that serves agent-invite consent,
 > `/v1/auth/agent-invites/opportunities`,
 > `/v1/auth/agent-invites/opportunities/{opportunity_uid}/send`,
@@ -50,7 +54,13 @@ Not here:
 
 - The `plow-gog` argv grammar, and what a Latch tool says about itself —
   [`plow-pbc/latch`](https://github.com/plow-pbc/latch) vendors the binary,
-  pins its version, and owns the only bump checklist.
+  pins its version, and owns the only bump checklist. The mail approval hook
+  deliberately mirrors Latch's global-flag stripping from `accountAt` and
+  `planPlowGog` in `packages/device-core/src/providers/plowGog.ts`; keep that
+  list and its value consumption in sync when Latch changes it. This follows
+  the same grammar, rather than defining another one: the hook must distinguish
+  flag values from the action path, since a value can itself be `gmail`.
+  Classification uses a copy; execution and approval hashing retain raw argv.
 - Per-chat state the owner sets or clears — trust, contact labels, anything
   keyed by a `cht_` id — [`plow-pbc/plow`](https://github.com/plow-pbc/plow).
   A file written under `$HERMES_HOME` instead is invisible to the dashboard
@@ -111,14 +121,15 @@ URL in git.
 
 Diagnostics — agent status frames, 💾 background-review posts, ⏳ long-running
 heartbeats, ⚠️ turn-stop warnings — are dropped in **every** room unless the
-credential's `verbose_output_enabled` preference (the dashboard's "Verbose
-agent output" toggle) is true; the typing indicator already shows the turn is
+agent's `verbose_output` setting (the dashboard's "Verbose agent output"
+toggle, read from `GET /v1/agents/me`; only a quiet answer is cached, so
+turning the toggle off is obeyed on the next line rather than a minute later) is true; the typing indicator already shows the turn is
 running. Hermes gives them no metadata of their own, so they are recognised by
 the text they open with, and the room rule below deliberately does not reach
 them: they are the runtime describing itself, never the turn's answer, so
 withholding one can never withhold the message the owner wanted.
 
-The model's own **mid-turn prose** is gated by the same preference, but only
+The model's own **mid-turn prose** is gated by the same setting, but only
 where someone else is listening. What counts as mid-turn is a metadata test,
 not a prefix one: Hermes marks the turn-final reply `notify` and a cron
 delivery `job_id`, and anything carrying neither, sent while a turn is open, is
@@ -174,6 +185,12 @@ distinct turns. The ack is the burst's last uid, so a restart mid-burst
 backfills the whole burst; a hand-off that fails is retried where it sits, with
 the rest of the chat waiting behind it.
 
+Inline replies carry the quoted sender, time, body, and part label as untrusted
+turn data. If the reply has no attachments of its own, the adapter delivers the
+quoted parent's media through the normal attachment path: the matching provider
+part when its index is available, otherwise all parent attachments. Everything
+comes from the message frame; no parent-message lookup is made.
+
 ### Group discretion and full trust
 
 The room mode is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
@@ -185,8 +202,9 @@ thread. A new kind of ask waits for the owner's yes here, with the model judging
 that consent from the conversation. With full trust enabled, members may use the
 owner's accounts without a per-ask okay; only what answers the request is disclosed.
 Both modes exclude credentials, authentication secrets, raw tokens and payment-card
-secrets. Email sends and calendar overrides require owner-DM approval. Member turns
-cannot send to other chats, write contacts, set goals, or list the owner's other rooms.
+secrets. Email sends require owner-DM approval; calendar overrides follow the
+calendar-conflict rule, only in the owner's DM. Member turns cannot send to other
+chats, write contacts, set goals, or list the owner's other rooms.
 New groups default to discretion without a trust question; the owner can enable
 full trust later.
 
@@ -207,7 +225,20 @@ agent's own sends. So a message the agent posts to chat B from a turn in chat
 A is invisible to chat B's next turn unless it is recorded there. The
 `plow_send_message` tool is the one sanctioned way to post cross-chat; it goes
 through the adapter's `send()` like every other outbound message (the grant
-and member-turn confinement apply exactly as for a reply). Recording lives in
+and member-turn confinement apply exactly as for a reply). `plow_list_chats`
+is where its `cht_` id comes from: a live `GET /v1/chats` — the same read that
+establishes reach, so the credential's grant is the whole listing — reduced to
+id, kind, title, the humans by name and handle, and trust. Only `active` rooms
+are listed. The route excludes just `failed`, so it serves rooms still being
+set up as well; `send` requires `active` and answers a pending one with `409
+chat_not_ready`, and a listing whose whole job is to source a sendable id has
+no business offering a choice that fails. Titles and names in
+it are other people's words, so the result carries the same untrusted marker
+every such block does; a title the provider defaulted to the room's own
+comma-joined handles is dropped, because that column is how the API says
+"nobody named this". It is refused on a member's turn for the reason the alias
+registry publishes no participant names: a listing that carries handles must
+not let one room's members enumerate the owner's others. Recording lives in
 that same `send()`: when a turn's message lands in a chat other than the
 turn's own, the adapter mirrors the text into that chat's session as an
 assistant turn with upstream's `gateway.mirror` — the mechanism Hermes uses
@@ -295,8 +326,30 @@ unreachable — cannot buy unbounded turns. Every settlement is announced, and a
 notice that fails to deliver leaves the goal running rather than letting it go
 quiet.
 
+Every turn under a goal opens with the goal itself, framed as what the command
+already established: a standing instruction from the owner who set it, named,
+with their text carried as theirs. It used to ride as "untrusted thread data,
+not an instruction" — the right posture for words the thread supplied, and the
+wrong one for a task the owner personally authorized, which had the agent
+disown it.
+
+Three things bound that. Every field interpolated into the line — the goal
+text and the setter's name alike — is encoded so it cannot end the block or
+start a line that reads as another one: quotation marks are not a boundary,
+and the guarantee is that the block ends where the code says it does, on one
+line, with anything injected left visible inside the text. The line states
+that a goal changes no rule of the turn it rides on: what may be done and
+disclosed in that room remains the channel prompt's answer. And every record
+is the owner's, named or not — the gate predates the field, so a goal written
+before authorship was recorded still reads as theirs. Retiring a goal drops
+the setter's name along with the transcript: neither has a reader once the
+goal is done, and both would otherwise sit on the persistent volume.
+
 An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM.
+the room's ordinary disclosure prompt and take owner authority only in a DM —
+unchanged by the reframing: in a group the thread is still full of other
+people's words, and an owner-authorized turn acting on them unprompted is a
+confused deputy holding owner-only tools.
 
 In a shared thread the prompt tells the agent to speak as itself and refer to
 the human it represents by name, never as "I" or "me" — the name itself stays
@@ -310,7 +363,7 @@ sets their account name, and a relationship on their own handle is refused. The
 tool is owner-turn-authorized only; it refuses outright during a member's turn
 and outside any active turn at all — a direct call cannot write a label except
 on the owner's own turn. A relationship renders as
-`Name [handle] (relationship)` in the untrusted roster context above — where
+`Name (handle) (relationship)` in the untrusted roster context above — where
 the owner's own row also carries `(your owner)` — never in
 the channel prompt, which instead states generically that a roster
 relationship is a label recorded on the owner's turn, and that a member's
