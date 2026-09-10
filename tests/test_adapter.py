@@ -4009,7 +4009,7 @@ async def test_plow_credit_exhaustion_sends_one_plain_sentence(
     })]
 
     assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
-        (logging.WARNING, f"[plow_chat] replaced Plow credit error: {error}"),
+        (logging.WARNING, f"plow_credit_error_replaced status=402 body_length={len(error)}"),
     ]
 
 
