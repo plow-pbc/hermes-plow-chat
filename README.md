@@ -196,7 +196,7 @@ comes from the message frame; no parent-message lookup is made.
 
 The room mode is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
 Before handing off each inbound burst, the adapter refreshes that chat so a
-dashboard change applies to the next message. By default, groups use discretion:
+dashboard change applies to the next message. With discretion,
 the owner may use connected accounts and share what they ask for in the room;
 members may obtain owner material only within what the owner has okayed in this
 thread. A new kind of ask waits for the owner's yes here, with the model judging
@@ -206,8 +206,8 @@ Both modes exclude credentials, authentication secrets, raw tokens and payment-c
 secrets. Email sends require owner-DM approval; calendar overrides follow the
 calendar-conflict rule, only in the owner's DM. Member turns cannot send to other
 chats, write contacts, set goals, or list the owner's other rooms.
-New groups default to discretion without a trust question; the owner can enable
-full trust later.
+Groups the owner starts begin with full trust, without a trust question; groups
+another member starts begin with discretion. The owner can change either later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
 dashboard. It only succeeds during an owner-authored Plow Chat turn and after

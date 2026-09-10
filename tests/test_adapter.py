@@ -3186,6 +3186,7 @@ def test_unparseable_dry_run_stays_a_dry_run(
     dry_run that is True — otherwise a typo becomes the irreversible branch."""
     module = _load(monkeypatch, tmp_path)
     _live_tool(module, monkeypatch, "start_group_thread", raises=AssertionError("must not send"))
+    module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi", "dry_run": junk, "confirm": True}))
     assert out["success"] is True and out["dry_run"] is True
@@ -3461,13 +3462,12 @@ def test_only_an_owner_turn_can_start_a_thread(
     assert "owner" in out["error"] and "nothing was sent" in out["error"]
 
 
-@pytest.mark.parametrize("trusted", ["tru", "maybe", None, "false"])
-def test_no_falsy_or_unparseable_trusted_grants_access(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any
+@pytest.mark.parametrize(("trusted", "granted"), [("tru", False), ("maybe", False), ("false", False), (None, True)])
+def test_absent_trusted_grants_full_trust_and_falsy_or_unparseable_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any, granted: bool
 ) -> None:
-    """trusted hands out access to the agent, so absent and falsy values read
-    as False and an unparseable one falls to the same side — the direction
-    that grants nothing."""
+    """Groups the owner starts default to full trust; a falsy value opts out,
+    and an unparseable one falls to the side that grants nothing."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set({"chat_uid": "cht_a", "owner": True})
     sent: list[Any] = []
@@ -3476,7 +3476,7 @@ def test_no_falsy_or_unparseable_trusted_grants_access(
     json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": trusted}))
-    assert sent == [(["+15550001111"], "hi", False)]
+    assert sent == [(["+15550001111"], "hi", granted)]
 
 
 def test_start_group_does_not_require_a_trust_question(
