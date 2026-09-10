@@ -6,6 +6,7 @@ roster readers -- written to be shared with the email platform tracked in
 plow-pbc/hermes-plugin-plow#109. Policy stays with the platform that owns it.
 """
 import asyncio
+import contextvars
 import logging
 import os
 
@@ -229,3 +230,22 @@ def _split(listing, provider):
     (no reach refresh) nor outside the grant (no warning)."""
     served = {chat["uid"]: chat for chat in listing if _provider(chat) == provider}
     return served, frozenset(chat["uid"] for chat in listing) - served.keys()
+
+
+# Hermes' own diagnostics reach an adapter through plain send() carrying no
+# metadata that tells them apart from the model's prose, so they are
+# recognised by the text they open with. They are the runtime talking about
+# itself, never the turn's answer, so withholding one can never withhold the
+# message the owner wanted.
+BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
+_WORKING_PREFIX = "⏳ Working —"
+# TODO(remove): once the fleet image pin includes srosro/hermes-agent's
+# turn-stop-status PR, turn-stop text arrives as status frames and this
+# final-response shim is dead code.
+_NO_REPLY_PREFIX = "⚠️ No reply: "
+_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
+
+# The open turn, as every tool handler and send guard reads it. Both
+# platforms set it in on_processing_start and clear it in
+# on_processing_complete; it lives here so both can.
+_ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)

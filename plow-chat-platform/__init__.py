@@ -7,7 +7,6 @@ The transport itself -- credential, socket, reach -- is `_transport.py`, written
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
-import contextvars
 import dataclasses
 import hashlib
 import json
@@ -43,9 +42,14 @@ from gateway.platforms.base import (
 from gateway.session import build_session_key
 
 from ._transport import (
+    BACKGROUND_REVIEW_PREFIX,
     BASE,
+    _ACTIVE_TURN,
+    _DIAGNOSTIC_PREFIXES,
     _NEVER_GUESS,
+    _NO_REPLY_PREFIX,
     _PlowAuthError,
+    _WORKING_PREFIX,
     _agent_name,
     _auth_raise_for_status,
     _bearer,
@@ -74,18 +78,6 @@ LATCH_URL = "https://plow.co/latch"
 # enabled it waits; an owner who just disabled it waits not at all.
 SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
-# Hermes' own diagnostics reach the adapter through plain send() carrying no
-# metadata that tells them apart from the model's prose, so they are still
-# recognised by the text they open with. The room carve-out below must not
-# reach them: they are the runtime talking about itself, never the turn's
-# answer, so withholding one can never withhold the message the owner wanted.
-BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
-_WORKING_PREFIX = "⏳ Working —"
-# TODO(remove): once the fleet image pin includes srosro/hermes-agent's
-# turn-stop-status PR, turn-stop text arrives as status frames and this
-# final-response shim is dead code.
-_NO_REPLY_PREFIX = "⚠️ No reply: "
-_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
 PROVIDER = "linq"                     # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
 # On the persistent volume: a checkpoint that dies with the container is no
@@ -797,7 +789,6 @@ def _message_type(media_types):
     return MessageType.DOCUMENT if media_types else MessageType.TEXT
 
 
-_ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "plow_send_message tool and will be refused on an external turn."
