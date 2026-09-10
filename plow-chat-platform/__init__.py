@@ -68,6 +68,7 @@ from ._transport import (
     _split,
     _ticket,
 )
+from . import email as plow_email
 
 LATCH_URL = "https://plow.co/latch"
 # How long a QUIET answer from /v1/agents/me serves the gate below. Only the
