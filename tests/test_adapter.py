@@ -2061,8 +2061,9 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
 
 async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """A new agent's own stores are empty, and it read that as absence in the
-    owner's world (plow#1880). Its first-ever connect hands hermes one silent,
-    Plow-signed setup turn in the owner's DM; a restart hands it none."""
+    owner's world (plow#1880). Its first-ever life hands hermes one silent,
+    Plow-signed setup turn in the owner's DM -- even when the first session
+    drops before reaching it -- and a restart hands it none."""
     module = _load(monkeypatch, tmp_path)
     handed: list[list[Any]] = []
     for _ in range(2):  # first-ever life, then a restart over the same checkpoint
@@ -2070,8 +2071,10 @@ async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.Mo
         adapter._set_reach([_chat("cht_a")])
         monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SocketHTTP())
         monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+        monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
+        monkeypatch.setattr(adapter, "_backfill", mock.AsyncMock(side_effect=[OSError("socket dropped"), None]))
         handed.append(_capture_events(monkeypatch, adapter))
-        with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+        with mock.patch.object(module.asyncio, "sleep", side_effect=[None, StopAsyncIteration]):
             with pytest.raises(StopAsyncIteration):
                 await adapter._listen()
 

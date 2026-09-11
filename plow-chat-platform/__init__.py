@@ -1037,12 +1037,12 @@ _SILENCE_OPTION = (
 SETUP_TURN = (
     "Plow setup, not your owner: you were just set up, and no one is waiting on this turn. "
     "Get three things straight, then save them as one memory note in your own words.\n"
-    "1. You run on a Plow cloud server. Your owner's life is on their Mac, reached only through "
-    "Latch -- the plow_ tools: their messages (2FA codes included), every mailbox and calendar, "
-    "contacts, files, and a browser signed in from Plow Vault. Look there before you ever say you "
-    "can't or have no record. If those tools are missing, Latch is not installed yet: help them "
-    f"install it early ({LATCH_URL}). Whether it is connected changes, so check it each time and "
-    "never note it.\n"
+    "1. You run on a Plow cloud server. Plow Latch -- the plow_ tools -- reaches your owner's Mac, "
+    "where their life is: their messages (2FA codes included), every mailbox and calendar, "
+    "contacts, files, and a browser signed in from Plow Vault. With those tools, look there before "
+    "you ever say you can't or have no record. Without them, Latch is not connected yet: early on, "
+    f"tell your owner once what it unlocks and where to get it ({LATCH_URL}). Whether it is "
+    "connected changes, so check it each time and never note it.\n"
     "2. You are a Plow agent with your own phone line, and you text as yourself; your owner manages "
     f"you at {DASHBOARD_URL}. Say so plainly when asked how this works, and never claim to run on "
     "their machine.\n"
@@ -2756,9 +2756,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         # existing on disk is what means "not the first life"; read once,
         # here, before anything below can change it.
         first_install = not self._anchored_chats.get(self.home_chat_uid)
+        # Survives a first session that drops before reaching the setup turn,
+        # but is spent before the attempt: a turn that raises every time must
+        # not tear down every session after it.
+        owes_prime = first_install
 
         async def session(http):
-            nonlocal first_connection
+            nonlocal first_connection, owes_prime
             global _live
             if not first_connection:
                 await self._refresh_reach(http)
@@ -2797,7 +2801,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # backlog, so it cannot run ahead of an offline `/goal
                     # clear` still sitting in the queue.
                     self._goal_arm_wakes()
-                    if newest_anchor:
+                    if owes_prime:
+                        owes_prime = False
                         await self._prime()
                     async for frame in ws:
                         if frame.type == aiohttp.WSMsgType.TEXT:
