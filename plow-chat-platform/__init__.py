@@ -3283,6 +3283,47 @@ def _is_draft_send(argv):
     )
 
 
+# The plugin's accumulated routing knowledge: every observed first-turn miss
+# adds a row (tool -> condition on the parsed JSON result, sentence). A fresh
+# agent's first batch -- session_search, memory, its Plow contacts and chats
+# -- comes back empty or thin, and an empty store about itself reads as
+# absence in the owner's world (#127). Each sentence rides on the result the
+# way Hermes' own link_hint does, so the model reads it as part of the answer.
+_MAC_ROUTE = (
+    "Your owner's messages, mail, calendar, contacts, files and what Plow did "
+    "for them before are on their Mac: plow_list_skills, then plow_read_skill "
+    "for the skill that covers it, then do what it says."
+)
+ROUTING_HINTS = {
+    "session_search": (
+        lambda r: not r.get("sessions_searched", r.get("count")),
+        "This searched only this agent's own past sessions. " + _MAC_ROUTE),
+    "memory": (
+        lambda r: "error" in r,
+        "Memory is this agent's own notebook and holds nothing about your owner's world. " + _MAC_ROUTE),
+    "plow_contacts": (
+        lambda r: r.get("success", True),
+        "This is Plow's own contact book: only the people named in Plow chats. " + _MAC_ROUTE),
+    "plow_list_chats": (
+        lambda r: r.get("success", True),
+        "These are this agent's own Plow chats. " + _MAC_ROUTE),
+}
+
+
+def _route_tool_result(tool_name, args, result, **_kwargs):
+    """transform_tool_result: attach the ROUTING_HINTS row for this tool as a
+    `routing_hint` field when its condition holds. None leaves the result as
+    Hermes has it; a result this hook cannot parse is never worth losing."""
+    try:
+        condition, sentence = ROUTING_HINTS[tool_name]
+        parsed = json.loads(result)
+        if not isinstance(parsed, dict) or not condition(parsed):
+            return None
+        return json.dumps({**parsed, "routing_hint": sentence}, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - unknown tool, non-JSON result, or a row's own bug
+        return None
+
+
 def _pre_tool_call(tool_name, args, **_kwargs):
     """Hold an outbound email for the owner, and hold a conflict override to
     the owner's own chat, whatever the latch MCP server is named.
@@ -4154,4 +4195,5 @@ def register(ctx):
         check_fn=check_requirements, requires_env=["PLOW_AGENT_TOKEN", "PLOW_HOME_CHANNEL"],
     )
     ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_hook("transform_tool_result", _route_tool_result)
     ctx.register_hook("pre_llm_call", _recall)

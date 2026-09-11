@@ -966,7 +966,7 @@ def test_guest_turn_is_not_tool_blocked(
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     turn = adapter._active_turn.set({"chat_uid": "cht_b", "owner": False})
     try:
-        assert set(hooks) == {"pre_tool_call", "pre_llm_call"}
+        assert set(hooks) == {"pre_tool_call", "pre_llm_call", "transform_tool_result"}
         assert hooks["pre_llm_call"] is module._recall
         assert hooks["pre_tool_call"](
             tool_name="mcp__latch__plow_run_command",
@@ -2263,6 +2263,54 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
+
+
+def _transformed(module: Any, tool: str, result: Any) -> Any:
+    """What reaches the model: Hermes keeps the result unless the hook returns a string."""
+    out = module._route_tool_result(tool_name=tool, args={}, result=result)
+    return result if out is None else out
+
+
+@pytest.mark.parametrize(
+    ("tool", "result", "routed"),
+    [
+        ("session_search", json.dumps({"success": True, "results": [], "count": 0, "sessions_searched": 0}), True),
+        ("session_search", json.dumps({"success": True, "results": [{"session_id": "s1"}], "count": 1,
+                                       "sessions_searched": 1}), False),
+        ("memory", json.dumps({"error": "Unknown action 'view'. Use: add, replace, remove"}), True),
+        ("memory", json.dumps({"success": True, "message": "added"}), False),
+        ("plow_contacts", json.dumps({"success": True, "contacts": [{"handle": "+15550001", "name": "Owner"}]}), True),
+        ("plow_contacts", json.dumps({"success": False, "error": "not readable on a member's turn"}), False),
+        ("plow_list_chats", json.dumps({"success": True, "chats": []}), True),
+        ("read_file", json.dumps({"error": "File not found"}), False),
+        ("session_search", "not json at all", False),
+        ("session_search", {"count": 0}, False),
+    ],
+    ids=["no_sessions", "hits", "memory_read", "memory_write", "contacts", "contacts_refused",
+         "chats", "unknown_tool", "malformed", "not_a_string"],
+)
+def test_an_empty_own_store_result_routes_the_model_to_the_mac(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tool: str, result: Any, routed: bool,
+) -> None:
+    """A fresh agent's own stores answer "nothing", and the model reports that
+    as absence in the owner's world (#127). The result the model reads carries
+    the route to the Mac exactly when the store it came from cannot answer for
+    the owner; anything else -- hits, other tools, unparseable -- is the
+    result as Hermes had it."""
+    module = _load(monkeypatch, tmp_path)
+    ctx = mock.Mock()
+    module.register(ctx)
+    assert ("transform_tool_result", module._route_tool_result) in [c.args for c in ctx.register_hook.call_args_list]
+
+    out = _transformed(module, tool, result)
+
+    if not routed:
+        assert out is result
+        return
+    parsed = json.loads(out)
+    assert parsed["routing_hint"].endswith(module._MAC_ROUTE)
+    assert "plow_list_skills" in parsed["routing_hint"] and "plow_read_skill" in parsed["routing_hint"]
+    assert {k: v for k, v in parsed.items() if k != "routing_hint"} == json.loads(result)
 
 
 def test_a_reply_keeps_the_phone_numbers_it_hands_people(
