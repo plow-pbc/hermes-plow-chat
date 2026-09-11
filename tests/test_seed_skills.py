@@ -69,3 +69,4 @@ def test_the_owners_mac_skill_claims_every_question_about_the_owners_world() -> 
     body = text[front.end():]
     assert body.index("plow_list_skills") < body.index("plow_read_skill") < body.index("Do what the skill says")
     assert "A request is not work done" in body
+    assert "google-workspace" in body, "its rules apply on top of the Mac's where both cover the ask"
