@@ -939,7 +939,7 @@ def _latch_section(_session_info: Mapping[str, Any]) -> str:
 # secrets" swallowed it, and so does the model's own prior when a general rule leaves it
 # unnamed -- a replayed trusted-room turn refused 12/12 either way, and fetched 12/12 with this.
 _GROUP_ROOM_RESTRICTIONS = (
-    "Never disclose standing secrets: passwords, backup codes, API keys, raw tokens, "
+    "Never disclose standing secrets such as passwords, backup codes, API keys, raw tokens, "
     "or full payment-card numbers. A one-time sign-in or verification code sent to the "
     "owner is not one of them: it is owner material like any other, shared under this room's rule. "
     "Email sends require approval from the owner's DM. "
