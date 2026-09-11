@@ -3298,9 +3298,13 @@ ROUTING_HINTS = {
     "session_search": (
         lambda r: not r.get("sessions_searched", r.get("count")),
         "This searched only this agent's own past sessions. " + _MAC_ROUTE),
+    # Hermes' memory tool has no read action: a fresh agent "checking" it gets
+    # an error, and that error is the empty read this row answers.
     "memory": (
         lambda r: "error" in r,
         "Memory is this agent's own notebook and holds nothing about your owner's world. " + _MAC_ROUTE),
+    # Neither takes a query, so "no match" is not determinable from the result:
+    # every successful read carries the note. Both are partial views by nature.
     "plow_contacts": (
         lambda r: r.get("success", True),
         "This is Plow's own contact book: only the people named in Plow chats. " + _MAC_ROUTE),

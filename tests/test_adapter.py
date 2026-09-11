@@ -2281,7 +2281,7 @@ def _transformed(module: Any, tool: str, result: Any) -> Any:
         ("memory", json.dumps({"success": True, "message": "added"}), False),
         ("plow_contacts", json.dumps({"success": True, "contacts": [{"handle": "+15550001", "name": "Owner"}]}), True),
         ("plow_contacts", json.dumps({"success": False, "error": "not readable on a member's turn"}), False),
-        ("plow_list_chats", json.dumps({"success": True, "chats": []}), True),
+        ("plow_list_chats", json.dumps({"success": True, "chats": [{"uid": "cht_a", "type": "dm"}]}), True),
         ("read_file", json.dumps({"error": "File not found"}), False),
         ("session_search", "not json at all", False),
         ("session_search", {"count": 0}, False),
