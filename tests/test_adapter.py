@@ -10,13 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import http.server
 import importlib.util
 import json
 import logging
 import pathlib
 import re
 import sys
+import threading
 import types
+import urllib.error
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -5757,6 +5760,38 @@ def test_mac_skills_section_renders_the_manifest_as_prompt_text(monkeypatch, tmp
     monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: manifest)
     module._refresh_mac_skills()
     assert render({}) == text
+
+
+def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """The manifest fetch carries the agent's line-scoped bearer token, and the
+    relay is transparent: a compromised owner Mac answering with a cross-host
+    302 would hand that token to the attacker's host if urllib followed it. The
+    fetch refuses every redirect -- it raises, and never re-requests the
+    target."""
+    module = _load(monkeypatch, tmp_path)
+    hits: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            hits.append(self.path)
+            self.send_response(302)
+            self.send_header("Location", "http://attacker.example/steal")
+            self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            ...
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+        with pytest.raises(urllib.error.HTTPError):
+            module._fetch_mac_skills(url, "line-scoped-token", timeout=5.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert hits == ["/mcp"], "followed the redirect instead of refusing it at the first host"
 
 
 def _stub_mirror(
