@@ -365,7 +365,8 @@ def _voiced(module: Any, prompt: str) -> str:
     """The exact non-solo-DM composition `_collaboration_prompt` applies, so
     the prompt-matrix tests below don't hand-roll it out of sync with the
     real code."""
-    return f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {module._NAME_FACT} {prompt}"
+    return (f"{module._VOICE_RULE}{module._RELATIONSHIP_FACT} {module._NAME_FACT} "
+            f"{module._GROUP_SPEAK_RULE}{prompt}")
 
 
 def _owned(module: Any, prompt: str, chat: dict[str, Any]) -> str:
@@ -1432,7 +1433,8 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
         identity = {**identity, "signup": None}
     if group:
         expected = _voiced(module, expected)
-    assert event["channel_prompt"] == _rendered(module, expected, agent_name, identity)
+    silenced = module._UNADDRESSED_SILENCE if (group and agent_name) else ""
+    assert event["channel_prompt"] == silenced + _rendered(module, expected, agent_name, identity)
     # The phrase is the owner's to share. Shown to a member's turn, the model
     # pasted it instead of calling plow_offer_invite (Elm, 2026-09-10).
     for offer in (SIGNUP["phrase"], NUMBER):
@@ -1528,8 +1530,11 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     # this test owns is the voice rule and the roster facts -- present in a
     # shared thread, absent in a solo DM, with the base prompt unchanged
     # either way.
-    assert event["channel_prompt"] == _rendered(module,
-        f"{rule}{roster_facts}{_owned(module, base, chat)}", "Elm", adapter._identity)
+    # "msg_1" never says "Elm", so a shared thread is also the silence case.
+    silenced = module._UNADDRESSED_SILENCE if group else ""
+    speak_rule = module._GROUP_SPEAK_RULE if group else ""
+    assert event["channel_prompt"] == silenced + _rendered(module,
+        f"{rule}{roster_facts}{speak_rule}{_owned(module, base, chat)}", "Elm", adapter._identity)
 
 
 @pytest.mark.parametrize(
@@ -1574,8 +1579,11 @@ async def test_authority_selects_the_prompt(
     expected = _owned(module, expected, chat) if role == "owner" else _membered(module, expected)
     if group:
         expected = _voiced(module, expected)
-    # A peer that did not name us, with no goal set, is also told to stay out.
-    silenced = module._GOAL_PEER_SILENCE if role == "peer" else ""
+    # Anyone who did not name us, with no goal set, is told to stay out -- a
+    # member's message as much as a peer agent's. These chats are unnamed
+    # lines, which cannot be addressed and so are never silenced.
+    silenced = module._UNADDRESSED_SILENCE if module._should_stay_silent(
+        {"type": "agent" if role == "peer" else "member"}, chat, "msg_matrix", None) else ""
     (event,) = handled
     # Byte-for-byte equality already pins _ANSWER_LAST's trailing position and
     # _SHARING_RULE's presence -- both are baked into `expected`.
@@ -4770,9 +4778,20 @@ def test_every_silence_instruction_names_the_sentinel(
     collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
                    module.GROUP_AUTHORITY_CHANNEL_PROMPT,
-                   collaboration):
+                   collaboration,
+                   module._UNADDRESSED_SILENCE):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
+    # Quiet in a group rides the shared-room gate, never the prompt constants:
+    # a solo non-owner DM is still an ordinary question to answer. The goal
+    # clause is load-bearing -- a goal wake names nobody.
+    assert "goal for this thread is active" in module._GROUP_SPEAK_RULE
+    assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
+    for constant in (module.EXTERNAL_CHANNEL_PROMPT,
+                     module.GROUP_AUTHORITY_CHANNEL_PROMPT,
+                     module.OWNER_CHANNEL_PROMPT):
+        assert module._GROUP_SPEAK_RULE not in constant
+    assert "on a turn you speak" in module._MEMBER_TURN_PREAMBLE
     # A solo owner DM never warrants unprompted silence, so its prompt does
     # not reserve the token — send()'s gate keys off exactly this absence.
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
@@ -5055,7 +5074,7 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
         assert module.NO_REPLY_SENTINEL in prompt
         # The paragraph after the silence prefix must not invite the very
         # contribution the prefix just forbade.
-        assert "only while a goal for this thread is active" in prompt
+        assert "goal for this thread is active" in prompt
         assert "when you have a useful contribution" not in prompt
 
 

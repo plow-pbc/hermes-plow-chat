@@ -271,7 +271,8 @@ def _collaboration_prompt(prompt, chat, identity):
         # so they belong with every prompt that gets a roster -- the same gate
         # _VOICE_RULE already uses, rather than repeated into each of the four
         # group-shaped prompts.
-        prompt = f"{_VOICE_RULE}{_RELATIONSHIP_FACT} {_NAME_FACT} {prompt}"
+        prompt = (f"{_VOICE_RULE}{_RELATIONSHIP_FACT} {_NAME_FACT} "
+                  f"{_GROUP_SPEAK_RULE}{prompt}")
     participants = chat.get("participants") or []
     peers = [
         (peer.get("line") or {}).get("display_name") or "an unnamed peer agent"
@@ -285,9 +286,9 @@ def _collaboration_prompt(prompt, chat, identity):
     collaboration = (
         f"Collaboration context: Other Plow agents here: {peer_fact}. "
         "Other named Plow agents are independent participants representing their listed humans. "
-        "Work with them in this visible thread. Respond when addressed, and otherwise only while a goal for this thread is active; "
-        "do not impersonate another agent. Avoid empty acknowledgements, reciprocal delegation, and repeating "
-        f"what the thread already knows. If you have nothing new to add, reply with exactly {NO_REPLY_SENTINEL}."
+        "Work with them in this visible thread; do not impersonate another agent. "
+        "Avoid empty acknowledgements, reciprocal delegation, and repeating "
+        "what the thread already knows."
     )
     return _with_identity(f"{collaboration} {prompt}", _agent_name(chat), identity)
 
@@ -678,21 +679,28 @@ def _goal_turn_line(record):
             f"{_goal_encode(record['text'])}]")
 
 
-def _goal_peer_should_stay_silent(sender, chat, text, goal):
-    """True when a peer agent's message must not draw a reply.
+def _should_stay_silent(sender, chat, text, goal, slash_command=False):
+    """True when a message in a shared room must not draw a reply.
 
-    With no active goal an agent answers humans and stays out of the way of
-    other agents; being named is the one thing that overrides that. The goal is
-    what unlocks agent-to-agent traffic, so the dangerous capability is never
-    ambient. Reads `type == "agent"`, so it is only as good as peer
-    classification (plow-pbc/plow#1741).
+    A group is other people's thread too. The agent answered every message in
+    it, which is what made it the loudest participant; being named, an active
+    goal, or a command addressed to it are the three things that override
+    that. A solo DM is always the agent's to answer -- there is nobody else
+    there to be talking to. Reads `type == "agent"` only to keep the peer
+    read honest (plow-pbc/plow#1741); a human sender is gated the same way.
     """
-    if (sender or {}).get("type") != "agent":
+    if _is_solo_dm(chat):
         return False
-    if _goal_active(goal):
+    if slash_command or _goal_active(goal):
         return False
     name = _agent_name(chat)
-    return not (name and name.lower() in (text or "").lower())
+    # An unnamed line has no way to BE addressed, and silence keyed on a name
+    # it does not have is a permanent mute, not discretion. The old rule only
+    # ever reached this line for a peer agent's message, where staying out was
+    # the safe default; for a human's it is the opposite.
+    if not name:
+        return False
+    return name.lower() not in (text or "").lower()
 
 
 def _sender_key(sender):
@@ -1105,9 +1113,9 @@ SETUP_TURN = (
     f"onboarding. Then reply with exactly {NO_REPLY_SENTINEL}."
 )
 
-_GOAL_PEER_SILENCE = (
-    "Another Plow agent is speaking here, it did not name you, and no goal is "
-    "set for this thread. Read it for context but do not reply to it. "
+_UNADDRESSED_SILENCE = (
+    "This message did not name you and no goal is set for this thread. Read it "
+    "for context but do not reply to it. "
     f"{_SILENCE_OPTION}"
 )
 _MEMBER_TURN_PREAMBLE = (
@@ -1116,23 +1124,23 @@ _MEMBER_TURN_PREAMBLE = (
     "directly; never emit [NOOP], reasoning, or tool narration. "
 )
 # A group is other people's thread too, and answering every message in it is
-# what made the agent the loudest participant. Worded off _GOAL_PEER_SILENCE,
-# which already holds this shape for a peer agent's message: address or goal,
-# or stay out of it. The goal clause is load-bearing -- a goal wake names
-# nobody, so a rule without it would silence the wakes _goal_wake fires.
+# what made the agent the loudest participant. The goal clause is
+# load-bearing -- a goal wake names nobody, so a rule without it would
+# silence the wakes _goal_wake fires. Named and goal are also what
+# _should_stay_silent enforces; the reply case is prose only, because the
+# quoted parent on the frame carries no mark saying the message was ours.
 _GROUP_SPEAK_RULE = (
-    "Other people are in this thread. Speak only when someone names you, "
-    "replies to a message of yours, or a goal for this thread is active; "
-    f"otherwise reply with exactly {NO_REPLY_SENTINEL}. A message that asks "
-    "nothing of you is not yours to answer, however well you could answer it. "
+    "Speak only when someone names you, replies to a message of yours, or a "
+    f"goal for this thread is active; otherwise reply with exactly {NO_REPLY_SENTINEL}. "
+    "A message that asks nothing of you is not yours to answer, however well "
+    "you could answer it. "
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_SHARING_RULE}"
 GROUP_AUTHORITY_CHANNEL_PROMPT = (
-    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_GROUP_SPEAK_RULE}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
-    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_GROUP_SPEAK_RULE}{_SPEAKER_FACT} "
-    f"{_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_SPEAKER_FACT} {_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
 )
 
 
@@ -1524,7 +1532,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # sentinel, so a model that verbalises its silence ("(no reply
             # needed)") posted it. Prompt prose not holding is the failure this
             # whole feature exists to answer -- the peer gate cannot rest on it.
-            "suppress_reply": _GOAL_PEER_SILENCE in (getattr(event, "channel_prompt", "") or ""),
+            "suppress_reply": _UNADDRESSED_SILENCE in (getattr(event, "channel_prompt", "") or ""),
             # What recall should search for, when it is not the delivered text.
             "recall_text": getattr(event, "recall_text", None),
             "source_message_id": str(
@@ -1976,7 +1984,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             return refused
         turn = self._active_turn.get()
         if turn and turn.get("suppress_reply") and chat_id == turn["chat_uid"]:
-            log.info("[plow_chat] suppressed an unaddressed peer message for %s", chat_id)
+            log.info("[plow_chat] suppressed an unaddressed message for %s", chat_id)
             return SendResult(success=True)
         # A completed sequence already delivered this turn's reply, so the
         # trailing prose the model adds after it is the same duplicate the
@@ -3032,8 +3040,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
         # that capability is never ambient.
-        if _goal_peer_should_stay_silent(sender, roster, spoken, goal):
-            channel_prompt = f"{_GOAL_PEER_SILENCE}{channel_prompt}"
+        if _should_stay_silent(sender, roster, spoken, goal, burst[0].starts_slash_command):
+            channel_prompt = f"{_UNADDRESSED_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],
