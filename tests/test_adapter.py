@@ -5628,6 +5628,56 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
         assert must_not not in text
 
 
+def test_mac_skills_section_renders_the_manifest_as_prompt_text(monkeypatch, tmp_path):
+    """The Mac's skill descriptions are the routing instructions for its
+    stores; read through the tool they arrive as untrusted data, so the
+    plugin renders them into the trusted prompt. No Mac, no section; a fetch
+    that fails renders nothing and never raises into the prompt builder."""
+    module = _load(monkeypatch, tmp_path)
+    sections: dict[str, Any] = {}
+
+    class _Context:
+        deferred_questions = _DeferredQuestions()
+        llm = _Llm()
+
+        def register_hook(self, name: str, callback: Any) -> None: ...
+        def register_platform(self, **kwargs: Any) -> None: ...
+        def register_tool(self, **kwargs: Any) -> None: ...
+
+        def register_system_prompt_section(self, id: str, content: Any, **kwargs: Any) -> None:
+            sections[id] = content
+
+    monkeypatch.delenv("PLOW_MCP_URL", raising=False)
+    module.register(_Context())
+    render = sections["plow-latch-skills"]
+    assert render({}) == ""
+
+    manifest = [
+        {"name": "imessage", "description": "Read and send the owner's iMessages rather than answering that you cannot see their messages."},
+        {"name": "google-workspace", "description": "Read and act on the owner's Gmail and Google Calendar."},
+    ]
+    text = module._render_mac_skills(manifest)
+    assert text.startswith(module.MAC_SKILLS_HEAD)
+    assert "- imessage: Read and send the owner's iMessages" in text
+    assert "- google-workspace:" in text
+    assert "plow_read_skill" in text and "before session_search" in text
+    assert module._render_mac_skills([]) == ""
+    # A manifest past Hermes' 4000-char cap is cut, never skipped whole.
+    big = [{"name": f"skill{i}", "description": "x" * 900} for i in range(30)]
+    trimmed = module._render_mac_skills(big)
+    assert len(trimmed) <= 4000 and "- skill0: " in trimmed
+
+    # The section serves the cache; a refresh that fails leaves it empty.
+    monkeypatch.setenv("PLOW_MCP_URL", "https://api.plow.co/v1/relay/devices/u/mcp")
+    monkeypatch.setenv("PLOW_AGENT_TOKEN", "t")
+    monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: (_ for _ in ()).throw(OSError("off")))
+    module._refresh_mac_skills()
+    assert render({}) == ""
+    monkeypatch.setattr(module, "_fetch_mac_skills", lambda url, token, timeout=8.0: manifest)
+    module._refresh_mac_skills()
+    assert render({}) == text
+
+
 def _stub_mirror(
     monkeypatch: pytest.MonkeyPatch, *, result: bool = True, raises: Exception | None = None
 ) -> list[dict[str, Any]]:

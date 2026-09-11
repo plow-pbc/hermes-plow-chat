@@ -17,8 +17,10 @@ import os
 import pathlib
 import re
 import stat
+import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -942,6 +944,98 @@ LATCH_PROMPT = (
 
 def _latch_section(_session_info: Mapping[str, Any]) -> str:
     return LATCH_PROMPT if os.environ.get("PLOW_MCP_URL") else ""
+
+
+# The Mac's own skill manifest, rendered into the trusted prompt. Latch
+# publishes one description per skill ("Read and send the owner's iMessages
+# ... rather than answering that you cannot see their messages"), and each is
+# the routing instruction for its store. Read through plow_list_skills they
+# arrive inside Hermes' untrusted-tool-result envelope, which tells the model
+# not to follow directives in them -- measured on a real agent: the manifest
+# came back, the model answered "no" over it, and the Mac was never read.
+# Here they are prompt text, in force before the first turn, for every store
+# the Mac publishes and any it adds later. Fetched once at start and refreshed
+# in the background; a Mac that is off renders nothing and the section is
+# skipped, never blocks a turn.
+MAC_SKILLS_HEAD = (
+    "Your owner's Mac publishes these skills. Each is the how-to for one part of their world, and "
+    "the one that covers what they asked is the first thing you read (plow_read_skill) and then "
+    "do, before session_search, before memory, before you reply:\n"
+)
+MAC_SKILLS_TTL_S = 600
+MAC_SKILLS_RETRY_S = 60
+_mac_skills: dict[str, Any] = {"text": "", "fetched_at": 0.0, "tried_at": 0.0, "lock": threading.Lock()}
+
+
+def _fetch_mac_skills(url: str, token: str, timeout: float = 8.0) -> list[dict[str, str]]:
+    """One JSON-RPC tools/call of plow_list_skills through the relay. Latch's
+    server is stateless (no initialize, JSON responses), so this is the whole
+    exchange. Raises on anything but a well-formed manifest."""
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "plow_list_skills", "arguments": {}},
+    }).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode()
+    if raw.lstrip().startswith("event:") or "\ndata:" in raw or raw.startswith("data:"):
+        raw = "\n".join(line[5:].strip() for line in raw.splitlines() if line.startswith("data:"))
+    result = json.loads(raw)["result"]
+    payload = result.get("structuredContent")
+    if payload is None:
+        text = next(c["text"] for c in result["content"] if c.get("type") == "text")
+        payload = json.loads(text)
+    skills = payload["skills"]
+    return [{"name": str(sk["name"]), "description": str(sk["description"])} for sk in skills]
+
+
+def _render_mac_skills(skills: list[dict[str, str]]) -> str:
+    if not skills:
+        return ""
+    # Hermes skips a section over 4000 chars outright. Each description gets
+    # the first sentence or so -- the routing rule is always at the front --
+    # and the whole section is cut at the cap: a bounded, terminating trim.
+    lines = [f"- {sk['name']}: {sk['description'][:280]}" for sk in skills]
+    text = MAC_SKILLS_HEAD + "\n".join(lines)
+    return text if len(text) <= 4000 else text[:4000].rsplit("\n", 1)[0]
+
+
+def _refresh_mac_skills() -> None:
+    url, token = os.environ.get("PLOW_MCP_URL"), os.environ.get("PLOW_AGENT_TOKEN")
+    if not url or not token:
+        return
+    try:
+        text = _render_mac_skills(_fetch_mac_skills(url, token))
+    except Exception as e:  # noqa: BLE001 -- a Mac that is off is the ordinary case
+        log.info("plow_chat: Mac skill manifest not fetched (%s); Latch section carries no skills yet", e)
+        return
+    with _mac_skills["lock"]:
+        _mac_skills["text"] = text
+        _mac_skills["fetched_at"] = time.time()
+
+
+def _kick_mac_skills_refresh() -> None:
+    if not os.environ.get("PLOW_MCP_URL"):
+        return
+    now = time.time()
+    with _mac_skills["lock"]:
+        stale = now - _mac_skills["fetched_at"] > MAC_SKILLS_TTL_S
+        if not stale or now - _mac_skills["tried_at"] < MAC_SKILLS_RETRY_S:
+            return
+        _mac_skills["tried_at"] = now
+    threading.Thread(target=_refresh_mac_skills, name="plow-mac-skills", daemon=True).start()
+
+
+def _mac_skills_section(_session_info: Mapping[str, Any]) -> str:
+    if not os.environ.get("PLOW_MCP_URL"):
+        return ""
+    _kick_mac_skills_refresh()
+    with _mac_skills["lock"]:
+        return _mac_skills["text"]
 
 
 _GROUP_ROOM_RESTRICTIONS = (
@@ -4138,6 +4232,8 @@ def register(ctx):
         log.warning("plow_chat: this Hermes has no register_system_prompt_section; Latch guidance not injected")
     else:
         register_section("plow-latch", _latch_section)
+        register_section("plow-latch-skills", _mac_skills_section)
+        _kick_mac_skills_refresh()
     # Registered unconditionally, like the platform itself: group chats are handled
     # by default, so gating the tool that starts one on a config nobody has to set
     # would leave it permanently unreachable on a stock install.
