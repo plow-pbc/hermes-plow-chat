@@ -1,15 +1,16 @@
 # Seed skills
 
-The two skills every Plow agent is seeded with. **This directory is the
+The three skills every Plow agent is seeded with. **This directory is the
 canonical copy, and the only one anyone edits by hand.**
 
 | skill |
 | --- |
 | `growth/plow-invite` |
 | `productivity/google-workspace` |
+| `productivity/owners-mac` |
 
 [`plow-pbc/plow-hermes-agent`](https://github.com/plow-pbc/plow-hermes-agent),
-the base image every hosted Plow agent boots, stages both of these out of this
+the base image every hosted Plow agent boots, stages all of these out of this
 repository's tarball at the `PLOW_CHAT_PLUGIN_SHA` it already pins — the same
 commit it fetches `plow-chat-platform/` from. Nothing is copied by hand, and it
 tracks no copy of its own: bumping that one pin moves the plugin and the skills
