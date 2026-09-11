@@ -1579,15 +1579,12 @@ async def test_authority_selects_the_prompt(
     expected = _owned(module, expected, chat) if role == "owner" else _membered(module, expected)
     if group:
         expected = _voiced(module, expected)
-    # Anyone who did not name us, with no goal set, is told to stay out -- a
-    # member's message as much as a peer agent's. These chats are unnamed
-    # lines, which cannot be addressed and so are never silenced.
-    silenced = module._UNADDRESSED_SILENCE if module._should_stay_silent(
-        {"type": "agent" if role == "peer" else "member"}, chat, "msg_matrix", None) else ""
     (event,) = handled
-    # Byte-for-byte equality already pins _ANSWER_LAST's trailing position and
-    # _SHARING_RULE's presence -- both are baked into `expected`.
-    assert event["channel_prompt"] == silenced + _rendered(module, expected, None, adapter._identity)
+    # These chats are unnamed lines, which cannot be addressed by name and so
+    # are never silenced -- what the silence matrix below owns. Byte-for-byte
+    # equality already pins _ANSWER_LAST's trailing position and
+    # _SHARING_RULE's presence: both are baked into `expected`.
+    assert event["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
     assert (event.authority, event.recall_everywhere) == (authority, everywhere)
     await adapter.on_processing_start(event)
     assert (adapter._send_guard("cht_other") is None) is authority, "the turn's gates follow its authority"
@@ -5041,17 +5038,26 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
 
 
 @pytest.mark.parametrize(
-    ("body", "goal_text", "expect_silenced"),
+    ("peer", "body", "goal_text", "reply_direction", "expect_silenced"),
     [
-        ("just thinking out loud", None, True),
-        ("Elm, can you check the date?", None, False),
-        ("just thinking out loud", "book the campsite", False),
+        pytest.param(True, "just thinking out loud", None, None, True, id="peer_unaddressed"),
+        pytest.param(True, "Elm, can you check the date?", None, None, False, id="peer_named"),
+        pytest.param(True, "just thinking out loud", "book the campsite", None, False, id="goal_unlocks"),
+        # The room is the boundary, not the speaker: a human's unaddressed
+        # message is the case the owner actually complained about.
+        pytest.param(False, "what time are we leaving?", None, None, True, id="human_unaddressed"),
+        pytest.param(False, "Elm, what time are we leaving?", None, None, False, id="human_named"),
+        # "helmet" carries "elm"; a substring match read that as being spoken to.
+        pytest.param(False, "we bought a helmet", None, None, True, id="name_inside_a_word"),
+        # A reply to this agent's own message addresses it without naming it.
+        pytest.param(False, "yes, that one", None, "outbound", False, id="reply_to_us"),
+        pytest.param(False, "yes, that one", None, "inbound", True, id="reply_to_someone_else"),
     ],
-    ids=["unaddressed_no_goal", "named", "goal_unlocks"],
 )
-async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
+async def test_a_shared_room_draws_a_reply_only_when_named_replied_to_or_under_a_goal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    body: str, goal_text: str | None, expect_silenced: bool,
+    peer: bool, body: str, goal_text: str | None,
+    reply_direction: str | None, expect_silenced: bool,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
@@ -5059,12 +5065,20 @@ async def test_a_peer_agent_draws_a_reply_only_when_named_or_under_a_goal(
         module._goal_save("cht_a", module._goal_new(goal_text))
     handled = _capture_events(monkeypatch, adapter)
 
-    frame = _peer_envelope("evt_peer", "cht_a", "msg_peer")
+    frame = (_peer_envelope("evt_peer", "cht_a", "msg_peer") if peer
+             else _envelope("evt_member", "cht_a", "msg_member", role="member"))
     frame["data"]["message"]["body"] = body
+    if reply_direction:
+        frame["data"]["message"]["reply_to"] = {
+            "part_index": None,
+            "message": {"sender": {"type": "member", "display_name": "Sam"},
+                        "created_at": "2026-09-09T12:00:00Z", "body": "which one?",
+                        "attachments": [], "direction": reply_direction},
+        }
     await adapter._on_frame(frame, object())
     await _settle(adapter)
 
-    # The read is never suppressed, only the reply: an agent blind to its peer
+    # The read is never suppressed, only the reply: an agent blind to the room
     # loses the thread and then talks past its own human.
     assert len(handled) == 1
     silenced = "do not reply to it" in handled[0]["channel_prompt"]

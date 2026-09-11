@@ -233,7 +233,9 @@ is the one flag that extends it to anyone else: a human member's turn in a trust
 group carries it, inside that group; it never follows them into a DM. A peer agent's
 turn and a goal wake have no human speaker, so trust grants them nothing. In
 discretion, a member's ask still waits for the owner's yes given in this thread,
-judged from the conversation, disclosing only what answers the request. A standing
+judged from the conversation, disclosing only what answers the request. Consent
+is the second question: in a shared room the first is whether the turn is the
+agent's to answer at all (below), and an unaddressed ask never reaches consent. A standing
 secret — a password, backup code, API key, raw token, or full card number — is
 refused regardless of authority. Email sends and calendar-conflict overrides need a
 turn with the owner's authority; an email's approval posts in the room that asked,
@@ -346,9 +348,12 @@ an instruction to Elm without parsing names or inventing a second router.
 
 Peer-agent messages are real inbound turns and remain visible in the same group
 as every human message. Only this line's own outbound echo is ignored. What a
-peer message does *not* do, absent a goal (below), is draw a reply: unless it
-names this agent, the turn carries a do-not-reply prompt. The reply is
-suppressed, never the read — an agent blind to its peer loses the thread and
+message in a shared room does *not* do is draw a reply for its own sake: a
+human's message and a peer agent's are gated alike, and the turn carries a
+do-not-reply prompt unless it names this agent, replies to a message this agent
+sent, is a slash command, or runs under an active goal (below). A solo DM is
+never gated, and a line with no name of its own cannot be addressed by name, so
+it keeps answering. The reply is suppressed, never the read — an agent blind to its peer loses the thread and
 then talks past its own human. Prompt prose alone did not hold: the agent that
 had the anti-acknowledgement paragraph still produced three rounds of "agreed,
 nothing to add".

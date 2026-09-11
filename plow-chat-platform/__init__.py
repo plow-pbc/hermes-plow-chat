@@ -679,28 +679,28 @@ def _goal_turn_line(record):
             f"{_goal_encode(record['text'])}]")
 
 
-def _should_stay_silent(sender, chat, text, goal, slash_command=False):
+def _should_stay_silent(chat, text, goal, slash_command=False, reply_to_self=False):
     """True when a message in a shared room must not draw a reply.
 
     A group is other people's thread too. The agent answered every message in
-    it, which is what made it the loudest participant; being named, an active
-    goal, or a command addressed to it are the three things that override
-    that. A solo DM is always the agent's to answer -- there is nobody else
-    there to be talking to. Reads `type == "agent"` only to keep the peer
-    read honest (plow-pbc/plow#1741); a human sender is gated the same way.
+    it, which is what made it the loudest participant; being named, being
+    replied to, an active goal, or a command are what speak. A solo DM is
+    always the agent's to answer -- there is nobody else there to be talking
+    to. The speaker does not enter into it: a human's message and a peer
+    agent's are gated the same way.
     """
-    if _is_solo_dm(chat):
-        return False
-    if slash_command or _goal_active(goal):
+    if _is_solo_dm(chat) or slash_command or reply_to_self or _goal_active(goal):
         return False
     name = _agent_name(chat)
     # An unnamed line has no way to BE addressed, and silence keyed on a name
-    # it does not have is a permanent mute, not discretion. The old rule only
-    # ever reached this line for a peer agent's message, where staying out was
-    # the safe default; for a human's it is the opposite.
+    # it does not have is a permanent mute, not discretion.
     if not name:
         return False
-    return name.lower() not in (text or "").lower()
+    # A token boundary, not a substring: "Ash" must not read "we paid cash"
+    # as its own name. Escaped, because a display name someone chose is data,
+    # never a pattern -- "C++" or "A." would otherwise be a broken regex or a
+    # wildcard. \w, so "Elm," and "@Elm" still address it.
+    return re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text or "", re.IGNORECASE) is None
 
 
 def _sender_key(sender):
@@ -3040,7 +3040,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
         # that capability is never ambient.
-        if _should_stay_silent(sender, roster, spoken, goal, burst[0].starts_slash_command):
+        # A reply to this agent's own message is addressed to it as surely as
+        # its name is. `direction` is the message resource's own field; a
+        # frame without one is simply not a reply to us.
+        replied_to = any((item.reply_to or {}).get("message", {}).get("direction") == "outbound"
+                         for item in burst)
+        if _should_stay_silent(roster, spoken, goal, burst[0].starts_slash_command, replied_to):
             channel_prompt = f"{_UNADDRESSED_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
