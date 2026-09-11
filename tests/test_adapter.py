@@ -4787,6 +4787,11 @@ def test_every_silence_instruction_names_the_sentinel(
     for signal in ("your name", "follow-up", "a reply to a message of yours",
                    "a goal for", "reply with exactly"):
         assert signal in module._GROUP_SPEAK_RULE
+    # Ownership is decided BEFORE any tool runs: suppression lands in send(),
+    # which is after a Mac, mail or calendar side effect would already have
+    # happened. A turn that is not this agent's does not act at all.
+    for guard in ("before you look anything up or use any tool", "call nothing"):
+        assert guard in module._GROUP_SPEAK_RULE
     assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
     for constant in (module.EXTERNAL_CHANNEL_PROMPT,
                      module.GROUP_AUTHORITY_CHANNEL_PROMPT,

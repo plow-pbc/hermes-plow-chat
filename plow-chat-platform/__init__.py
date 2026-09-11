@@ -1106,8 +1106,11 @@ _GROUP_SPEAK_RULE = (
     "were just asked or just said, a reply to a message of yours, or a goal for "
     "this thread all make it yours. Being named opens a conversation and you stay "
     "in it until it turns elsewhere -- someone naming another agent turns it "
-    f"elsewhere. When it is not yours, reply with exactly {NO_REPLY_SENTINEL} and "
-    "nothing else: never your reasoning, and never a sentence explaining that you "
+    f"elsewhere. Settle that question first, before you look anything up or use any "
+    "tool: a turn that is not yours is not yours to act on either, so call nothing, "
+    "change nothing, and fetch nothing for it -- someone else's request to someone "
+    f"else is not your errand. When it is not yours, reply with exactly {NO_REPLY_SENTINEL} "
+    "and nothing else: never your reasoning, and never a sentence explaining that you "
     "are staying quiet. A message that asks nothing of you is not yours to answer, "
     "however well you could answer it. "
 )
