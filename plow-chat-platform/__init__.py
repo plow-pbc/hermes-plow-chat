@@ -3306,10 +3306,10 @@ ROUTING_HINTS = {
     # Neither takes a query, so "no match" is not determinable from the result:
     # every successful read carries the note. Both are partial views by nature.
     "plow_contacts": (
-        lambda r: r.get("success", True),
+        lambda r: "contacts" in r,
         "This is Plow's own contact book: only the people named in Plow chats. " + _MAC_ROUTE),
     "plow_list_chats": (
-        lambda r: r.get("success", True),
+        lambda r: "chats" in r,
         "These are this agent's own Plow chats. " + _MAC_ROUTE),
 }
 
