@@ -2210,7 +2210,8 @@ def _authority_case_name_a_contact(module: Any, monkeypatch: pytest.MonkeyPatch,
         # No chat id rides along: the contact book is keyed by handle, not by room.
         assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
     else:
-        assert "owner" in out["error"] and record == []
+        assert "owner" in out["error"]
+        assert record == []
 
 
 def _authority_case_read_the_book(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
@@ -2238,17 +2239,18 @@ def _authority_case_list_chats(module: Any, monkeypatch: pytest.MonkeyPatch, tur
     assert (module._UNTRUSTED_MARK in out.get("note", "")) is authorized
 
 
-# One table over the turns every action gate is keyed on. Naming is the one
-# write among these four, so unlike the three reads it refuses no-turn too.
-_GATE_AUTHORITY_ON_NO_TURN = {
-    "cross-chat-send": (_authority_case_cross_chat_send, True),
-    "name-a-contact": (_authority_case_name_a_contact, False),
-    "read-the-book": (_authority_case_read_the_book, True),
-    "list-chats": (_authority_case_list_chats, True),
+# One table over the turns every action gate is keyed on: the turn flag it
+# reads, and whether no turn at all passes. Naming is the one write, so it
+# keys on the owner's identity and, unlike the three reads, refuses no-turn.
+_GATES = {
+    "cross-chat-send": (_authority_case_cross_chat_send, "authority", True),
+    "name-a-contact": (_authority_case_name_a_contact, "owner", False),
+    "read-the-book": (_authority_case_read_the_book, "authority", True),
+    "list-chats": (_authority_case_list_chats, "authority", True),
 }
 
 
-@pytest.mark.parametrize("gate", list(_GATE_AUTHORITY_ON_NO_TURN))
+@pytest.mark.parametrize("gate", list(_GATES))
 @pytest.mark.parametrize(
     "turn",
     [
@@ -2259,13 +2261,12 @@ _GATE_AUTHORITY_ON_NO_TURN = {
         pytest.param(None, id="no-turn"),
     ],
 )
-def test_action_gates_key_on_turn_authority(
+def test_action_gates_key_on_the_turn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, gate: str,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
-    run, no_turn_authorized = _GATE_AUTHORITY_ON_NO_TURN[gate]
-    authorized = no_turn_authorized if turn is None else bool(turn["authority"])
-    run(module, monkeypatch, turn, authorized)
+    run, flag, no_turn_authorized = _GATES[gate]
+    run(module, monkeypatch, turn, no_turn_authorized if turn is None else turn[flag])
 
 
 @pytest.mark.parametrize(
@@ -3653,14 +3654,17 @@ def test_starting_a_thread_gates_on_trust_and_turn_authority(
         assert ("owner" if trusted else "authority") in out["error"]
 
 
-@pytest.mark.parametrize(("trusted", "granted"), [("tru", False), ("maybe", False), ("false", False), (None, True)])
+@pytest.mark.parametrize(("turn", "trusted", "granted"), [
+    (_OWNER_DM, "tru", False), (_OWNER_DM, "maybe", False), (_OWNER_DM, "false", False),
+    (_OWNER_DM, None, True), (_TRUSTED_MEMBER, None, False)])
 def test_absent_trusted_grants_full_trust_and_falsy_or_unparseable_does_not(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any, granted: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], trusted: Any, granted: bool
 ) -> None:
-    """Groups the owner starts default to full trust; a falsy value opts out,
-    and an unparseable one falls to the side that grants nothing."""
+    """Groups the owner starts default to full trust, and anyone else's to
+    discretion; a falsy value opts out, and an unparseable one falls to the
+    side that grants nothing."""
     module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(_OWNER_DM)
+    module._ACTIVE_TURN.set(turn)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
                result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
