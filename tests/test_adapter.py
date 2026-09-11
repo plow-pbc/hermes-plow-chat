@@ -5605,7 +5605,7 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
                  # that earlier agents' work persists on the Mac: an agent that
                  # knew only the possessive rule searched its own sessions for
                  # "did Plow do X for me" and declared it out of reach.
-                 "end to end", "audit*.ndjson", "not from your own chat history"):
+                 "end to end", "publishes a skill for reading each", "not from your own chat history"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
