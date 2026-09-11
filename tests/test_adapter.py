@@ -1557,12 +1557,9 @@ async def test_authority_selects_the_prompt(
     if group:
         expected = _voiced(module, expected)
     prompt = handled[0]["channel_prompt"]
+    # Byte-for-byte equality already pins _ANSWER_LAST's trailing position and
+    # _SHARING_RULE's presence -- both are baked into `expected`.
     assert prompt == _rendered(module, expected, None, adapter._identity)
-    # The ordering rule closes every one of these, separated from the sentence
-    # before it -- membership alone would pass on "...truthful.Write your".
-    assert f" {module._ANSWER_LAST}" in prompt
-    # One sharing rule on every turn; nothing trust-specific anywhere.
-    assert module._SHARING_RULE in prompt
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
@@ -2166,36 +2163,88 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
     ]
 
 
-@pytest.mark.parametrize(
-    ("turn", "confined"),
-    [
-        pytest.param(_OWNER_DM, False, id="owner-dm"),
-        pytest.param(_OWNER_GROUP, False, id="owner-group"),
-        pytest.param(_TRUSTED_MEMBER, False, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, True, id="discretion-member"),
-        pytest.param(None, False, id="no-turn"),
-    ],
-)
-def test_message_guard_confines_only_a_turn_without_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, confined: bool,
-) -> None:
-    """Only a turn without the owner's authority is confined to its own
-    chat -- the owner anywhere, a trusted group's member, and no turn at all
-    (a cron send) may all address another granted chat freely."""
-    module = _load(monkeypatch, tmp_path)
+def _authority_case_cross_chat_send(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """Only a turn without the owner's authority is confined to its own chat."""
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_g", group=True), _chat("cht_t", group=True),
                         _chat("cht_b", group=True), _chat("cht_other")])
     adapter._active_turn.set(turn)
-
     result = adapter._send_guard("cht_other")
-
-    if confined:
+    if authorized:
+        assert result is None
+    else:
         assert result is not None
         assert "authority" in result.error and "confined" in result.error
+
+
+def _authority_case_name_a_contact(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    record: list[Any] = []
+    _live_tool(module, monkeypatch, "name_contact",
+               result={"display_name": "Abby", "relationship": "wife"}, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_name_contact(
+        {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}))
+    assert out["success"] is authorized
+    if authorized:
+        # No chat id rides along: the contact book is keyed by handle, not by room.
+        assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
     else:
-        assert result is None
+        assert "owner" in out["error"] and record == []
+
+
+def _authority_case_read_the_book(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """The mirror of naming's gate: a no-turn cron caller reads, where it refuses to write."""
+    record: list[Any] = []
+    _live_tool(module, monkeypatch, "contacts", result=_BOOK, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_contacts({}))
+    assert out["success"] is authorized
+    assert out.get("contacts") == (_BOOK if authorized else None)
+    assert record == ([()] if authorized else []), "a refusal must not reach Plow at all"
+
+
+def _authority_case_list_chats(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
+    """A listing carrying participants is the mirror of plow_contacts' gate."""
+    record: list[Any] = []
+    listing = [{"chat_id": "cht_a", "kind": "dm", "trusted": False, "participants": []}]
+    _live_tool(module, monkeypatch, "list_chats", result=listing, record=record)
+    module._ACTIVE_TURN.set(turn)
+    out = json.loads(module._plow_list_chats({}))
+    assert out["success"] is authorized
+    assert out.get("chats") == (listing if authorized else None)
+    assert record == ([()] if authorized else []), "a refusal must not reach Plow at all"
+    # Somebody else's words carry the same untrusted marker every such block does.
+    assert (module._UNTRUSTED_MARK in out.get("note", "")) is authorized
+
+
+# One table over the turns every action gate is keyed on. Naming is the one
+# write among these four, so unlike the three reads it refuses no-turn too.
+_GATE_AUTHORITY_ON_NO_TURN = {
+    "cross-chat-send": (_authority_case_cross_chat_send, True),
+    "name-a-contact": (_authority_case_name_a_contact, False),
+    "read-the-book": (_authority_case_read_the_book, True),
+    "list-chats": (_authority_case_list_chats, True),
+}
+
+
+@pytest.mark.parametrize("gate", list(_GATE_AUTHORITY_ON_NO_TURN))
+@pytest.mark.parametrize(
+    "turn",
+    [
+        pytest.param(_OWNER_DM, id="owner-dm"),
+        pytest.param(_OWNER_GROUP, id="owner-group"),
+        pytest.param(_TRUSTED_MEMBER, id="trusted-member"),
+        pytest.param(_DISCRETION_MEMBER, id="discretion-member"),
+        pytest.param(None, id="no-turn"),
+    ],
+)
+def test_action_gates_key_on_turn_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, gate: str,
+) -> None:
+    module = _load(monkeypatch, tmp_path)
+    run, no_turn_authorized = _GATE_AUTHORITY_ON_NO_TURN[gate]
+    authorized = no_turn_authorized if turn is None else bool(turn["authority"])
+    run(module, monkeypatch, turn, authorized)
 
 
 @pytest.mark.parametrize(
@@ -2439,49 +2488,6 @@ def _live_tool(
 
 
 @pytest.mark.parametrize(
-    ("turn", "written"),
-    [
-        pytest.param(_OWNER_DM, True, id="owner-dm"),
-        pytest.param(_OWNER_GROUP, True, id="owner-group"),
-        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
-        pytest.param(None, False, id="no-turn"),
-    ],
-)
-def test_naming_is_refused_during_a_member_turn_and_written_on_the_owners(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, written: bool,
-) -> None:
-    """A member saying "I'm Sam's wife" cannot become a label unless their turn
-    carries the owner's authority -- the owner anywhere, or anyone in a group
-    the owner trusts. Everywhere else the gate fails closed, like
-    plow_start_group_message's trusted branch, not open, and so does no turn
-    at all."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    _live_tool(
-        module, monkeypatch, "name_contact",
-        result=lambda handle, body: {
-            "handle": handle, "display_name": body.get("display_name"),
-            "relationship": body.get("relationship"),
-        },
-        record=record,
-    )
-    args = {"handle": "+15550000002", "display_name": "Abby", "relationship": "wife"}
-    module._ACTIVE_TURN.set(turn)
-
-    out = json.loads(module._plow_name_contact(dict(args)))
-
-    assert out["success"] is written
-    if written:
-        # No chat id rides along: the contact book is keyed by handle, not by room.
-        assert record == [("+15550000002", {"display_name": "Abby", "relationship": "wife"})]
-    else:
-        assert "owner" in out["error"]
-        assert record == []
-
-
-@pytest.mark.parametrize(
     ("status", "expected"),
     [
         pytest.param(None, "could not confirm the write", id="timeout-unconfirmed"),
@@ -2510,40 +2516,6 @@ def test_naming_reports_unconfirmed_write_on_network_error(
 # The contact book as the server serves it: the owner's own row first.
 _BOOK = [{"provider_key": "+15550000001", "display_name": "Sam", "relationship": None, "role": "owner"},
          {"provider_key": "+15550000002", "display_name": "Abby", "relationship": "wife", "role": "member"}]
-
-
-@pytest.mark.parametrize(
-    ("turn", "read"),
-    [
-        pytest.param(_OWNER_DM, True, id="owner-dm"),
-        pytest.param(_OWNER_GROUP, True, id="owner-group"),
-        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
-        pytest.param(None, True, id="a-cron-turn-has-no-turn-at-all"),
-    ],
-)
-def test_the_contact_book_reads_on_the_owners_turn_and_on_no_turn_but_never_a_members(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, read: bool,
-) -> None:
-    """The mirror of naming's gate, not a copy of it. A cron turn carries no
-    roster and no turn, and is exactly the caller that needs the book to know
-    its owner's name -- so no-turn reads, where no-turn refuses to write. A
-    turn without the owner's authority -- a member's own turn in a group the
-    owner has not trusted -- is the one context somebody else is steering,
-    and it is refused, with no request made at all."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    _live_tool(module, monkeypatch, "contacts", result=_BOOK, record=record)
-    module._ACTIVE_TURN.set(turn)
-
-    out = json.loads(module._plow_contacts({}))
-
-    assert out["success"] is read
-    # Rows reach the model as the server wrote them -- the owner's own row is
-    # what a rosterless turn is here for.
-    assert out.get("contacts") == (_BOOK if read else None)
-    assert record == ([()] if read else []), "a refusal must not reach Plow at all"
 
 
 @pytest.mark.parametrize("title", ["Cabin Cleaning", "+15550000001"])
@@ -2628,44 +2600,6 @@ async def test_a_declined_chat_listing_reaches_the_tool_as_a_decline(
 
     with pytest.raises(module._PlowSendError):
         await adapter.list_chats()
-
-
-@pytest.mark.parametrize(
-    ("turn", "listed"),
-    [
-        pytest.param(_OWNER_DM, True, id="owner-dm"),
-        pytest.param(_OWNER_GROUP, True, id="owner-group"),
-        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
-        pytest.param(None, True, id="a-cron-turn-has-no-turn-at-all"),
-    ],
-)
-def test_the_chat_listing_is_refused_on_a_members_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, listed: bool,
-) -> None:
-    """A listing carrying participants is exactly what one room's member must
-    not be able to read about the owner's other rooms -- the same line
-    plow_contacts and a cross-chat send already hold. The gate is the contact
-    book's, not naming's: a turn-less caller (cron) is the owner's own agent
-    with nobody steering it, and reads; a turn without the owner's authority
-    -- a member's own turn in an untrusted group -- is refused, with no
-    request made at all."""
-    module = _load(monkeypatch, tmp_path)
-    record: list[Any] = []
-    listing = [{"chat_id": "cht_a", "kind": "dm", "trusted": False, "participants": []}]
-    _live_tool(module, monkeypatch, "list_chats", result=listing, record=record)
-    module._ACTIVE_TURN.set(turn)
-
-    out = json.loads(module._plow_list_chats({}))
-
-    assert out["success"] is listed
-    assert out.get("chats") == (listing if listed else None)
-    assert record == ([()] if listed else []), "a refusal must not reach Plow at all"
-    # Titles and names in the listing are written by the people in those
-    # rooms, and they reach a turn that can act cross-chat -- so they ride
-    # with the same marker every other block of somebody else's words carries.
-    assert (module._UNTRUSTED_MARK in out.get("note", "")) is listed
 
 
 @pytest.mark.parametrize(
@@ -3484,18 +3418,30 @@ def test_draft_by_id_send_is_blocked_everywhere(
     assert "gmail send" in out["message"]
 
 
-@pytest.mark.parametrize("turn", [_OWNER_DM, _OWNER_GROUP, _TRUSTED_MEMBER])
-def test_owner_send_escalates_to_the_human_gate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any],
+@pytest.mark.parametrize(
+    ("turn", "authorized"),
+    [
+        pytest.param(_OWNER_DM, True, id="owner-dm"),
+        pytest.param(_OWNER_GROUP, True, id="owner-group"),
+        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
+        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
+        pytest.param(None, False, id="no-turn"),
+    ],
+)
+def test_a_mail_send_gates_on_turn_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, authorized: bool,
 ) -> None:
-    """Any turn with the owner's authority -- the owner anywhere, or a
-    trusted group's member -- may put a send in front of the human gate."""
+    """A turn with the owner's authority puts a send in front of the human
+    gate; everywhere else it is blocked outright, not escalated -- the
+    approval prompt itself would publish the email into the room."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
-    assert out["action"] == "approve"
-    assert "andrew@example.com" in out["message"]
-    assert out["rule_key"].startswith("google-send:")
+    if authorized:
+        assert out["action"] == "approve" and "andrew@example.com" in out["message"]
+        assert out["rule_key"].startswith("google-send:")
+    else:
+        assert out["action"] == "block" and "nothing was sent" in out["message"]
 
 
 @pytest.mark.parametrize("flags", [
@@ -3556,21 +3502,6 @@ def test_rule_key_is_per_message_so_always_never_generalises(
     assert first["rule_key"] != second["rule_key"]
 
 
-@pytest.mark.parametrize("turn", [None, _DISCRETION_MEMBER])
-def test_a_send_without_authority_is_blocked_not_escalated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: Any,
-) -> None:
-    """A turn without the owner's authority must not be able to answer the
-    approval prompt, and the prompt itself would publish the email into the
-    room; cron runs have no turn at all."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(turn)
-    argv = ["plow-gog", "--account", "so@plow.co", *_SEND_ARGV[1:-2]]
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
-    assert out["action"] == "block"
-    assert "nothing was sent" in out["message"]
-
-
 _FORCED_BOOKING_ARGV = [
     "plow-gog", "cal", "create", "primary", "--summary", "Dentist",
     "--from", "2026-09-09T10:00:00-07:00", "--to", "2026-09-09T11:00:00-07:00",
@@ -3611,7 +3542,6 @@ def test_conflict_override_requires_authority(
     module._ACTIVE_TURN.set(turn)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
     assert (None if out is None else out["action"]) == expected
-
 
 
 @pytest.mark.parametrize("tool_name,args", [
@@ -3665,45 +3595,23 @@ def test_group_message_reports_adoption_separately_from_delivery(
 
 
 @pytest.mark.parametrize(
-    "turn",
+    ("trusted", "turn", "started"),
     [
-        pytest.param(None, id="outside-turn"),
-        pytest.param(_DISCRETION_MEMBER, id="discretion-member"),
-        pytest.param(_TRUSTED_MEMBER, id="trusted-member"),
+        pytest.param(True, None, False, id="trusted-outside-turn"),
+        pytest.param(True, _DISCRETION_MEMBER, False, id="trusted-discretion-member"),
+        pytest.param(True, _TRUSTED_MEMBER, False, id="trusted-trusted-member"),
+        pytest.param(False, _TRUSTED_MEMBER, True, id="plain-trusted-member"),
+        pytest.param(False, _DISCRETION_MEMBER, False, id="plain-discretion-member"),
+        pytest.param(False, None, False, id="plain-outside-turn"),
     ],
 )
-def test_only_an_owner_turn_can_start_a_trusted_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None,
+def test_starting_a_thread_gates_on_trust_and_turn_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool, turn: dict[str, Any] | None, started: bool,
 ) -> None:
     """A trusted thread hands its members the owner's own reach, so opening
-    one is owner-only -- even for a turn that already carries the owner's
-    authority in its own trusted group."""
-    module = _load(monkeypatch, tmp_path)
-    _live_tool(module, monkeypatch, "start_group_thread",
-               raises=AssertionError("must not send"))
-    module._ACTIVE_TURN.set(turn)
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi",
-         "dry_run": False, "confirm": True, "trusted": True}))
-    assert out["success"] is False
-    assert "owner" in out["error"] and "nothing was sent" in out["error"]
-
-
-@pytest.mark.parametrize(
-    ("turn", "started"),
-    [
-        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
-        pytest.param(None, False, id="outside-turn"),
-    ],
-)
-def test_a_plain_thread_needs_only_the_owners_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    turn: dict[str, Any] | None, started: bool,
-) -> None:
-    """Discretion mode asks nothing of room shape, only of authority: a
-    trusted group's member may open a plain thread the owner never touched,
-    where a discretion member or a turn-less cron run may not."""
+    one is owner-only even for a turn with authority in its own trusted
+    group. A plain thread asks only authority: a trusted group's member may
+    open one the owner never touched; a discretion member or no turn may not."""
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
@@ -3711,12 +3619,14 @@ def test_a_plain_thread_needs_only_the_owners_authority(
     module._ACTIVE_TURN.set(turn)
     out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
-         "dry_run": False, "confirm": True, "trusted": False}))
+         "dry_run": False, "confirm": True, "trusted": trusted}))
     assert out["success"] is started
     if started:
-        assert sent == [(["+15550001111"], "hi", False)]
+        assert sent == [(["+15550001111"], "hi", trusted)]
     else:
-        assert "authority" in out["error"] and "nothing was sent" in out["error"]
+        assert sent == []
+        assert "nothing was sent" in out["error"]
+        assert ("owner" if trusted else "authority") in out["error"]
 
 
 @pytest.mark.parametrize(("trusted", "granted"), [("tru", False), ("maybe", False), ("false", False), (None, True)])
