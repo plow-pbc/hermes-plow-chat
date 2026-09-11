@@ -1326,6 +1326,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         chat_uid = event.source.chat_id
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
+        # Hermes builds its own events and swallows a raise here, so an
+        # unstamped event is a speakerless wake, not a missing turn.
+        if not hasattr(event, "authority"):
+            event.authority, event.recall_everywhere = _authority(
+                await self.get_chat_info(chat_uid), _owner_dm(self._chats[chat_uid]), human=False)
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
@@ -1419,7 +1424,8 @@ class PlowChatAdapter(BasePlatformAdapter):
             await self._goal_reply(chat_uid, _goal_status_line(goal))
             return
         if not authority:
-            await self._goal_reply(chat_uid, "Only the owner or a trusted group can set or clear this goal.")
+            await self._goal_reply(
+                chat_uid, "Only the owner, or a person in a group the owner trusts, can set or clear this goal.")
             return
         if action == "clear":
             if goal is None:
@@ -1659,10 +1665,10 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _goal_fire(self, chat_uid, goal):
         """Inject the goal turn, the same path `gateway/wake.py` uses.
 
-        A scheduled wake carries the room's real disclosure prompt, and owner
-        authority ONLY in a DM. In a group the thread is full of other people's
-        words; an owner-authorized turn acting on them unprompted is a confused
-        deputy holding owner-only tools.
+        A scheduled wake has no human speaker, so outside the owner's DM it gets
+        the discretion prompt and no authority. In a group the thread is full of
+        other people's words; an owner-authorized turn acting on them unprompted
+        is a confused deputy holding owner-only tools.
         """
         # Refreshed first. Inbound delivery re-reads trust before scoping
         # recall; a wake that skipped it would keep recalling the owner's

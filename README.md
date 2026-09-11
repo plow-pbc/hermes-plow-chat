@@ -345,9 +345,9 @@ before authorship was recorded still reads as theirs. Retiring a goal drops
 the setter's name along with the transcript: neither has a reader once the
 goal is done, and both would otherwise sit on the persistent volume.
 
-An active goal is what unlocks replying to peer agents. Scheduled wakes carry
-the room's ordinary disclosure prompt and take owner authority only in a DM —
-unchanged by the reframing: in a group the thread is still full of other
+An active goal is what unlocks replying to peer agents. A scheduled wake has no
+human speaker, so outside the owner's DM it gets the discretion prompt and no
+authority — unchanged by the reframing: in a group the thread is still full of other
 people's words, and an owner-authorized turn acting on them unprompted is a
 confused deputy holding owner-only tools.
 
