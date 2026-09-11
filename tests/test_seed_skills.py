@@ -49,3 +49,23 @@ def test_a_seed_skill_names_only_tools_the_plugin_registers(
     assert tokens, f"{skill} names no plow_* token at all; the read or the pattern is broken"
     named = tokens - LATCH_MCP_TOOLS
     assert named <= registered, f"{skill} names tools the plugin does not register: {sorted(named - registered)}"
+
+
+def test_the_owners_mac_skill_claims_every_question_about_the_owners_world() -> None:
+    """A fresh agent's own stores are empty, and the model reads that as "no
+    record" of the owner's world (#128). Hermes picks a skill by its
+    description, so this one has to name the whole of that world, in
+    general terms -- no person, no product line -- and route to the Mac
+    rather than the agent's own sessions."""
+    text = (ROOT / "seed-skills/productivity/owners-mac/SKILL.md").read_text()
+    front = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    assert front, "frontmatter missing"
+    fields = dict(line.split(": ", 1) for line in front.group(1).splitlines())
+    assert fields["name"] == "owners-mac"
+    description = fields["description"].lower()
+    for must in ("messages", "mail", "calendar", "contacts", "files", "browser",
+                 "earlier agent", "not from your own sessions"):
+        assert must in description
+    body = text[front.end():]
+    assert body.index("plow_list_skills") < body.index("plow_read_skill") < body.index("Do what the skill says")
+    assert "A request is not work done" in body
