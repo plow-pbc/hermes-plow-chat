@@ -190,17 +190,18 @@ comes from the message frame; no parent-message lookup is made.
 
 The room mode is an owner-scoped, per-chat preference served on `GET
 /v1/chats/{uid}`. Before handing off each inbound burst, the adapter refreshes that
-chat so a dashboard change applies to the next message. Trust is the one flag: a
-trusted group makes every member the owner, so any turn there carries the owner's
-authority in every room, not just this one. In discretion, a member's ask still waits
-for the owner's yes given in this thread, judged from the conversation, disclosing
-only what answers the request. A standing secret — a password, backup code, API key,
-raw token, or full card number — is refused regardless of authority. Email sends and
-calendar-conflict overrides need a turn with the owner's authority, with approval
-posting in the room that asked. A turn without authority cannot send to other chats,
-write contacts, set goals, or list the owner's other rooms. Groups the owner starts
-begin trusted; groups another member starts begin with discretion, and only the owner
-can change that later.
+chat so a dashboard change applies to the next message. The owner's own turns carry
+that authority everywhere -- a DM, an untrusted group, a trusted group. Trust is the
+one flag that extends it to everyone else in a group: a trusted group makes every
+member the owner, so any turn there carries authority in every room, not just this
+one. In discretion, a member's ask still waits for the owner's yes given in this
+thread, judged from the conversation, disclosing only what answers the request. A
+standing secret — a password, backup code, API key, raw token, or full card number —
+is refused regardless of authority. Email sends and calendar-conflict overrides need
+a turn with the owner's authority, with approval posting in the room that asked. A
+turn without authority cannot send to other chats, write contacts, set goals, or list
+the owner's other rooms. Groups the owner starts begin trusted; groups another member
+starts begin with discretion, and only the owner can change that later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
 dashboard; opening a trusted thread is owner-only too. Both only succeed on an owner-

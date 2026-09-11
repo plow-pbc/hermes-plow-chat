@@ -905,9 +905,7 @@ _DISCLOSURE = (
     "what answers the request. This turn cannot send to other chats, write "
     "contacts, set goals, or list the owner's other rooms."
 )
-# The owner anywhere, or anyone in a group the owner trusts: one prompt,
-# whoever is speaking. Names the WHY -- an unnamed speaker was refused a
-# trusted turn's own tools without it (replay A/B, see task-3-report.md).
+# Says WHY: without it, a trusted member shown as a bare number was refused (live-model replay).
 _AUTHORITY = (
     "This request carries your owner's full authority: your owner either sent "
     "it or made everyone in this group trusted, so serve whoever asked — named "
