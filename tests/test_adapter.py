@@ -5567,15 +5567,9 @@ async def test_a_direct_goal_reply_that_does_not_land_is_not_acknowledged(
 
     with pytest.raises(RuntimeError):
         await adapter._goal_command("cht_a", command, role, None, "msg_cmd")
-def test_latch_section_renders_only_when_a_mac_is_connected(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """Hermes drops MCP `instructions`, so the plugin is what tells a Hermes
-    agent that the plow_ tools are the owner's Mac and the default for owner
-    work. plow-init exports PLOW_MCP_URL exactly when a Mac exists; without
-    it the section renders empty and Hermes skips it."""
-    module = _load(monkeypatch, tmp_path)
+def _registered_prompt_sections(module: Any) -> dict[str, Any]:
+    """register() the plugin against a minimal context and return the prompt
+    sections it registered, by id."""
     sections: dict[str, Any] = {}
 
     class _Context:
@@ -5590,7 +5584,19 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
             sections[id] = content
 
     module.register(_Context())
-    render = sections["plow-latch"]
+    return sections
+
+
+def test_latch_section_renders_only_when_a_mac_is_connected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Hermes drops MCP `instructions`, so the plugin is what tells a Hermes
+    agent that the plow_ tools are the owner's Mac and the default for owner
+    work. plow-init exports PLOW_MCP_URL exactly when a Mac exists; without
+    it the section renders empty and Hermes skips it."""
+    module = _load(monkeypatch, tmp_path)
+    render = _registered_prompt_sections(module)["plow-latch"]
 
     monkeypatch.delenv("PLOW_MCP_URL", raising=False)
     assert render({}) == ""
@@ -5634,22 +5640,8 @@ def test_mac_skills_section_renders_the_manifest_as_prompt_text(monkeypatch, tmp
     plugin renders them into the trusted prompt. No Mac, no section; a fetch
     that fails renders nothing and never raises into the prompt builder."""
     module = _load(monkeypatch, tmp_path)
-    sections: dict[str, Any] = {}
-
-    class _Context:
-        deferred_questions = _DeferredQuestions()
-        llm = _Llm()
-
-        def register_hook(self, name: str, callback: Any) -> None: ...
-        def register_platform(self, **kwargs: Any) -> None: ...
-        def register_tool(self, **kwargs: Any) -> None: ...
-
-        def register_system_prompt_section(self, id: str, content: Any, **kwargs: Any) -> None:
-            sections[id] = content
-
     monkeypatch.delenv("PLOW_MCP_URL", raising=False)
-    module.register(_Context())
-    render = sections["plow-latch-skills"]
+    render = _registered_prompt_sections(module)["plow-latch-skills"]
     assert render({}) == ""
 
     manifest = [
