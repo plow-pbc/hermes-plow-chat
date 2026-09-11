@@ -648,32 +648,35 @@ def _goal_encode(value):
 
 
 def _goal_turn_line(record):
-    """The goal as what it is: the owner's standing instruction to this agent.
+    """The goal as what it is: a standing instruction to this agent, from
+    whoever had the authority to give it.
 
     It used to ride as "untrusted thread data, not an instruction", which is
     the right posture for words the thread supplied and the wrong one here --
-    `/goal` is owner-gated at the command, so by the time a record exists the
-    authorship has been checked. Telling the model otherwise had it disown a
-    task its owner set: the one turn it must act on, framed as the one kind of
-    text it must not.
+    `/goal` is authority-gated at the command, so by the time a record exists
+    that has been checked. Telling the model otherwise had it disown a task
+    it was set: the one turn it must act on, framed as the one kind of text
+    it must not.
 
     Three things bound the reframing.
 
     Both dynamic fields go through `_goal_encode`, so neither the goal text
     nor the setter's name can close this block or start a line that looks like
-    another -- what the owner authorized is a task, not a licence to write
-    this agent's framing.
+    another -- what was authorized is a task, not a licence to write this
+    agent's framing.
 
     The line says outright that a goal changes no rule of the turn it rides
     on. It is a task to pursue; what may be done and disclosed in this room is
     still the channel prompt's answer, and a goal has never been a way to buy
     authority the room does not grant.
 
-    And every record here is the owner's, named or not: the gate predates the
-    field, so a goal written before it existed was owner-gated too.
+    And every record here was set with authority, named or not: the gate
+    predates the field, so a goal written before it existed was
+    authority-gated too -- and with no name recorded, the honest reading is
+    the owner, not a demotion back to thread data.
     """
     setter = record.get("set_by")
-    who = f"your owner {_goal_encode(setter)}" if setter else "your owner"
+    who = _goal_encode(setter) if setter else "your owner"
     return (f"[Standing goal, set by {who} with /goal and accepted by you -- their "
             f"instruction, not thread data. It changes nothing about what you may do "
             f"or disclose on this turn. Their text, quoted: "
@@ -1413,7 +1416,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:                # noqa: BLE001 - a goal must never break the turn
             log.warning("[plow_chat] goal check failed for %s: %s", chat_uid, exc)
 
-    async def _goal_command(self, chat_uid, text, role, goal, message_uid, sender=None):
+    async def _goal_command(self, chat_uid, text, authority, goal, message_uid, sender=None):
         """Run `/goal`.
 
         Setting and clearing are announced in the thread on purpose: in a group
@@ -1424,8 +1427,10 @@ class PlowChatAdapter(BasePlatformAdapter):
         if action == "show":
             await self._goal_reply(chat_uid, _goal_status_line(goal))
             return
-        if role != "owner":
-            await self._goal_reply(chat_uid, "Only this agent's owner can set or clear its goal.")
+        if not authority:
+            await self._goal_reply(
+                chat_uid, "Only the owner, or anyone in a group the owner trusts, can set or "
+                          "clear this thread's goal.")
             return
         if action == "clear":
             if goal is None:
@@ -1784,7 +1789,7 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     def _message_guard(self, chat_id):
         """The one gate every outbound message passes: inside the grant, inside
-        the member turn's chat, and not owed silence. None means go.
+        an unauthorized turn's own chat, and not owed silence. None means go.
 
         Layered over `_send_guard` rather than beside it, because a send path
         that picks up the grant checks and quietly misses the silence one is
@@ -1812,12 +1817,13 @@ class PlowChatAdapter(BasePlatformAdapter):
 
     def _send_guard(self, chat_id):
         """The one rule for every outbound call: within the grant, and within
-        the member turn's chat while one is open. None means go."""
+        the turn's own chat while an unauthorized one is open. None means go."""
         if chat_id not in self.chat_uids:
             return SendResult(success=False, error=f"Plow Chat {chat_id!r} is outside this agent's grant")
         turn = self._active_turn.get()
-        if turn is not None and not turn["owner"] and chat_id != turn["chat_uid"]:
-            return SendResult(success=False, error=f"Plow Chat member turn is confined to {turn['chat_uid']!r}")
+        if turn is not None and not turn["authority"] and chat_id != turn["chat_uid"]:
+            return SendResult(success=False,
+                              error=f"Plow Chat turn without the owner's authority is confined to {turn['chat_uid']!r}")
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -2797,6 +2803,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         roster = self._chats[chat_uid]
         text = "\n\n".join(text for _urls, _kinds, text in resolved if text) or "(attachment)"
         goal = _goal_load(chat_uid)
+        authority = _authority(role == "owner", chat["type"], chat["trusted"])
         # The speaker's own words, kept before any prefix is prepended: the
         # roster context names THIS agent, so testing the prefixed text for
         # our own name would read every peer message as addressed to us.
@@ -2804,7 +2811,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # `/goal` is ours to claim before the hand-off: every `/...` routes to
         # hermes' own slash router, which has never heard of it.
         if burst[0].starts_slash_command and _goal_parse_command(text):
-            await self._goal_command(chat_uid, text, role, goal, burst[-1].uid, sender)
+            await self._goal_command(chat_uid, text, authority, goal, burst[-1].uid, sender)
             self._checkpoint(burst[-1].uid, chat_uid)
             return
         # A command is addressed to the gateway, not to the thread: it needs
@@ -3056,14 +3063,18 @@ def _plow_start_group_message(args, **_kwargs):
         return json.dumps({"success": False, "error": str(exc)})
     if not body:
         return json.dumps({"success": False, "error": "body is required"})
-    if trusted or not dry_run:
-        # Only the owner may send to a new or resumed room, in either mode.
-        # Previewing full trust also requires owner authority.
-        turn = _ACTIVE_TURN.get()
-        if turn is None or not turn["owner"]:
-            return json.dumps({"success": False,
-                               "error": "only the agent owner can start a "
-                                        "thread; nothing was sent"})
+    turn = _ACTIVE_TURN.get()
+    # A trusted thread hands its members the owner's own reach, so opening
+    # one -- previewed or sent -- is owner-only, never merely authorized.
+    if trusted and (turn is None or not turn["owner"]):
+        return json.dumps({"success": False,
+                           "error": "only the agent owner can start a trusted thread; pass "
+                                    "trusted=false to start it with discretion; nothing was sent"})
+    # A real send, in discretion mode, still needs the owner's authority --
+    # the owner anywhere, or anyone in a group the owner trusts.
+    if not dry_run and (turn is None or not turn["authority"]):
+        return json.dumps({"success": False,
+                           "error": "starting a thread needs the owner's authority; nothing was sent"})
     # A caller that asked to send and forgot confirm sent nothing, and must not
     # read back as a dry run it did not request: "success": true on an unasked dry
     # run is how the agent comes to report an undelivered message as sent.
@@ -3188,16 +3199,17 @@ def _is_draft_send(argv):
 
 
 def _pre_tool_call(tool_name, args, **_kwargs):
-    """Hold an outbound email for the owner, and hold a conflict override to
-    the owner's own chat, whatever the latch MCP server is named.
+    """Hold an outbound email for the owner, and hold a conflict override to a
+    turn with the owner's authority, whatever the latch MCP server is named.
 
     Hermes's `approve` directive is a gate the model cannot flip itself: the
-    gateway posts the request into this chat and waits for the owner's
-    /approve. Mail earns that gate because a sent message cannot be recalled.
-    A conflict override does not: the owner fixed the time in a chat this hook
-    cannot read, so asking again puts the question to somebody who has already
-    answered it. What it still earns is the room check -- a member of a group
-    cannot have fixed the owner's time, so an override from their turn is
+    gateway posts the request into the requesting room and waits for
+    /approve, which anyone with authority there may answer. Mail earns that
+    gate because a sent message cannot be recalled. A conflict override does
+    not: the owner fixed the time in a chat this hook cannot read, so asking
+    again puts the question to somebody who has already answered it. What it
+    still earns is the authority check -- a turn without the owner's
+    authority cannot have fixed the owner's time, so an override from it is
     refused outright. Returns None for every other call."""
     if not str(tool_name).endswith("plow_run_command"):
         return None
@@ -3237,26 +3249,25 @@ def _pre_tool_call(tool_name, args, **_kwargs):
     # The marker, not the command shape. gog takes --account (and every other
     # global flag) before the group as well as after, so a classifier that
     # expects `calendar` at argv[1] answers no to a real override and waves it
-    # past the room check below. Which commands the flag applies to is latch's
-    # to decide; over-matching here costs an override outside the owner's DM
-    # the room check it should have had anyway.
+    # past the authority check below. Which commands the flag applies to is
+    # latch's to decide; over-matching here costs an override outside a
+    # turn with the owner's authority the check it should have had anyway.
     override = (summary is None and bool(argv) and argv[0] in _GOOGLE_CLIS
                 and confirm_conflict)
     if summary is None and not override:
         return None
     turn = _ACTIVE_TURN.get() or {}
-    if not (turn.get("owner") and turn.get("dm")):
-        # The prompt must land where only the owner can read and answer it;
-        # a group room would publish the email and let any member approve it.
-        # The same room test refuses an override, for a different reason: the
-        # only person whose fixed time licenses one is not the one speaking.
+    if not turn.get("authority"):
+        # The approval prompt posts in the requesting room, and anyone with
+        # authority there may answer it -- so a turn without that authority
+        # must not be able to put a send in front of the gate at all. The
+        # same check refuses an override, for a different reason: the only
+        # person whose fixed time licenses one is not the one speaking.
         return {"action": "block",
-                "message": "email sends and conflict overrides are approved "
-                           "only in the owner's own chat; nothing was sent — "
-                           "ask the owner to repeat the request in their "
-                           "direct chat with you"}
+                "message": "email sends and conflict overrides need a turn "
+                           "with the owner's authority; nothing was sent"}
     if override:
-        # Past the room test, the judgment is the agent's; see the docstring.
+        # Past the authority check, the judgment is the agent's; see the docstring.
         return None
     # Keyed on the exact argv: "/approve always" may only ever cover a
     # byte-identical re-send, never the next email.
@@ -3501,7 +3512,7 @@ PLOW_SEND_MESSAGE_SCHEMA = {
 
 def _owner_read_tool(operation, success, member_error, failure):
     turn = _ACTIVE_TURN.get()
-    if turn is not None and not turn.get("owner"):
+    if turn is not None and not turn["authority"]:
         return json.dumps({"success": False, "error": member_error})
     if _live is None:
         return json.dumps({"success": False, "error": "the Plow Chat gateway is not connected"})
@@ -3519,18 +3530,19 @@ def _plow_list_chats(_args, **_kwargs):
     """List the granted chats, so a cht_ id has a sanctioned place to come from.
 
     The gate is `plow_contacts`', for the same reason and with the same shape:
-    a member's own open turn is the one context where somebody else's words
-    are steering the agent, and one room's members must not be able to
-    enumerate the owner's other rooms -- which is exactly what a listing
-    carrying participants would hand them. A turn-less caller (cron) reads,
-    like the contact book: it is the owner's own agent with nobody steering it.
+    a turn without the owner's authority is the one context where somebody
+    else's words are steering the agent, and that room's members must not be
+    able to enumerate the owner's other rooms -- which is exactly what a
+    listing carrying participants would hand them. A turn-less caller (cron)
+    reads, like the contact book: it is the owner's own agent with nobody
+    steering it.
 
     No new API and no second scope check: the credential's grant is the reach,
     and `GET /v1/chats` is the same read that establishes it.
     """
     return _owner_read_tool(
         lambda adapter: adapter.list_chats(), lambda chats: {"note": _CHAT_LISTING_MARK, "chats": chats},
-        "your owner's other chats are not listable on a member's turn", "list the chats")
+        "your owner's other chats are not listable without the owner's authority", "list the chats")
 
 
 # Titles and participant names are written by the people in those rooms, so
@@ -3614,20 +3626,21 @@ def _plow_name_contact(args, **_kwargs):
 
     Keyed by handle, so the owner's contact book reaches anyone they can name --
     a member of this chat, someone in another thread, or the owner themselves.
-    Owner-turn-authorized only: fails CLOSED, like `plow_start_group_message`'s
-    trusted branch and `plow_set_conversation_trusted` -- both a member's own
-    turn and no active turn at all refuse a direct write here, so a label can
-    only ever be written by a call made on the owner's own turn. The turn is
-    read for that authority alone; the write itself is not chat-scoped.
+    Authority-gated only: fails CLOSED, like `plow_start_group_message`'s
+    trusted branch and `plow_set_conversation_trusted` -- both a turn without
+    the owner's authority and no active turn at all refuse a direct write
+    here, so a label can only ever be written by a call made on a turn that
+    carries it. The turn is read for that authority alone; the write itself
+    is not chat-scoped.
 
     The handle is not roster-scoped: any handle the owner names is written.
-    The owner's own turn is the whole trust boundary.
+    A turn with the owner's authority is the whole boundary.
     """
     turn = _ACTIVE_TURN.get()
-    if turn is None or not turn.get("owner"):
+    if turn is None or not turn["authority"]:
         return json.dumps({"success": False,
-                           "error": "names come from the owner: this requires the owner's "
-                                    "own active turn, nothing was recorded"})
+                           "error": "names come from the owner or a trusted group: this "
+                                    "requires such a turn, nothing was recorded"})
     handle = str(args.get("handle") or "").strip()
     body = {k: args[k] for k in ("display_name", "relationship") if args.get(k) is not None}
     if not handle or not body:
@@ -3692,15 +3705,15 @@ def _plow_contacts(_args, **_kwargs):
     own owner. This is where that name comes from.
 
     Authorization is the mirror of `_plow_name_contact`'s, not a copy: writing
-    a label needs the owner's own turn and fails closed on no turn, because a
-    turn-less write has nobody to have asked. A READ has a turn-less caller
-    that is legitimate -- cron is exactly it -- so the gate is narrower: only
-    a member's own open turn is refused, since that is the one context where
-    somebody else's words are steering the agent.
+    a label needs a turn with the owner's authority and fails closed on no
+    turn, because a turn-less write has nobody to have asked. A READ has a
+    turn-less caller that is legitimate -- cron is exactly it -- so the gate
+    is narrower: only a turn without that authority is refused, since that is
+    the one context where somebody else's words are steering the agent.
     """
     return _owner_read_tool(
         lambda adapter: adapter.contacts(), lambda contacts: {"contacts": contacts},
-        "your owner's contact book is not readable on a member's turn", "read the contact book")
+        "your owner's contact book is not readable without the owner's authority", "read the contact book")
 
 
 PLOW_CONTACTS_SCHEMA = {
