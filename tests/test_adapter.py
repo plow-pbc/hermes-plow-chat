@@ -319,9 +319,11 @@ def _mark_anchored(adapter: Any, *chat_uids: str) -> None:
 def _chat(uid: str, *, name: str | None = None, group: bool = False,
           agent_name: str | None = None, trusted: bool = False,
           owner_name: str | None = None, status: str = "active") -> dict[str, Any]:
+    # Every line resource carries `provider_type`; only a named line also has a
+    # persona and a uid to send from.
+    line = {"uid": "ln_x", "display_name": agent_name} if agent_name else {}
     participants = [
-        {"type": "agent", "line": {"uid": "ln_x", "display_name": agent_name}}
-        if agent_name else {"type": "agent"},
+        {"type": "agent", "line": line | {"provider_type": "imessage"}},
         {"type": "member", "uid": f"mem_owner_{uid}", "role": "owner",
          "display_name": owner_name, "provider_key": "+15550000001"},
     ]
@@ -329,7 +331,7 @@ def _chat(uid: str, *, name: str | None = None, group: bool = False,
         participants.append({"type": "member", "uid": f"mem_other_{uid}", "role": "member",
                              "provider_key": "+15550000002"})
     return {"uid": uid, "display_name": name, "participants": participants,
-            "trusted": trusted, "status": status, "provider": "linq"}
+            "trusted": trusted, "status": status}
 
 
 def _voiced(module: Any, prompt: str) -> str:
@@ -391,13 +393,12 @@ def _peer_envelope(event_id: str, chat_id: str, message_id: str) -> dict[str, An
 def _collaboration_chat() -> dict[str, Any]:
     return {
         "uid": "cht_a",
-        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
                 "relationship": "self",
                 "represents_participant_uid": "mem_sam_cht_a",
-                "line": {"uid": "ln_elm", "display_name": "Elm"},
+                "line": {"uid": "ln_elm", "display_name": "Elm", "provider_type": "imessage"},
             },
             {
                 "type": "agent",
@@ -417,13 +418,12 @@ def _dm_chat() -> dict[str, Any]:
     """A 1:1 DM as the server actually lists it: the owner and us, no peer."""
     return {
         "uid": "cht_a",
-        "provider": "linq",
         "participants": [
             {
                 "type": "agent",
                 "relationship": "self",
                 "represents_participant_uid": "mem_sam_cht_a",
-                "line": {"uid": "ln_elm", "display_name": "Elm"},
+                "line": {"uid": "ln_elm", "display_name": "Elm", "provider_type": "imessage"},
             },
             {"type": "member", "uid": "mem_sam_cht_a", "display_name": "Sam", "role": "owner",
              "provider_key": "+15550000001"},
@@ -1839,7 +1839,8 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
 
 
 class _HTTP:
-    def __init__(self) -> None:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
         self.posts: list[tuple[str, dict[str, Any]]] = []
 
     async def __aenter__(self) -> _HTTP:
@@ -1849,7 +1850,7 @@ class _HTTP:
 
     def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _Resp:
         self.posts.append((url, json))
-        return _Resp({"uid": "msg_sent"})
+        return _Resp({"uid": "msg_sent"} if self.status < 400 else {"detail": "nope"}, self.status)
 
 
 async def test_a_grant_that_drops_the_configured_home_is_refused(
@@ -1924,14 +1925,15 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An email thread is a chat on the same grant (plow-pbc/hermes-plugin-plow#109), listed by the
-    same `GET /v1/chats` and carried by the same socket. It must never render
-    as an SMS room: reach, the send guard, the tool listing and the alias
-    registry see only `linq` chats, and a frame for a `gmail` chat is dropped
-    without the reach refresh an unknown chat costs and without the warning
-    an out-of-grant chat earns -- it is neither."""
+    same `GET /v1/chats` and fanned out to this platform's socket too. It must
+    never render as an SMS room: reach, the send guard, the tool listing and
+    the alias registry see only `imessage` lines, and a frame for an `email`
+    one is dropped without the reach refresh an unknown chat costs and without
+    the warning an out-of-grant chat earns -- it is neither."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    mail = _chat("cht_mail", name="Re: invoice", group=True) | {"provider": "gmail"}
+    mail = _chat("cht_mail", name="Re: invoice", group=True)
+    mail["participants"][0]["line"]["provider_type"] = "email"
     listing = {"object": "list", "has_more": False, "data": [_chat("cht_a"), mail]}
 
     class _GrantHTTP:
@@ -1962,21 +1964,15 @@ async def test_reach_serves_only_the_phone_line_and_ignores_email_frames(
     assert "outside the grant" not in caplog.text
 
 
-def test_a_listing_without_provider_is_served_as_the_phone_line(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+def test_set_reach_raises_when_the_self_agent_line_has_no_provider_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
-    """`_provider` defaults an absent key to `linq` -- today's actual shape,
-    since plow does not yet serve the field on any chat, and this default
-    governs every chat on every deployed agent until it does. Pin the
-    observable outcome: a listing with no `provider` key at all is served as
-    the phone line entire, none of it foreign."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    legacy = [{k: v for k, v in _chat(uid).items() if k != "provider"}
-              for uid in ("cht_a", "cht_b")]
-    adapter._set_reach(legacy)
-    assert adapter.chat_uids == frozenset({"cht_a", "cht_b"})
-    assert adapter._foreign == frozenset()
+    broken = _chat("cht_broken")
+    del broken["participants"][0]["line"]["provider_type"]
+    with pytest.raises(RuntimeError, match="has no provider_type"):
+        adapter._set_reach([broken])
 
 
 class _SocketHTTP(_HTTP):
@@ -2237,7 +2233,7 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     module = _load(monkeypatch, tmp_path)
     ctx = mock.Mock()
     module.register(ctx)
-    kwargs = ctx.register_platform.call_args.kwargs
+    [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
 
@@ -2357,7 +2353,8 @@ def _live_tool(
             raise raises
         return result(*args, **kwargs) if callable(result) else result
 
-    setattr(adapter, method, stub)
+    if method is not None:  # None keeps the real send(), for the loop-hop pin below
+        setattr(adapter, method, stub)
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
     monkeypatch.setattr(module, "_live", (adapter, loop))
@@ -2493,7 +2490,8 @@ async def test_the_chat_listing_reduces_each_room_to_what_picking_one_takes(
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     peer_room = _chat("cht_peer")
-    peer_room["participants"] = [{"type": "agent", "relationship": "peer"},
+    peer_room["participants"] = [{"type": "agent", "relationship": "self", "line": {"provider_type": "imessage"}},
+                                 {"type": "agent", "relationship": "peer"},
                                  {"type": "member", "role": "owner",
                                   "display_name": "Sam", "provider_key": "+15550000001"}]
     unnamed = _chat("cht_u", name="+15550000001, +15550000002", group=True)
@@ -3165,7 +3163,7 @@ async def test_home_line_uid_raises_when_the_home_chat_has_no_agent_line(
     create a chat on, and guessing one would send from a sibling agent's."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats["cht_a"] = _chat("cht_a")  # an agent participant, but no line
+    adapter._chats["cht_a"] = _chat("cht_a")  # an agent line, but no uid to send from
     with pytest.raises(RuntimeError, match="home chat has no agent line"):
         await adapter._home_line_uid()
 
@@ -5798,6 +5796,30 @@ def test_plow_send_message_reports_the_adapter_refusal_and_mirrors_nothing(
     out = json.loads(module._plow_send_message({"chat_id": "cht_other", "body": "hi"}))
     assert out["success"] is False and "confined" in out["error"]
     assert calls == []
+
+
+def test_a_member_email_turn_cannot_steer_a_send_into_a_phone_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The turn survives the hop onto the adapter's loop: the tool bridges with
+    run_coroutine_threadsafe, which copies the calling context, so _send_guard
+    confines a member turn opened on the email line exactly as it confines one
+    opened on the phone line -- one guard, both platforms, no second check
+    beside it. Driven through the real send() and a real loop thread, because a
+    stubbed send is precisely what cannot prove the context crossed."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = _live_tool(module, monkeypatch, None)
+    adapter._set_reach([_chat("cht_a"), _chat("cht_b")])
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+    # Exactly what the email line's on_processing_start records for a
+    # non-owner participant on a Gmail thread.
+    module._ACTIVE_TURN.set({"chat_uid": "cht_mail", "owner": False, "dm": False})
+
+    out = json.loads(module._plow_send_message({"chat_id": "cht_b", "body": "steer"}))
+
+    assert out["success"] is False and "confined to 'cht_mail'" in out["error"]
+    assert http.posts == [], "a refusal must not reach Plow at all"
 
 
 @pytest.mark.parametrize("args", [{"chat_id": "", "body": "hi"}, {"chat_id": "cht_x", "body": "  "}])
