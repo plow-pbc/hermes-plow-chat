@@ -5605,12 +5605,19 @@ def test_latch_section_renders_only_when_a_mac_is_connected(
                  # that earlier agents' work persists on the Mac: an agent that
                  # knew only the possessive rule searched its own sessions for
                  # "did Plow do X for me" and declared it out of reach.
-                 "end to end", "publishes a skill for reading each",
+                 "end to end", "plow_history",
+                 # Measured on a real agent with the real Latch tool list
+                 # (2026-09-11): three prompt variants that stated the rule
+                 # mid-section went 0/4 on a first-turn Mac read; the same
+                 # rule as the section's opening sentence, phrased as the
+                 # turn's first tool call, went 3/3.
+                 "your first tool call is on their "
+                 "Mac",
                  # A/B on the real tool list (2026-09-11): the deferral above got the
                  # agent to call plow_list_skills and then answer "no" over the
                  # manifest; the listing has to be read as a table of contents.
                  "read it with plow_read_skill and do what it says in the same turn",
-                 "true only after the Mac was asked"):
+                 "until a plow_ tool has looked"):
         assert must in text
     assert "mcp__plow__" not in text, "the server key differs between installs; name the tool prefix only"
     assert "not your owner" in text
