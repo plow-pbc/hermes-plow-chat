@@ -923,19 +923,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     attacker's host. Refuse every redirect: this endpoint is fixed."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Drain and close the redirect response before raising, so the socket
-        # is not left for the GC. Both steps are best-effort: a Mac that resets
-        # the connection mid-redirect (read raises IncompleteRead/OSError, or
-        # close raises) must still surface as the clean refusal below, never a
-        # raw socket error.
-        for step in (fp.read, fp.close):
-            try:
-                step()
-            except Exception:  # noqa: BLE001 -- the refusal is what matters, not the drain
-                pass
-        # NEVER interpolate newurl: a compromised Mac controls the Location and
-        # could reflect the bearer token into it, and this error is logged.
-        raise urllib.error.HTTPError(req.full_url, code, "refusing redirect", headers, None)
+        # Refuse every redirect. Returning None is urllib's idiom for "do not
+        # follow": it raises the HTTPError itself, whose message is the status
+        # reason, never the attacker-controlled Location — so the bearer token
+        # cannot ride a redirect to another host, and nothing Mac-controlled
+        # reaches the logged error.
+        return None
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)

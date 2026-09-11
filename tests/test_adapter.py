@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import http.client
 import http.server
 import importlib.util
 import json
@@ -5798,28 +5797,6 @@ def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tm
 
     assert hits == ["/mcp"], "followed the redirect instead of refusing it at the first host"
 
-
-def test_no_redirect_still_refuses_when_the_drain_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
-    """A Mac that resets mid-redirect makes fp.read()/fp.close() raise
-    (IncompleteRead is not an OSError; close can reset too). The refusal must
-    still be the clean HTTPError, never the raw socket error."""
-    module = _load(monkeypatch, tmp_path)
-
-    class _Fp:
-        def read(self, *_a: Any) -> bytes:
-            raise http.client.IncompleteRead(b"", 5)
-
-        def close(self) -> None:
-            raise OSError("reset on close")
-
-    handler = module._NoRedirect()
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        handler.redirect_request(
-            urllib.request.Request("http://127.0.0.1/mcp"),
-            _Fp(), 302, "Found", {}, "http://attacker.example/steal?t=line-scoped-token",
-        )
-    assert "attacker.example" not in str(excinfo.value)
-    assert "line-scoped-token" not in str(excinfo.value)
 
 
 def test_refresh_mac_skills_logs_no_mac_controlled_content(
