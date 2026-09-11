@@ -2059,11 +2059,15 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     assert sorted(greetings) == ["cht_a", "cht_b"], "a restart re-greeted an already-met chat"
 
 
-async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("live_group", [False, True])
+async def test_a_first_ever_connect_primes_the_agent_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, live_group: bool,
+) -> None:
     """A new agent's own stores are empty, and it read that as absence in the
     owner's world (plow#1880). Its first-ever life hands hermes one silent,
-    Plow-signed setup turn in the owner's DM -- even when the first session
-    drops before reaching it -- and a restart hands it none."""
+    Plow-signed setup turn in the home chat -- even when the first session
+    drops before reaching it -- and a restart hands it none. Owner authority
+    comes from the live roster, not the one cached at connect."""
     module = _load(monkeypatch, tmp_path)
     handed: list[list[Any]] = []
     for _ in range(2):  # first-ever life, then a restart over the same checkpoint
@@ -2072,7 +2076,10 @@ async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.Mo
         monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SocketHTTP())
         monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
         monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
-        monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
+        async def live_roster(chat_uid: str, adapter: Any = adapter) -> None:
+            adapter._chats[chat_uid] = _chat(chat_uid, group=live_group)
+
+        monkeypatch.setattr(adapter, "_refresh_current_chat", live_roster)
         monkeypatch.setattr(adapter, "_backfill", mock.AsyncMock(side_effect=[OSError("socket dropped"), None]))
         handed.append(_capture_events(monkeypatch, adapter))
         with mock.patch.object(module.asyncio, "sleep", side_effect=[None, StopAsyncIteration]):
@@ -2082,7 +2089,8 @@ async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.Mo
     first_life, restart = handed
     assert restart == [], "a restart re-primed an agent that was already set up"
     [setup] = first_life
-    assert setup["source"]["chat_id"] == "cht_a" and setup["source"]["role_authorized"] is True
+    assert setup["source"]["chat_id"] == "cht_a"
+    assert setup["source"]["role_authorized"] is not live_group, "authority must follow the live roster"
     assert setup["source"]["user_id"] == "plow_setup", "the setup turn must not speak as the owner"
     assert module.NO_REPLY_SENTINEL in setup["channel_prompt"], "the owner must be able to see nothing"
     assert module.LATCH_URL in setup["text"]
