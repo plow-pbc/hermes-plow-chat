@@ -373,7 +373,9 @@ included — is a name to ask for once and record with the tool, never one to
 guess out of mail, calendar or memory. `plow_contacts` reads the book back,
 owner's row first, for the turns that have no roster at all — a Hermes-cron
 turn carries no chat, and this is where its owner's own name comes from; it
-reads on the owner's turn and on no turn, and is refused on a member's. An
+reads on a turn with the owner's authority or with no active turn at all, and
+refuses only a turn without that authority. Naming stays owner-turn-only,
+above, unlike this read. An
 owner turn needs no such read: the chat resource every one of them already
 re-reads carries the owner as a participant — name, handle and role — in a solo
 DM as much as in a group. That is what the channel prompt names them from:
