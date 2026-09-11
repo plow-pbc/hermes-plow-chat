@@ -1269,9 +1269,9 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
     # boundary, not the asker.
     owner_prompt = handled[1]["channel_prompt"]
     assert owner_prompt == _rendered(module,
-        _voiced(module, _owned(module, module.GROUP_OWNER_CHANNEL_PROMPT, room)),
+        _voiced(module, _owned(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT, room)),
         None, adapter._identity)
-    for block in (module._DISCLOSURE, module._NO_RELAY):
+    for block in (module._AUTHORITY, module._NO_RELAY):
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
     assert member_prompt == _rendered(module,
@@ -1388,7 +1388,7 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
     ("group", "role", "base"),
     [
         pytest.param(False, "owner", "OWNER_CHANNEL_PROMPT", id="dm_owner"),
-        pytest.param(True, "owner", "GROUP_OWNER_CHANNEL_PROMPT", id="group_owner"),
+        pytest.param(True, "owner", "GROUP_AUTHORITY_CHANNEL_PROMPT", id="group_owner"),
         pytest.param(True, "member", "EXTERNAL_CHANNEL_PROMPT", id="group_member"),
     ],
 )
@@ -1512,7 +1512,7 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     await _settle(adapter)
 
     (event,) = handled
-    base = module.GROUP_OWNER_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
+    base = module.GROUP_AUTHORITY_CHANNEL_PROMPT if group else module.OWNER_CHANNEL_PROMPT
     roster_facts = f"{module._RELATIONSHIP_FACT} {module._NAME_FACT} " if group else ""
     # Composed through _with_identity rather than re-spelling the prefix: the
     # identity-and-facts text is pinned once, by the prefix test above. What
@@ -1527,13 +1527,13 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     ("group", "role", "trusted", "prompt_name"),
     [
         pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
-        pytest.param(True, "owner", False, "GROUP_OWNER_CHANNEL_PROMPT", id="untrusted-group-owner"),
+        pytest.param(True, "owner", False, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="untrusted-group-owner"),
+        pytest.param(True, "owner", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="trusted-group-owner"),
+        pytest.param(True, "member", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="trusted-group-member"),
         pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", id="untrusted-group-member"),
-        pytest.param(True, "owner", True, "TRUSTED_GROUP_OWNER_CHANNEL_PROMPT", id="trusted-group-owner"),
-        pytest.param(True, "member", True, "TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT", id="trusted-group-member"),
     ],
 )
-async def test_trust_selects_the_explicit_prompt_matrix(
+async def test_authority_selects_the_prompt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     group: bool,
@@ -1556,18 +1556,13 @@ async def test_trust_selects_the_explicit_prompt_matrix(
         expected = _owned(module, expected, chat)
     if group:
         expected = _voiced(module, expected)
-    assert handled[0]["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
+    prompt = handled[0]["channel_prompt"]
+    assert prompt == _rendered(module, expected, None, adapter._identity)
     # The ordering rule closes every one of these, separated from the sentence
     # before it -- membership alone would pass on "...truthful.Write your".
-    assert f" {module._ANSWER_LAST}" in handled[0]["channel_prompt"]
-
-    if trusted:
-        prompt = handled[0]["channel_prompt"].lower()
-        assert "calendar" in prompt
-        assert "normal tools" in prompt
-        assert "everyone" in prompt
-        for secret in ("credentials", "authentication secrets", "raw tokens", "payment-card"):
-            assert secret in prompt
+    assert f" {module._ANSWER_LAST}" in prompt
+    # One sharing rule on every turn; nothing trust-specific anywhere.
+    assert module._SHARING_RULE in prompt
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
@@ -1797,8 +1792,7 @@ def test_roster_context_carries_relationships_and_the_prompt_says_they_are_the_o
     # _RELATIONSHIP_FACT is composed in by _collaboration_prompt (same gate as
     # _VOICE_RULE), not baked into the base prompt constants -- assert the
     # composed prompt a real turn actually gets.
-    for base in (module.GROUP_OWNER_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT,
-                 module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT, module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT):
+    for base in (module.GROUP_AUTHORITY_CHANNEL_PROMPT, module.EXTERNAL_CHANNEL_PROMPT):
         composed = module._collaboration_prompt(base, chat, identity)
         assert module._RELATIONSHIP_FACT in composed
         # A bare handle is a hole in the same roster, so the instruction to
@@ -1846,7 +1840,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
     assert handled[0]["channel_prompt"] == _rendered(module,
-        _voiced(module, module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT), None, adapter._identity)
+        _voiced(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT), None, adapter._identity)
 
 
 async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
@@ -2289,7 +2283,7 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
     prompt = module._channel_prompt({"type": "group", "trusted": False}, "member", _chat("cht_a", group=True), {})
     for rule in (module._DISCLOSURE, module._NO_RELAY, module._SPEAKER_FACT):
         assert rule in prompt
-    assert module._TRUSTED_CONVERSATION not in prompt
+    assert module._AUTHORITY not in prompt
 
 
 def test_owner_turn_prompt_names_ownership(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
@@ -4774,9 +4768,7 @@ def test_every_silence_instruction_names_the_sentinel(
     module = _load(monkeypatch, tmp_path)
     collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_MEMBER_CHANNEL_PROMPT,
-                   module.GROUP_OWNER_CHANNEL_PROMPT,
-                   module.TRUSTED_GROUP_OWNER_CHANNEL_PROMPT,
+                   module.GROUP_AUTHORITY_CHANNEL_PROMPT,
                    collaboration):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
