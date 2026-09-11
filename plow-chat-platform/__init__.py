@@ -4067,7 +4067,9 @@ def register(ctx):
         platform_hint="You are chatting over an iMessage/SMS-style Plow Chat "
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables. This thread is your own line — "
-                      "the number is yours, and here you write as yourself.",
+                      "the number is yours, and here you write as yourself. Your owner's "
+                      "world — their messages, mail, calendar, contacts and files — is on "
+                      "their Mac behind the plow_ tools, and is answered from there.",
     )
     # The agent's own email line, on the same transport (design §5). The
     # hint's address is written onto this entry by the adapter once reach

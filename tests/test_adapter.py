@@ -2263,6 +2263,9 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
+    # The owner's world is on the Mac (#129): the hint is in force from the
+    # first turn, before any section or skill is read.
+    assert "on their Mac behind the plow_ tools" in kwargs["platform_hint"]
 
 
 def test_a_reply_keeps_the_phone_numbers_it_hands_people(
