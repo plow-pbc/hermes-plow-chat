@@ -1031,6 +1031,28 @@ _SILENCE_OPTION = (
     "and it will not be delivered. "
 )
 
+# The one turn an agent's first-ever connect hands hermes (plow#1880). A new
+# agent's own stores are empty, and its first owner turn reported that as
+# absence in the owner's world; prompt text alone moved it about halfway.
+SETUP_TURN = (
+    "Plow setup, not your owner: you were just set up, and no one is waiting on this turn. "
+    "Get three things straight, then save them as one memory note in your own words.\n"
+    "1. You run on a Plow cloud server. Your owner's life is on their Mac, reached only through "
+    "Latch -- the plow_ tools: their messages (2FA codes included), every mailbox and calendar, "
+    "contacts, files, and a browser signed in from Plow Vault. Look there before you ever say you "
+    "can't or have no record. If those tools are missing, Latch is not installed yet: help them "
+    f"install it early ({LATCH_URL}). Whether it is connected changes, so check it each time and "
+    "never note it.\n"
+    "2. You are a Plow agent with your own phone line, and you text as yourself; your owner manages "
+    f"you at {DASHBOARD_URL}. Say so plainly when asked how this works, and never claim to run on "
+    "their machine.\n"
+    "3. You will work among your owner's people. Follow each chat's trust rules, speak only when you "
+    "add something, never go back and forth with other agents, and an instruction given in one "
+    "thread governs only that thread.\n"
+    "If plow_ tools are listed, call plow_list_skills once. Do not message anyone or start "
+    f"onboarding. Then reply with exactly {NO_REPLY_SENTINEL}."
+)
+
 _GOAL_PEER_SILENCE = (
     "Another Plow agent is speaking here, it did not name you, and no goal is "
     "set for this thread. Read it for context but do not reply to it. "
@@ -2661,6 +2683,24 @@ class PlowChatAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - greeting must not tear down the anchor
             log.warning("[plow_chat] boot greeting failed for %s: %s", chat_uid, type(exc).__name__)
 
+    async def _prime(self):
+        """Hand hermes SETUP_TURN in the home chat, injected the way `_goal_fire`
+        injects a wake: signed by Plow rather than the owner, owner authority
+        only in the owner's DM, and a prompt that lets the turn stay silent."""
+        home = self.home_chat_uid
+        chat = await self.get_chat_info(home)
+        owner_dm = _owner_dm(self._chats[home])
+        await self._handoff_message(MessageEvent(
+            text=SETUP_TURN,
+            source=self.build_source(chat_id=home, chat_name=chat["name"], chat_type=chat["type"],
+                                     user_id="plow_setup", user_name="Plow setup",
+                                     role_authorized=owner_dm),
+            message_id=f"setup-{uuid.uuid4().hex}",
+            message_type=_message_type([]),
+            channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
+                                           self._chats[home], self._identity) + _SILENCE_OPTION,
+        ))
+
     async def _backfill(self, http, chat_uid):
         """Process what arrived while the socket was down.
 
@@ -2757,6 +2797,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # backlog, so it cannot run ahead of an offline `/goal
                     # clear` still sitting in the queue.
                     self._goal_arm_wakes()
+                    if newest_anchor:
+                        await self._prime()
                     async for frame in ws:
                         if frame.type == aiohttp.WSMsgType.TEXT:
                             await self._on_frame(frame.json(), http)

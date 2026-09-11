@@ -2059,6 +2059,31 @@ async def test_two_chat_reach_opens_one_granted_socket(monkeypatch: pytest.Monke
     assert sorted(greetings) == ["cht_a", "cht_b"], "a restart re-greeted an already-met chat"
 
 
+async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """A new agent's own stores are empty, and it read that as absence in the
+    owner's world (plow#1880). Its first-ever connect hands hermes one silent,
+    Plow-signed setup turn in the owner's DM; a restart hands it none."""
+    module = _load(monkeypatch, tmp_path)
+    handed: list[list[Any]] = []
+    for _ in range(2):  # first-ever life, then a restart over the same checkpoint
+        adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+        adapter._set_reach([_chat("cht_a")])
+        monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SocketHTTP())
+        monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
+        handed.append(_capture_events(monkeypatch, adapter))
+        with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
+            with pytest.raises(StopAsyncIteration):
+                await adapter._listen()
+
+    first_life, restart = handed
+    assert restart == [], "a restart re-primed an agent that was already set up"
+    [setup] = first_life
+    assert setup["source"]["chat_id"] == "cht_a" and setup["source"]["role_authorized"] is True
+    assert setup["source"]["user_id"] == "plow_setup", "the setup turn must not speak as the owner"
+    assert module.NO_REPLY_SENTINEL in setup["channel_prompt"], "the owner must be able to see nothing"
+    assert module.LATCH_URL in setup["text"]
+
+
 async def test_concurrent_discovery_of_a_new_chat_greets_it_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
