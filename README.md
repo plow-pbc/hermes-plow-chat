@@ -208,8 +208,8 @@ members may obtain owner material only within what the owner has okayed in this
 thread. A new kind of ask waits for the owner's yes here, with the model judging
 that consent from the conversation. With full trust enabled, members may use the
 owner's accounts without a per-ask okay; only what answers the request is disclosed.
-Both modes exclude passwords, API keys, raw tokens and full payment-card numbers. A
-one-time sign-in code sent to the owner is ordinary owner material: shared on request
+Both modes exclude standing secrets: passwords, backup codes, API keys, raw tokens and
+full payment-card numbers. A one-time sign-in code sent to the owner is ordinary owner material: shared on request
 with full trust, and on the owner's okay with discretion. Email sends require owner-DM approval; calendar overrides follow the
 calendar-conflict rule, only in the owner's DM. Member turns cannot send to other
 chats, write contacts, set goals, or list the owner's other rooms.

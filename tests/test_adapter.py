@@ -1545,10 +1545,10 @@ async def test_trust_selects_the_explicit_prompt_matrix(
         assert "calendar" in prompt
         assert "normal tools" in prompt
         assert "everyone" in prompt
-        for secret in ("passwords", "api keys", "raw tokens", "payment-card"):
+        for secret in ("passwords", "backup codes", "api keys", "raw tokens", "payment-card"):
             assert secret in prompt
         # A trusted room that can read the owner's mail must also hand over the code in it.
-        assert "sign-in or verification code sent to the owner is not on that list" in prompt
+        assert "sign-in or verification code sent to the owner is not one of them" in prompt
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
