@@ -4816,9 +4816,11 @@ def _active_goal_adapter(module: Any, monkeypatch: pytest.MonkeyPatch,
     return adapter, sent
 
 
-def _goal_chat_with_owner_speaking(module: Any) -> Any:
+def _goal_chat_with_owner_speaking(module: Any, *, trusted: bool = False) -> Any:
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_collaboration_chat()])
+    chat = _collaboration_chat()
+    chat["trusted"] = trusted
+    adapter._set_reach([chat])
     _mark_anchored(adapter, "cht_a")
     # These tests stand in for a live socket session, which is the only state in
     # which pacing may run at all.
@@ -4912,12 +4914,22 @@ def test_wake_backoff_doubles_and_caps(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert max(seconds) == module.GOAL_WAKE_MAX_SECONDS
 
 
-@pytest.mark.parametrize("role", ["owner", "member"], ids=["owner", "member"])
-async def test_only_the_owner_may_set_a_goal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, role: str,
+@pytest.mark.parametrize(
+    ("role", "trusted", "expect_set", "setter"),
+    [("owner", False, True, "Owner"),
+     ("member", False, False, None),
+     ("member", True, True, "Member")],
+    ids=["owner", "untrusted-member", "trusted-member"],
+)
+async def test_only_a_turn_with_authority_may_set_a_goal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    role: str, trusted: bool, expect_set: bool, setter: str | None,
 ) -> None:
+    """Authority, not identity, is the gate: the owner may always set the
+    thread's goal, and so may a member of a group the owner trusts -- only a
+    member with neither is refused."""
     module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
+    adapter = _goal_chat_with_owner_speaking(module, trusted=trusted)
     handled = _capture_events(monkeypatch, adapter)
     sent = mock.AsyncMock(return_value=_SendResult(success=True))
     monkeypatch.setattr(adapter, "send", sent)
@@ -4929,13 +4941,13 @@ async def test_only_the_owner_may_set_a_goal(
     # The command is ours: it never reaches hermes' slash router.
     assert not any("/goal book the campsite" in (event["text"] or "") for event in handled)
     record = module._goal_load("cht_a")
-    if role == "owner":
+    if expect_set:
         assert record["text"] == "book the campsite"
         assert record["status"] == module.GOAL_ACTIVE
         # Who set it, off the sender the gate above already authorized: a
         # message uid answers "was this the same command?", never "whose
         # instruction is this?", and the turn line needs the latter.
-        assert record["set_by"] == "Owner"
+        assert record["set_by"] == setter
         # The announcement is the consent artifact: in a group it is how the
         # other household sees what this agent was told to pursue.
         assert "book the campsite" in sent.await_args[0][1]
@@ -5464,7 +5476,7 @@ async def test_a_refused_goal_announcement_starts_nothing(
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
 
     with pytest.raises(RuntimeError):
-        await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None, "msg_set")
+        await adapter._goal_command("cht_a", "/goal book the campsite", True, None, "msg_set")
 
     assert module._goal_load("cht_a") is None, "no goal may exist without its disclosure"
     assert started == []
@@ -5551,7 +5563,7 @@ async def test_a_failed_goal_notice_never_strands_an_open_goal_unpaced(
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda uid: started.append(uid))
 
     with contextlib.suppress(RuntimeError):        # `set` raises so the command is not checkpointed
-        await adapter._goal_command("cht_a", command, "owner", module._goal_load("cht_a"), "msg_cmd")
+        await adapter._goal_command("cht_a", command, True, module._goal_load("cht_a"), "msg_cmd")
 
     assert module._goal_load("cht_a")["status"] == module.GOAL_ACTIVE, "nothing was written"
     assert started == ["cht_a"], "and the pacing it stopped was handed back"
@@ -5589,11 +5601,11 @@ async def test_replaying_the_message_that_set_a_goal_does_not_restart_it(
     monkeypatch.setattr(adapter, "send", sent)
     monkeypatch.setattr(adapter, "_goal_start_wake", lambda _uid: None)
 
-    await adapter._goal_command("cht_a", "/goal book the campsite", "owner", None, "msg_set")
+    await adapter._goal_command("cht_a", "/goal book the campsite", True, None, "msg_set")
     settled = module._goal_retire(module._goal_load("cht_a"), "met")
     module._goal_save("cht_a", settled)
 
-    await adapter._goal_command("cht_a", "/goal book the campsite", "owner",
+    await adapter._goal_command("cht_a", "/goal book the campsite", True,
                                 module._goal_load("cht_a"), "msg_set")
 
     assert module._goal_load("cht_a")["status"] == "met", "finished work stays finished"
@@ -5729,22 +5741,31 @@ async def test_scheduled_wake_authority_matches_current_participants(
 
 
 @pytest.mark.parametrize(
-    ("command", "role"),
-    [("/goal", "owner"), ("/goal book it", "member"), ("/goal clear", "owner")],
+    ("command", "authority"),
+    [("/goal", True), ("/goal book it", False), ("/goal clear", True)],
     ids=["status", "denied", "nothing_to_clear"],
 )
 async def test_a_direct_goal_reply_that_does_not_land_is_not_acknowledged(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str, role: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, command: str, authority: bool,
 ) -> None:
     """Checkpointing a command whose answer never arrived tells the user it was
     handled and removes the retry that would have delivered it. Someone who
     asked for status and got silence is owed the retry."""
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
-    monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=False)))
+    sent = mock.AsyncMock(return_value=_SendResult(success=False))
+    monkeypatch.setattr(adapter, "send", sent)
 
     with pytest.raises(RuntimeError):
-        await adapter._goal_command("cht_a", command, role, None, "msg_cmd")
+        await adapter._goal_command("cht_a", command, authority, None, "msg_cmd")
+
+    if not authority:
+        # The denial itself is the reply that failed to land -- confirm this
+        # case actually exercised that branch, not the set path a truthy
+        # string used to fall through to.
+        assert "Only the owner" in sent.await_args[0][1]
+
+
 def test_latch_section_renders_only_when_a_mac_is_connected(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
