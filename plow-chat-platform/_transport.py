@@ -6,6 +6,7 @@ roster readers -- written to be shared with the email platform tracked in
 plow-pbc/hermes-plugin-plow#109. Policy stays with the platform that owns it.
 """
 import asyncio
+import contextvars
 import logging
 import os
 
@@ -184,12 +185,15 @@ def _owner_identity(chat):
     resource that answers this, and a name the owner changes lands on their
     very next turn with no cache and no second request.
 
-    No default on the `next`: `role == "owner"` is how this turn was chosen in
-    the first place, so a chat that then has no owner participant is a broken
-    contract, not a case to render around.
+    A chat with no owner participant is a broken contract, not a case to
+    render around. The raise names the chat because the email line reads this
+    on every turn, not only an owner's, and `_serve` logs the exception TYPE
+    only -- so an unnamed StopIteration there reads as a network blip.
     """
-    owner = next(p for p in chat.get("participants") or []
-                 if p.get("type") == "member" and p.get("role") == "owner")
+    owner = next((p for p in chat.get("participants") or []
+                  if p.get("type") == "member" and p.get("role") == "owner"), None)
+    if owner is None:
+        raise RuntimeError(f"chat {chat.get('uid')} has no owner participant")
     # `_participant_identity` already answers "named, or still a bare handle?"
     # -- it hands back the handle itself when there is no meaningful name.
     handle = _one_line(owner.get("provider_key"))
@@ -218,14 +222,52 @@ def _owner_fact(owner):
 
 
 def _provider(chat):
-    # Absent until plow serves it on every chat (plow-pbc/hermes-plugin-plow#109); an absent key is
-    # the phone line, which is every chat there is until then.
-    return chat.get("provider", "linq")
+    # Which line this chat is, off its own agent participant.
+    provider_type = _self_agent_line(chat).get("provider_type")
+    if provider_type is None:
+        raise RuntimeError(f"chat {chat.get('uid')} has no provider_type")
+    return provider_type
 
 
 def _split(listing, provider):
     """The chats this platform serves, and the uids on the same grant it does
-    not: those ride the same socket, and a frame for one is neither unknown
-    (no reach refresh) nor outside the grant (no warning)."""
+    not: plow fans a frame to both platforms, so one for the other's chat is
+    neither unknown (no reach refresh) nor outside the grant (no warning)."""
     served = {chat["uid"]: chat for chat in listing if _provider(chat) == provider}
     return served, frozenset(chat["uid"] for chat in listing) - served.keys()
+
+
+# Hermes' own diagnostics reach an adapter through plain send() carrying no
+# metadata that tells them apart from the model's prose, so they are
+# recognised by the text they open with. They are the runtime talking about
+# itself, never the turn's answer, so withholding one can never withhold the
+# message the owner wanted.
+BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
+_WORKING_PREFIX = "⏳ Working —"
+# TODO(remove): once the fleet image pin includes srosro/hermes-agent's
+# turn-stop-status PR, turn-stop text arrives as status frames and this
+# final-response shim is dead code.
+_NO_REPLY_PREFIX = "⚠️ No reply: "
+_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
+
+# The open turn, as every tool handler and send guard reads it. Both
+# platforms set it in on_processing_start and clear it in
+# on_processing_complete; it lives here so both can.
+_ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
+
+
+def _is_chatter(turn, chat_id, metadata):
+    """Is this outbound text the model working out loud, or the turn's answer?
+
+    The turn boundary is the classifier: prose the model writes while a turn
+    is open, into that turn's own chat, is its working-out. Hermes marks the
+    turn-final reply `notify` -- the key telegram, discord, mattermost and a2a
+    already read for the same distinction -- and the scheduler marks a cron
+    delivery `job_id`. Everything an adapter itself sends (the greeting, a goal
+    notice, the send_message tool) runs turn-less or cross-chat, so it falls
+    out as not-chatter without needing to say so. Both platforms read an
+    outbound message this way; what they do with the verdict is theirs.
+    """
+    meta = metadata or {}
+    return (turn is not None and chat_id == turn["chat_uid"]
+            and not meta.get("notify") and "job_id" not in meta)

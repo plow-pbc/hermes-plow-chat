@@ -9,6 +9,7 @@ plow-chat-platform/     exactly what gets installed, and nothing else
   plugin.yaml           the manifest -- registers the platform id
   __init__.py           the chat adapter and the tools; Hermes loads it from the plugin root
   _transport.py         the transport the chat adapter runs, written to be shared with the email platform tracked in plow-pbc/hermes-plugin-plow#109
+  email.py              the email-line adapter: plow_email, on the same transport
 tests/                  the adapter suite
 ```
 
@@ -42,6 +43,11 @@ The directory is named for the plugin id so the install can be a directory copy:
 > `agent-mgr`'s `images.hermes_local` base tag, which can't move past it).
 > Installing this plugin before the API is available fails loudly instead of
 > silently skipping delivery.
+> `plow_email` carries a further prerequisite: until plow lists Gmail threads
+> as chats in `GET /v1/chats` and dispatches `POST /v1/chats/{uid}/messages`
+> by provider, the adapter gets no inbound turns and its replies fail. That
+> work is tracked by [`hermes-plugin-plow#109`](https://github.com/plow-pbc/hermes-plugin-plow/issues/109) —
+> don't bump the plugin pin to a SHA where `plow_email` is registered until it ships.
 
 ## Where changes go
 
@@ -94,7 +100,8 @@ gets this plugin the same way — bundled in that base image, not installed
 separately. Bumping `PLOW_CHAT_PLUGIN_SHA` there, pointing `runtime/stack.json`'s
 `images.hermes_local` at the new base, and running `agent-mgr deploy` moves the
 fleet. It lands at `/opt/hermes/plugins/plow_chat/` on the image, as the same
-three files and nothing else: `__init__.py`, `_transport.py`, `plugin.yaml`.
+four files and nothing else: `__init__.py`, `_transport.py`, `email.py`,
+`plugin.yaml`.
 
 **Pinned by SHA, never vendored.** A branch ref would silently re-point a running
 agent on the next push here, and this plugin holds the chat token. A vendored
@@ -109,7 +116,7 @@ URL in git.
 | var | required | meaning |
 |---|---|---|
 | `PLOW_AGENT_TOKEN` | yes | the chat-scoped bearer activation mints |
-| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (provider `linq`). Must be inside the credential's grant; a grant without it refuses to connect |
+| `PLOW_HOME_CHANNEL` | yes | the home chat, `cht_…` — where cron and default output land, and must be a phone-line chat (the line's `provider_type` is `imessage`). Must be inside the credential's grant; a grant without it refuses to connect |
 | `PLOW_API_BASE` | no | API base, default `https://api.plow.co` (no `/v1` suffix) |
 | `PLOW_MCP_URL` | no | the Mac relay URL plow-init exports when the account has a Mac; when set, the plugin adds a system-prompt section that makes the Mac the default for owner work |
 
@@ -185,6 +192,31 @@ the adapter delivers the quoted parent's media through the normal attachment
 path: the matching provider
 part when its index is available, otherwise all parent attachments. Everything
 comes from the message frame; no parent-message lookup is made.
+
+### The email line (`plow_email`)
+
+The agent's `@plow.co` address is its own Hermes platform, registered by this
+same plugin on the same credential and the same transport helpers, each
+platform holding its own socket. Every chat resource names its line's
+`provider_type`; this adapter serves the `email` ones and the phone-line
+adapter serves the `imessage` ones, so a mail never renders as an SMS room
+and a text never renders as an email. Sessions are keyed
+`plow_email:<dm|group>:<cht_id>`; the platform hint names the line's
+address, read off the thread's own agent participant at connect. Replies go
+out through the same chat send endpoint — plow dispatches on the provider —
+with no approval gate: this is the agent's own line, like its number. Only
+the turn's answer, a cron delivery, or a turn-less send is ever mailed;
+mid-turn prose and the runtime's diagnostics are dropped. No cron home
+(`PLOW_HOME_CHANNEL` stays the phone line's), no roster policy on
+multi-address threads, no backfill across a socket gap, and no delivered
+attachments in v1 — an attachment-only mail arrives as a placeholder naming
+the count ([hermes-plugin-plow#119](https://github.com/plow-pbc/hermes-plugin-plow/issues/119)).
+
+`plow_email` needs no dotenv entry of its own: it reads the same
+`PLOW_AGENT_TOKEN` as `plow_chat`, and Hermes's `_enable_plugin_platform`
+auto-enables every registered plugin platform whose `check_fn` passes, with
+no `is_connected` gate — so it comes up on the pin bump alone, same as the
+phone line.
 
 ### Group discretion and full trust
 
