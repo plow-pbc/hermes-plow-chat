@@ -3081,7 +3081,7 @@ def _plow_start_group_message(args, **_kwargs):
                 "trusted": trusted,
             },
             "next_step": "Call again with dry_run=false and confirm=true only after "
-                         "explicit owner approval.",
+                         "explicit approval on a turn with the owner's authority.",
         })
 
     # The tool only exists on a running gateway, and a thread nobody can listen

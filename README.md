@@ -188,25 +188,24 @@ comes from the message frame; no parent-message lookup is made.
 
 ### Group discretion and full trust
 
-The room mode is an owner-scoped, per-chat preference served on `GET /v1/chats/{uid}`.
-Before handing off each inbound burst, the adapter refreshes that chat so a
-dashboard change applies to the next message. With discretion,
-the owner may use connected accounts and share what they ask for in the room;
-members may obtain owner material only within what the owner has okayed in this
-thread. A new kind of ask waits for the owner's yes here, with the model judging
-that consent from the conversation. With full trust enabled, members may use the
-owner's accounts without a per-ask okay; only what answers the request is disclosed.
-Both modes exclude credentials, authentication secrets, raw tokens and payment-card
-secrets. Email sends require owner-DM approval; calendar overrides follow the
-calendar-conflict rule, only in the owner's DM. Member turns cannot send to other
-chats, write contacts, set goals, or list the owner's other rooms.
-Groups the owner starts begin with full trust, without a trust question; groups
-another member starts begin with discretion. The owner can change either later.
+The room mode is an owner-scoped, per-chat preference served on `GET
+/v1/chats/{uid}`. Before handing off each inbound burst, the adapter refreshes that
+chat so a dashboard change applies to the next message. Trust is the one flag: a
+trusted group makes every member the owner, so any turn there carries the owner's
+authority in every room, not just this one. In discretion, a member's ask still waits
+for the owner's yes given in this thread, judged from the conversation, disclosing
+only what answers the request. A standing secret — a password, backup code, API key,
+raw token, or full card number — is refused regardless of authority. Email sends and
+calendar-conflict overrides need a turn with the owner's authority, with approval
+posting in the room that asked. A turn without authority cannot send to other chats,
+write contacts, set goals, or list the owner's other rooms. Groups the owner starts
+begin trusted; groups another member starts begin with discretion, and only the owner
+can change that later.
 
 The `plow_set_conversation_trusted` tool writes the same API preference as the
-dashboard. It only succeeds during an owner-authored Plow Chat turn and after
-the model passes `confirm=true` for an explicit owner request. Member turns and
-calls outside an active chat turn cannot change it.
+dashboard; opening a trusted thread is owner-only too. Both only succeed on an owner-
+authored Plow Chat turn where the model passes `confirm=true` for an explicit owner
+request. Member turns and calls outside an active chat turn cannot change either.
 
 This plugin version requires a Plow API that publishes the required `trusted`
 chat field and `PUT /v1/chats/{uid}/trusted`. Deploy that API first: against an
