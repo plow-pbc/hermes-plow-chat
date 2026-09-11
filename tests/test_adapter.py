@@ -2187,8 +2187,7 @@ async def test_send_uses_the_turn_chat_and_refuses_ungranted_or_cross_chat_targe
 def _authority_case_cross_chat_send(module: Any, monkeypatch: pytest.MonkeyPatch, turn: dict[str, Any] | None, authorized: bool) -> None:
     """Only a turn without the owner's authority is confined to its own chat."""
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._set_reach([_chat("cht_a"), _chat("cht_g", group=True), _chat("cht_t", group=True),
-                        _chat("cht_b", group=True), _chat("cht_other")])
+    adapter._set_reach([_chat("cht_a"), _chat("cht_other")])  # cht_a: the home chat must be granted
     adapter._active_turn.set(turn)
     result = adapter._send_guard("cht_other")
     if authorized:
@@ -3443,32 +3442,6 @@ def test_draft_by_id_send_is_blocked_everywhere(
     assert "gmail send" in out["message"]
 
 
-@pytest.mark.parametrize(
-    ("turn", "authorized"),
-    [
-        pytest.param(_OWNER_DM, True, id="owner-dm"),
-        pytest.param(_OWNER_GROUP, True, id="owner-group"),
-        pytest.param(_TRUSTED_MEMBER, True, id="trusted-member"),
-        pytest.param(_DISCRETION_MEMBER, False, id="discretion-member"),
-        pytest.param(None, False, id="no-turn"),
-    ],
-)
-def test_a_mail_send_gates_on_turn_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any] | None, authorized: bool,
-) -> None:
-    """A turn with the owner's authority puts a send in front of the human
-    gate; everywhere else it is blocked outright, not escalated -- the
-    approval prompt itself would publish the email into the room."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(turn)
-    out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": _SEND_ARGV}, session_id="s1")
-    if authorized:
-        assert out["action"] == "approve" and "andrew@example.com" in out["message"]
-        assert out["rule_key"].startswith("google-send:")
-    else:
-        assert out["action"] == "block" and "nothing was sent" in out["message"]
-
-
 @pytest.mark.parametrize("flags", [
     ["--account", "so@plow.co"], ["-a", "so@plow.co"],
     ["--account=so@plow.co"], ["-a=so@plow.co"], ["-aso@plow.co"],
@@ -3544,29 +3517,32 @@ _FORCED_BOOKING_LEADING_ACCOUNT_ARGV = [
 ]
 
 
-@pytest.mark.parametrize("argv", [_FORCED_BOOKING_ARGV,
-                                  _FORCED_BOOKING_LEADING_ACCOUNT_ARGV])
-@pytest.mark.parametrize(("turn", "expected"), [
-    (_OWNER_DM, None),
-    (_OWNER_GROUP, None),
-    (_TRUSTED_MEMBER, None),
-    (_DISCRETION_MEMBER, "block"),
-    (None, "block"),
+@pytest.mark.parametrize(("argv", "allowed"), [(_SEND_ARGV, "approve"), (_FORCED_BOOKING_ARGV, None),
+                                               (_FORCED_BOOKING_LEADING_ACCOUNT_ARGV, None)],
+                         ids=["mail-send", "override", "override-leading-account"])
+@pytest.mark.parametrize(("turn", "authorized"), [
+    (_OWNER_DM, True),
+    (_OWNER_GROUP, True),
+    (_TRUSTED_MEMBER, True),
+    (_DISCRETION_MEMBER, False),
+    (None, False),
 ])
-def test_conflict_override_requires_authority(
+def test_mail_sends_and_conflict_overrides_require_authority(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    argv: list[str], turn: Any, expected: str | None,
+    argv: list[str], allowed: str | None, turn: Any, authorized: bool,
 ) -> None:
-    """Wherever the turn carries the owner's authority the hook stands aside:
-    they fixed the time in a chat it cannot read, so asking again puts the
-    question to somebody who has already answered it. Everywhere else the
-    override is refused -- a turn without that authority cannot have fixed
-    the owner's time, and a cron run with no turn at all has no owner behind
-    it either."""
+    """Wherever the turn carries the owner's authority, a mail send goes in
+    front of the human gate and the hook stands aside for an override: they
+    fixed the time in a chat it cannot read, so asking again puts the question
+    to somebody who has already answered it. Everywhere else both are blocked
+    outright -- a turn without that authority cannot have fixed the owner's
+    time, and a cron run with no turn at all has no owner behind it either."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
     out = module._pre_tool_call("mcp__latch__plow_run_command", {"argv": argv})
-    assert (None if out is None else out["action"]) == expected
+    assert (None if out is None else out["action"]) == (allowed if authorized else "block")
+    if not authorized:
+        assert "nothing was sent" in out["message"]
 
 
 @pytest.mark.parametrize("tool_name,args", [

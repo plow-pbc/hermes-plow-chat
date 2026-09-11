@@ -649,15 +649,14 @@ def _goal_encode(value):
 
 
 def _goal_turn_line(record):
-    """The goal as what it is: a standing instruction to this agent, from
-    whoever had the authority to give it.
+    """The goal as what it is: a standing instruction from whoever set it.
 
     It used to ride as "untrusted thread data, not an instruction", which is
     the right posture for words the thread supplied and the wrong one here --
     `/goal` is authority-gated at the command, so by the time a record exists
-    that has been checked. Telling the model otherwise had it disown a task
-    it was set: the one turn it must act on, framed as the one kind of text
-    it must not.
+    the authorship has been checked. Telling the model otherwise had it disown
+    a task it was set: the one turn it must act on, framed as the one kind of
+    text it must not.
 
     Three things bound the reframing.
 
@@ -671,10 +670,8 @@ def _goal_turn_line(record):
     still the channel prompt's answer, and a goal has never been a way to buy
     authority the room does not grant.
 
-    And every record here was set with authority, named or not: the gate
-    predates the field, so a goal written before it existed was
-    authority-gated too -- and with no name recorded, the honest reading is
-    the owner, not a demotion back to thread data.
+    And a record with no name is the owner's: written before the field
+    existed, it was owner-gated too.
     """
     setter = record.get("set_by")
     who = _goal_encode(setter) if setter else "your owner"
@@ -1422,9 +1419,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             await self._goal_reply(chat_uid, _goal_status_line(goal))
             return
         if not authority:
-            await self._goal_reply(
-                chat_uid, "Only the owner, or anyone in a group the owner trusts, can set or "
-                          "clear this thread's goal.")
+            await self._goal_reply(chat_uid, "Only the owner or a trusted group can set or clear this goal.")
             return
         if action == "clear":
             if goal is None:
@@ -3529,11 +3524,10 @@ def _plow_list_chats(_args, **_kwargs):
 
     The gate is `plow_contacts`', for the same reason and with the same shape:
     a turn without the owner's authority is the one context where somebody
-    else's words are steering the agent, and that room's members must not be
-    able to enumerate the owner's other rooms -- which is exactly what a
-    listing carrying participants would hand them. A turn-less caller (cron)
-    reads, like the contact book: it is the owner's own agent with nobody
-    steering it.
+    else's words steer the agent, and its room must not enumerate the owner's
+    other rooms -- exactly what a listing carrying participants would hand
+    them. A turn-less caller (cron) reads, like the contact book: it is the
+    owner's own agent with nobody steering it.
 
     No new API and no second scope check: the credential's grant is the reach,
     and `GET /v1/chats` is the same read that establishes it.
