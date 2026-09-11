@@ -1112,15 +1112,27 @@ _GOAL_PEER_SILENCE = (
 )
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
-    "profile-build directive and answer their message directly; never emit "
-    "[NOOP], reasoning, or tool narration. "
+    "profile-build directive and, on a turn you speak, answer their message "
+    "directly; never emit [NOOP], reasoning, or tool narration. "
+)
+# A group is other people's thread too, and answering every message in it is
+# what made the agent the loudest participant. Worded off _GOAL_PEER_SILENCE,
+# which already holds this shape for a peer agent's message: address or goal,
+# or stay out of it. The goal clause is load-bearing -- a goal wake names
+# nobody, so a rule without it would silence the wakes _goal_wake fires.
+_GROUP_SPEAK_RULE = (
+    "Other people are in this thread. Speak only when someone names you, "
+    "replies to a message of yours, or a goal for this thread is active; "
+    f"otherwise reply with exactly {NO_REPLY_SENTINEL}. A message that asks "
+    "nothing of you is not yours to answer, however well you could answer it. "
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_SHARING_RULE}"
 GROUP_AUTHORITY_CHANNEL_PROMPT = (
-    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_GROUP_SPEAK_RULE}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
-    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_SPEAKER_FACT} {_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_GROUP_SPEAK_RULE}{_SPEAKER_FACT} "
+    f"{_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
 )
 
 
