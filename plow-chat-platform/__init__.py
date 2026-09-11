@@ -932,7 +932,17 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
             fp.close()
         except Exception:  # noqa: BLE001 -- a reset already freed the socket
             pass
-        raise urllib.error.HTTPError(req.full_url, code, "refusing redirect", headers, None)
+        # Empty headers, not the Mac's: the response headers carry the
+        # attacker-controlled Location (which can reflect the bearer token) and
+        # ride HTTPError.hdrs into e.headers / e.info(). An empty Message keeps
+        # every field of the error free of anything from the Mac's response.
+        # Imported here, not at module top: a module-level `import email.message`
+        # binds the name `email`, which collides with this package's own `email`
+        # submodule (imported as plow_email) and breaks the plugin's import —
+        # observed as an ImportError across the whole suite.
+        from email.message import Message
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect", Message(), None)
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)

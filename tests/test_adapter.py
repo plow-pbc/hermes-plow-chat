@@ -5791,6 +5791,9 @@ def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tm
         # can reflect the bearer token, into the error that gets logged.
         assert "attacker.example" not in str(excinfo.value)
         assert "line-scoped-token" not in str(excinfo.value)
+        # Nothing from the Mac's response headers reaches the error, either.
+        assert excinfo.value.headers.get("Location") is None
+        assert "attacker.example" not in str(dict(excinfo.value.headers))
     finally:
         server.shutdown()
         server.server_close()
