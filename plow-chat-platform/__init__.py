@@ -7,7 +7,6 @@ The transport itself -- credential, socket, reach -- is `_transport.py`, written
 See HERMES_INTEGRATION.md for deployment and protocol constraints.
 """
 import asyncio
-import contextvars
 import dataclasses
 import hashlib
 import json
@@ -44,14 +43,20 @@ from gateway.platforms.base import (
 from gateway.session import build_session_key
 
 from ._transport import (
+    BACKGROUND_REVIEW_PREFIX,
     BASE,
+    _ACTIVE_TURN,
+    _DIAGNOSTIC_PREFIXES,
     _NEVER_GUESS,
+    _NO_REPLY_PREFIX,
     _PlowAuthError,
+    _WORKING_PREFIX,
     _agent_name,
     _auth_raise_for_status,
     _bearer,
     _chat_type,
     _granted_chats,
+    _is_chatter,
     _is_solo_dm,
     _one_line,
     _owner_fact,
@@ -65,6 +70,7 @@ from ._transport import (
     _split,
     _ticket,
 )
+from . import email as plow_email
 
 LATCH_URL = "https://plow.co/latch"
 # How long a QUIET answer from /v1/agents/me serves the gate below. Only the
@@ -75,20 +81,8 @@ LATCH_URL = "https://plow.co/latch"
 # enabled it waits; an owner who just disabled it waits not at all.
 SETTINGS_TTL_SECONDS = 60
 DASHBOARD_URL = "https://app.plow.co/dashboard"
-# Hermes' own diagnostics reach the adapter through plain send() carrying no
-# metadata that tells them apart from the model's prose, so they are still
-# recognised by the text they open with. The room carve-out below must not
-# reach them: they are the runtime talking about itself, never the turn's
-# answer, so withholding one can never withhold the message the owner wanted.
-BACKGROUND_REVIEW_PREFIX = "💾 Self-improvement review:"
-_WORKING_PREFIX = "⏳ Working —"
-# TODO(remove): once the fleet image pin includes srosro/hermes-agent's
-# turn-stop-status PR, turn-stop text arrives as status frames and this
-# final-response shim is dead code.
-_NO_REPLY_PREFIX = "⚠️ No reply: "
-_DIAGNOSTIC_PREFIXES = (BACKGROUND_REVIEW_PREFIX, _WORKING_PREFIX, _NO_REPLY_PREFIX)
 PLATFORM_NAME = "plow_chat"
-PROVIDER = "linq"                     # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
+PROVIDER = "imessage"                 # the phone line; the email line is plow_email's (plow-pbc/hermes-plugin-plow#109)
 # On the persistent volume: a checkpoint that dies with the container is no
 # checkpoint at all - a restart would come back with no baseline, skip the
 # backfill, and silently lose whatever arrived while it was down. The gateway's
@@ -814,7 +808,6 @@ def _message_type(media_types):
     return MessageType.DOCUMENT if media_types else MessageType.TEXT
 
 
-_ACTIVE_TURN = contextvars.ContextVar("plow_chat_active_turn", default=None)
 REPLY_TARGET_PROMPT = (
     "Your reply is delivered to this chat; any other chat needs the explicit "
     "plow_send_message tool and will be refused on an external turn."
@@ -1841,17 +1834,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # diagnostic, so it never delivers.
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
             return SendResult(success=True)
-        # The turn boundary is the classifier: prose the model writes while a
-        # turn is open, into that turn's own chat, is its working-out. Hermes
-        # marks the turn-final reply `notify` -- the key telegram, discord,
-        # mattermost and a2a already read for the same distinction -- and the
-        # scheduler marks a cron delivery `job_id`. Everything the adapter
-        # itself sends (the greeting, a goal notice, the send_message tool)
-        # runs turn-less or cross-chat, so it falls out as not-chatter
-        # without needing to say so.
-        meta = metadata or {}
-        chatter = (turn is not None and chat_id == turn["chat_uid"]
-                   and not meta.get("notify") and "job_id" not in meta)
+        chatter = _is_chatter(turn, chat_id, metadata)
         # Matched on text because Hermes gives these no metadata of their own:
         # the heartbeat and the memory notice arrive unmarked, and the
         # turn-stop explainer arrives `notify`-marked because Hermes
@@ -2412,8 +2395,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         adoption only, so a room retitled or joined mid-connection is stale
         there and current here. The grant decides which rooms the credential
         can see; the listing then narrows that to the phone line's own chats
-        (`provider == "linq"`), excluding chats of another provider on the
-        same grant.
+        (the line's `provider_type` is `imessage`), excluding chats on another
+        line of the same grant.
 
         Status is the other narrowing, because the listing exists to source a
         `cht_` id for `plow_send_message`. `/v1/chats` excludes only `failed`,
@@ -3448,11 +3431,11 @@ def _plow_send_message(args, **_kwargs):
 
     The adapter's send() is the authority on reach: outside the grant, or a
     cross-chat send during a member's turn, comes back refused and is
-    relayed as-is. Nothing here is a second gate. Sent notify-marked: this is
-    a deliberate agent action on a tool call, not a turn's mid-turn chatter --
-    it also runs on another thread via run_coroutine_threadsafe, where
-    self._active_turn.get() reads None, so an unmarked send here would be
-    held nowhere and just silently never leave while still reporting success."""
+    relayed as-is. Nothing here is a second gate, and none is needed on this
+    side of the hop: run_coroutine_threadsafe copies the calling context onto
+    the task it starts, so _send_guard on the adapter's loop reads the same
+    active turn this thread does -- a member's turn is confined there, on
+    whichever line opened it."""
     chat_id = (args.get("chat_id") or "").strip()
     body = (args.get("body") or "").strip()
     if not chat_id or not body:
@@ -3672,7 +3655,8 @@ PLOW_NAME_CONTACT_SCHEMA = {
         "type": "object",
         "properties": {
             "handle": {"type": "string",
-                       "description": "The person's handle, as shown in the roster (a phone number, +1...)."},
+                       "description": "The person's handle, as shown in the roster (a phone number, "
+                                       "+1..., or an email address)."},
             "display_name": {"type": "string"},
             "relationship": {"type": "string"},
         },
@@ -3969,6 +3953,17 @@ def register(ctx):
                       "thread. Keep replies short; bold, italics and headings render, "
                       "but skip code blocks and tables. This thread is your own line — "
                       "the number is yours, and here you write as yourself.",
+    )
+    # The agent's own email line, on the same transport (design §5). The
+    # hint's address is written onto this entry by the adapter once reach
+    # has read it -- see PlowEmailAdapter._publish_hint. No cron home: an
+    # email line has no standing thread for a delivery to land in.
+    ctx.register_platform(
+        name=plow_email.PLATFORM_NAME,
+        label="Plow Email",
+        adapter_factory=lambda cfg: plow_email.PlowEmailAdapter(cfg),
+        check_fn=plow_email.check_requirements,
+        platform_hint=plow_email.hint(),
     )
     # A Hermes without this API (older fleet pins) must still get its phone
     # line: the section is guidance, the platform is the product.
