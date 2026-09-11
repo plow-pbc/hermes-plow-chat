@@ -679,52 +679,6 @@ def _goal_turn_line(record):
             f"{_goal_encode(record['text'])}]")
 
 
-def _names(text, name):
-    """True when `text` addresses `name` as a word, not as a substring.
-
-    Escaped, because a display name someone chose is data, never a pattern --
-    "C++" or "A." would otherwise be a broken regex or a wildcard. The word
-    boundary is a non-word character, so "Elm," and "@Elm" still address it
-    and "helmet" does not.
-    """
-    return bool(name) and re.search(rf"(?<!\w){re.escape(name)}(?!\w)",
-                                    text or "", re.IGNORECASE) is not None
-
-
-def _peer_names(chat):
-    """The display names of the other agents in the room, for reading who a
-    message hands the floor to."""
-    return [name for participant in (chat.get("participants") or [])
-            if participant.get("type") == "agent" and participant.get("relationship") == "peer"
-            for name in [(participant.get("line") or {}).get("display_name")] if name]
-
-
-def _should_stay_silent(chat, text, goal, slash_command=False, reply_to_self=False, held_floor=False):
-    """True when a message in a shared room must not draw a reply.
-
-    A group is other people's thread too. The agent answered every message in
-    it, which is what made it the loudest participant; being named, being
-    replied to, an active goal, or a command are what speak. A solo DM is
-    always the agent's to answer -- there is nobody else there to be talking
-    to. The speaker does not enter into it: a human's message and a peer
-    agent's are gated the same way.
-    """
-    if _is_solo_dm(chat) or slash_command or reply_to_self or _goal_active(goal):
-        return False
-    name = _agent_name(chat)
-    # An unnamed line has no way to BE addressed, and silence keyed on a name
-    # it does not have is a permanent mute, not discretion.
-    if not name:
-        return False
-    if _names(text, name):
-        return False
-    # Being named opens a conversation; it does not have to be repeated in
-    # every line of it. While this agent is the one that spoke last, a
-    # follow-up with no name in it is still its own -- unless the message
-    # names another agent, which is how the floor is handed over.
-    return not (held_floor and not any(_names(text, peer) for peer in _peer_names(chat)))
-
-
 def _sender_key(sender):
     if sender.get("type") == "agent":
         return (sender.get("line") or {}).get("uid")
@@ -1135,27 +1089,27 @@ SETUP_TURN = (
     f"onboarding. Then reply with exactly {NO_REPLY_SENTINEL}."
 )
 
-_UNADDRESSED_SILENCE = (
-    "This message did not name you and no goal is set for this thread. Read it "
-    "for context but do not reply to it. "
-    f"{_SILENCE_OPTION}"
-)
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and, on a turn you speak, answer their message "
     "directly; never emit [NOOP], reasoning, or tool narration. "
 )
-# A group is other people's thread too, and answering every message in it is
-# what made the agent the loudest participant. The goal clause is
-# load-bearing -- a goal wake names nobody, so a rule without it would
-# silence the wakes _goal_wake fires. Named and goal are also what
-# _should_stay_silent enforces; the reply case is prose only, because the
-# quoted parent on the frame carries no mark saying the message was ours.
+# Whether a message is this agent's to answer is the MODEL's judgement, made
+# here and answered with the sentinel (owner ruling, 2026-09-11). Code held a
+# name match once: it read "we paid cash" as an agent called Ash, and it could
+# not read a follow-up at all -- "what else can you do for me?", one line after
+# the owner named that agent, went unanswered. Reading a conversation is what
+# the model is for; the code's only part is honouring the answer.
 _GROUP_SPEAK_RULE = (
-    "Speak only when someone names you, replies to a message of yours, or a "
-    f"goal for this thread is active; otherwise reply with exactly {NO_REPLY_SENTINEL}. "
-    "A message that asks nothing of you is not yours to answer, however well "
-    "you could answer it. "
+    "Other people are in this thread, and most of what they say is to each other. "
+    "Work out whether this message is for you: your name, a follow-up to what you "
+    "were just asked or just said, a reply to a message of yours, or a goal for "
+    "this thread all make it yours. Being named opens a conversation and you stay "
+    "in it until it turns elsewhere -- someone naming another agent turns it "
+    f"elsewhere. When it is not yours, reply with exactly {NO_REPLY_SENTINEL} and "
+    "nothing else: never your reasoning, and never a sentence explaining that you "
+    "are staying quiet. A message that asks nothing of you is not yours to answer, "
+    "however well you could answer it. "
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_SHARING_RULE}"
 GROUP_AUTHORITY_CHANNEL_PROMPT = (
@@ -1291,13 +1245,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
-        # Who spoke last among the AGENTS in a chat: True while this line's own
-        # message is the most recent agent turn there. The owner asked Spruce,
-        # Spruce answered, and "what else can you do?" was still Spruce's to
-        # answer -- it went unanswered because nothing carried that (group
-        # transcript, 2026-09-11). Humans speaking never changes it; a peer
-        # agent answering does.
-        self._held_floor = {}                # chat uid -> this line spoke last
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._goal_paced = False              # pacing runs only inside a live socket session
@@ -1556,12 +1503,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
-            # Read from the prompt for the same reason, and enforced in `send`
-            # rather than asked for: the sentinel only suppresses the exact
-            # sentinel, so a model that verbalises its silence ("(no reply
-            # needed)") posted it. Prompt prose not holding is the failure this
-            # whole feature exists to answer -- the peer gate cannot rest on it.
-            "suppress_reply": _UNADDRESSED_SILENCE in (getattr(event, "channel_prompt", "") or ""),
             # What recall should search for, when it is not the delivered text.
             "recall_text": getattr(event, "recall_text", None),
             "source_message_id": str(
@@ -1999,22 +1940,18 @@ class PlowChatAdapter(BasePlatformAdapter):
         return _goal_parse_verdict(content)
 
     def _message_guard(self, chat_id):
-        """The one gate every outbound message passes: inside the grant, inside
-        an unauthorized turn's own chat, and not owed silence. None means go.
+        """The one gate every outbound message passes: inside the grant,
+        inside the member turn's chat, and not a second copy of a reply a
+        sequence already delivered. None means go.
 
-        Layered over `_send_guard` rather than beside it, because a send path
-        that picks up the grant checks and quietly misses the silence one is
-        exactly how the status frame kept speaking through a suppressed turn.
-        Silence is scoped to the turn's own chat: a suppressed turn may still
-        act, and an explicit send elsewhere is not the reply being gated.
+        Whether a message is this agent's to send at all is the model's
+        judgement, made from the channel prompt and answered with the
+        sentinel; honouring that answer is `send`'s job, not this gate's.
         """
         refused = self._send_guard(chat_id)
         if refused is not None:
             return refused
         turn = self._active_turn.get()
-        if turn and turn.get("suppress_reply") and chat_id == turn["chat_uid"]:
-            log.info("[plow_chat] suppressed an unaddressed message for %s", chat_id)
-            return SendResult(success=True)
         # A completed sequence already delivered this turn's reply, so the
         # trailing prose the model adds after it is the same duplicate the
         # peer gate above exists to stop. Keyed on the sequence's own turn
@@ -2950,9 +2887,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         """One inbound message, from the socket or from the backfill, queued
         for the chat's server."""
         if msg["direction"] != "inbound":
-            # The echo of our own send is the one durable signal that this
-            # line is the agent holding the floor here.
-            self._held_floor[chat_uid] = True
             return                           # the echo of our own send
         sender = msg["sender"]
         if sender["type"] not in ("member", "agent") or (
@@ -2961,10 +2895,6 @@ class PlowChatAdapter(BasePlatformAdapter):
             # an outbound agent sender carries a `line` object and NO uid key.
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
-        if sender["type"] == "agent":
-            # Past the gate above, an agent sender is a peer: it answered, so
-            # the floor is no longer ours and a bare follow-up is theirs.
-            self._held_floor[chat_uid] = False
         uid = msg["uid"]
         if (chat_uid, uid) in self._seen:
             return                           # socket/backfill overlap - never re-fetch
@@ -3077,18 +3007,6 @@ class PlowChatAdapter(BasePlatformAdapter):
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
         channel_prompt = _channel_prompt(chat, role, roster, self._identity, authority)
-        # Suppress the REPLY, never the read: an agent that cannot see a peer
-        # speak loses the thread, and then says incoherent things to its own
-        # human. The goal is what unlocks answering another agent at all, so
-        # that capability is never ambient.
-        # A reply to this agent's own message is addressed to it as surely as
-        # its name is. `direction` is the message resource's own field; a
-        # frame without one is simply not a reply to us.
-        replied_to = any((item.reply_to or {}).get("message", {}).get("direction") == "outbound"
-                         for item in burst)
-        if _should_stay_silent(roster, spoken, goal, burst[0].starts_slash_command, replied_to,
-                               self._held_floor.get(chat_uid, False)):
-            channel_prompt = f"{_UNADDRESSED_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
             source=self.build_source(chat_id=chat_uid, chat_name=chat["name"], chat_type=chat["type"],

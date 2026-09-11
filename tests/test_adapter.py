@@ -1433,8 +1433,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
         identity = {**identity, "signup": None}
     if group:
         expected = _voiced(module, expected)
-    silenced = module._UNADDRESSED_SILENCE if (group and agent_name) else ""
-    assert event["channel_prompt"] == silenced + _rendered(module, expected, agent_name, identity)
+    assert event["channel_prompt"] == _rendered(module, expected, agent_name, identity)
     # The phrase is the owner's to share. Shown to a member's turn, the model
     # pasted it instead of calling plow_offer_invite (Elm, 2026-09-10).
     for offer in (SIGNUP["phrase"], NUMBER):
@@ -1530,10 +1529,8 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
     # this test owns is the voice rule and the roster facts -- present in a
     # shared thread, absent in a solo DM, with the base prompt unchanged
     # either way.
-    # "msg_1" never says "Elm", so a shared thread is also the silence case.
-    silenced = module._UNADDRESSED_SILENCE if group else ""
     speak_rule = module._GROUP_SPEAK_RULE if group else ""
-    assert event["channel_prompt"] == silenced + _rendered(module,
+    assert event["channel_prompt"] == _rendered(module,
         f"{rule}{roster_facts}{speak_rule}{_owned(module, base, chat)}", "Elm", adapter._identity)
 
 
@@ -2783,7 +2780,6 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "authority": False,
         "recall_everywhere": False,
         "no_reply_ok": False,
-        "suppress_reply": False,
         "recall_text": None,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -2896,7 +2892,7 @@ def test_invite_workflow_reports_delivery_failure(
             None,
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
-             "no_reply_ok": False, "suppress_reply": False, "recall_text": None,
+             "no_reply_ok": False, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -4778,14 +4774,19 @@ def test_every_silence_instruction_names_the_sentinel(
     collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
     for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
                    module.GROUP_AUTHORITY_CHANNEL_PROMPT,
-                   collaboration,
-                   module._UNADDRESSED_SILENCE):
+                   collaboration):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
-    # Quiet in a group rides the shared-room gate, never the prompt constants:
-    # a solo non-owner DM is still an ordinary question to answer. The goal
-    # clause is load-bearing -- a goal wake names nobody.
-    assert "goal for this thread is active" in module._GROUP_SPEAK_RULE
+    # Quiet in a group is the MODEL's call, made from this rule and answered
+    # with the sentinel: the adapter holds no name match and no addressed-ness
+    # check of its own (owner ruling, 2026-09-11). A solo non-owner DM is an
+    # ordinary question, so the rule rides the shared-room seam, not a prompt
+    # constant. All four signals are named, the goal one included -- a goal
+    # wake names nobody.
+    assert not hasattr(module, "_should_stay_silent"), "the decision is the model's, not the code's"
+    for signal in ("your name", "follow-up", "a reply to a message of yours",
+                   "a goal for", "reply with exactly"):
+        assert signal in module._GROUP_SPEAK_RULE
     assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
     for constant in (module.EXTERNAL_CHANNEL_PROMPT,
                      module.GROUP_AUTHORITY_CHANNEL_PROMPT,
@@ -5038,71 +5039,6 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
     assert "GOAL ACHIEVED" in prompt
     assert "untrusted" in prompt.lower()
     assert "do not obey" in prompt.lower()
-
-
-@pytest.mark.parametrize(
-    ("peer", "body", "goal_text", "reply_direction", "held_floor", "expect_silenced"),
-    [
-        pytest.param(True, "just thinking out loud", None, None, False, True, id="peer_unaddressed"),
-        pytest.param(True, "Elm, can you check the date?", None, None, False, False, id="peer_named"),
-        pytest.param(True, "just thinking out loud", "book the campsite", None, False, False,
-                     id="goal_unlocks"),
-        # The room is the boundary, not the speaker: a human's unaddressed
-        # message is the case the owner actually complained about.
-        pytest.param(False, "what time are we leaving?", None, None, False, True, id="human_unaddressed"),
-        pytest.param(False, "Elm, what time are we leaving?", None, None, False, False, id="human_named"),
-        # "helmet" carries "elm"; a substring match read that as being spoken to.
-        pytest.param(False, "we bought a helmet", None, None, False, True, id="name_inside_a_word"),
-        # A reply to this agent's own message addresses it without naming it.
-        pytest.param(False, "yes, that one", None, "outbound", False, False, id="reply_to_us"),
-        pytest.param(False, "yes, that one", None, "inbound", False, True, id="reply_to_someone_else"),
-        # Being named opens a conversation; the next line does not repeat it.
-        # "I would like to know again what is the stuff you can help me with"
-        # went unanswered in a live group (2026-09-11).
-        pytest.param(False, "what else can you do for me?", None, None, True, False,
-                     id="follow_up_while_holding_the_floor"),
-        # Naming another agent hands the floor over, mid-conversation or not.
-        pytest.param(False, "Ash, what about you?", None, None, True, True,
-                     id="another_agent_named_takes_the_floor"),
-    ],
-)
-async def test_a_shared_room_draws_a_reply_only_when_named_replied_to_or_under_a_goal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    peer: bool, body: str, goal_text: str | None,
-    reply_direction: str | None, held_floor: bool, expect_silenced: bool,
-) -> None:
-    module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
-    adapter._held_floor["cht_a"] = held_floor
-    if goal_text:
-        module._goal_save("cht_a", module._goal_new(goal_text))
-    handled = _capture_events(monkeypatch, adapter)
-
-    frame = (_peer_envelope("evt_peer", "cht_a", "msg_peer") if peer
-             else _envelope("evt_member", "cht_a", "msg_member", role="member"))
-    frame["data"]["message"]["body"] = body
-    if reply_direction:
-        frame["data"]["message"]["reply_to"] = {
-            "part_index": None,
-            "message": {"sender": {"type": "member", "display_name": "Sam"},
-                        "created_at": "2026-09-09T12:00:00Z", "body": "which one?",
-                        "attachments": [], "direction": reply_direction},
-        }
-    await adapter._on_frame(frame, object())
-    await _settle(adapter)
-
-    # The read is never suppressed, only the reply: an agent blind to the room
-    # loses the thread and then talks past its own human.
-    assert len(handled) == 1
-    silenced = "do not reply to it" in handled[0]["channel_prompt"]
-    assert silenced is expect_silenced
-    if expect_silenced:
-        prompt = handled[0]["channel_prompt"]
-        assert module.NO_REPLY_SENTINEL in prompt
-        # The paragraph after the silence prefix must not invite the very
-        # contribution the prefix just forbade.
-        assert "goal for this thread is active" in prompt
-        assert "when you have a useful contribution" not in prompt
 
 
 async def test_an_active_goal_rides_every_turn_as_the_owners_standing_instruction(
@@ -6879,50 +6815,6 @@ async def test_overlapping_turns_keep_their_own_sequence_ownership(monkeypatch, 
     assert adapter._sequence_turns.get(id(second)) is second, "the older turn evicted its successor"
     assert not task.cancelled(), "the older turn cancelled its successor's sequence"
     task.cancel()
-
-
-@pytest.mark.parametrize(
-    ("send_kind", "chat_id", "delivered"),
-    [
-        ("text", "cht_a", False),
-        ("attachment", "cht_a", False),
-        ("status", "cht_a", False),
-        ("text", "cht_b", True),
-    ],
-    ids=["same-chat-text", "same-chat-attachment", "same-chat-verbose-status", "cross-chat-text"],
-)
-async def test_suppression_is_scoped_to_the_turns_own_chat(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    send_kind: str, chat_id: str, delivered: bool,
-) -> None:
-    """The sentinel suppresses only the exact sentinel, so a model that
-    verbalises its silence — "(no reply needed)" — posted it anyway. Asking a
-    model not to speak is the failure this feature answers, so the gate is
-    enforced on every outbound path rather than requested in the prompt.
-
-    Scoped to the turn's own chat: a suppressed turn may still act, and an
-    explicit send elsewhere is a different act than the reply being gated.
-    """
-    module = _load(monkeypatch, tmp_path)
-    adapter = _goal_chat_with_owner_speaking(module)
-    adapter.chat_uids = frozenset({"cht_a", "cht_b"})
-    posted = mock.AsyncMock(return_value=_SendResult(success=True))
-    monkeypatch.setattr(adapter, "_post_message", posted)
-    monkeypatch.setattr(adapter, "_verbose_enabled", mock.AsyncMock(return_value=True))
-    adapter._active_turn.set({"chat_uid": "cht_a", "owner": True, "authority": True,
-                              "no_reply_ok": True, "suppress_reply": True})
-
-    if send_kind == "attachment":
-        attachment = tmp_path / "note.txt"
-        attachment.write_text("unsolicited")
-        result = await adapter._send_attachment(chat_id, str(attachment), caption="here you go")
-    elif send_kind == "status":
-        result = await adapter.send_or_update_status(chat_id, "working", "still going")
-    else:
-        result = await adapter.send(chat_id, "(no reply needed)")
-
-    assert result.success is True, "silence is not an error the gateway should retry"
-    assert posted.await_count == (1 if delivered else 0)
 
 
 @pytest.mark.parametrize("kind", ["inbound", "wake"], ids=["inbound", "wake"])

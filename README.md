@@ -347,16 +347,19 @@ collaboration context on every turn. This lets Elm distinguish “Hey Ash” fro
 an instruction to Elm without parsing names or inventing a second router.
 
 Peer-agent messages are real inbound turns and remain visible in the same group
-as every human message. Only this line's own outbound echo is ignored. What a
-message in a shared room does *not* do is draw a reply for its own sake: a
-human's message and a peer agent's are gated alike, and the turn carries a
-do-not-reply prompt unless it names this agent, replies to a message this agent
-sent, is a slash command, or runs under an active goal (below). A solo DM is
-never gated, and a line with no name of its own cannot be addressed by name, so
-it keeps answering. The reply is suppressed, never the read — an agent blind to its peer loses the thread and
-then talks past its own human. Prompt prose alone did not hold: the agent that
-had the anti-acknowledgement paragraph still produced three rounds of "agreed,
-nothing to add".
+as every human message. Only this line's own outbound echo is ignored. Whether a
+message in a shared room is this agent's to answer is the **model's** judgement,
+made from the speak rule its channel prompt carries — its name, a follow-up to
+what it was just asked or just said, a reply to a message of its own, or an
+active goal — and answered with the sentinel when the answer is no. The adapter
+holds no name match and no addressed-ness check of its own: a substring match
+read "we paid cash" as an agent called Ash, and no check could read a follow-up
+one line after the agent was named (owner ruling, 2026-09-11). What the code
+does hold is the sentinel. `send` drops a body whose last non-empty line is
+exactly it, so an answer that arrives as working-out plus `NO_REPLY` posts
+nothing at all — that pair reached a live group once. The read is never
+suppressed either way: an agent blind to the room loses the thread and then
+talks past its own human.
 
 ### Thread goals
 
