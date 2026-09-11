@@ -925,9 +925,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Drain and close the redirect response before raising; the base
         # handler does the same before it would follow, so the socket is not
-        # left open for the GC to reclaim.
-        fp.read()
-        fp.close()
+        # left open for the GC to reclaim. A Mac that resets the connection
+        # mid-redirect must still surface as a clean refusal, not the raw
+        # socket error, so the drain is best-effort.
+        try:
+            fp.read()
+        except OSError:
+            pass
+        finally:
+            fp.close()
         # NEVER interpolate newurl: a compromised Mac controls the Location and
         # could reflect the bearer token into it, and this error is logged.
         raise urllib.error.HTTPError(req.full_url, code, "refusing redirect", headers, None)

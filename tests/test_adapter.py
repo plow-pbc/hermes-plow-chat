@@ -5798,6 +5798,41 @@ def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tm
     assert hits == ["/mcp"], "followed the redirect instead of refusing it at the first host"
 
 
+def test_refresh_mac_skills_logs_no_mac_controlled_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed fetch is logged by exception TYPE only. A compromised Mac's
+    response — here a redirect reflecting the token into its Location — must
+    never reach the persisted log line, by the error message or the arg."""
+    module = _load(monkeypatch, tmp_path)
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", "http://attacker.example/steal?t=line-scoped-token")
+            self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            ...
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("PLOW_MCP_URL", f"http://127.0.0.1:{server.server_address[1]}/mcp")
+        monkeypatch.setenv("PLOW_AGENT_TOKEN", "line-scoped-token")
+        with caplog.at_level("INFO"):
+            module._refresh_mac_skills()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "not fetched" in logged
+    assert "HTTPError" in logged  # the type name, our fixed diagnostic
+    assert "attacker.example" not in logged
+    assert "line-scoped-token" not in logged
+
+
 def _stub_mirror(
     monkeypatch: pytest.MonkeyPatch, *, result: bool = True, raises: Exception | None = None
 ) -> list[dict[str, Any]]:
