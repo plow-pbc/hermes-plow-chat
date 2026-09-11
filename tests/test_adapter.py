@@ -3596,23 +3596,32 @@ def test_group_message_reports_adoption_separately_from_delivery(
 
 
 @pytest.mark.parametrize(
-    ("trusted", "turn", "started"),
+    ("trusted", "turn", "started", "resolved"),
     [
-        pytest.param(True, None, False, id="trusted-outside-turn"),
-        pytest.param(True, _DISCRETION_MEMBER, False, id="trusted-discretion-member"),
-        pytest.param(True, _TRUSTED_MEMBER, False, id="trusted-trusted-member"),
-        pytest.param(False, _TRUSTED_MEMBER, True, id="plain-trusted-member"),
-        pytest.param(False, _DISCRETION_MEMBER, False, id="plain-discretion-member"),
-        pytest.param(False, None, False, id="plain-outside-turn"),
+        pytest.param(True, None, False, True, id="trusted-outside-turn"),
+        pytest.param(True, _DISCRETION_MEMBER, False, True, id="trusted-discretion-member"),
+        pytest.param(True, _TRUSTED_MEMBER, False, True, id="trusted-trusted-member"),
+        pytest.param(False, _TRUSTED_MEMBER, True, False, id="plain-trusted-member"),
+        pytest.param(False, _DISCRETION_MEMBER, False, False, id="plain-discretion-member"),
+        pytest.param(False, None, False, False, id="plain-outside-turn"),
+        pytest.param("tru", _OWNER_DM, True, False, id="owner-unparseable-word-opts-out"),
+        pytest.param("maybe", _OWNER_DM, True, False, id="owner-unparseable-guess-opts-out"),
+        pytest.param("false", _OWNER_DM, True, False, id="owner-falsy-string-opts-out"),
+        pytest.param(None, _OWNER_DM, True, True, id="owner-omitted-defaults-to-full-trust"),
+        pytest.param(None, _TRUSTED_MEMBER, False, True, id="trusted-member-omitted-still-owner-only"),
     ],
 )
 def test_starting_a_thread_gates_on_trust_and_turn_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: bool, turn: dict[str, Any] | None, started: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, trusted: Any, turn: dict[str, Any] | None,
+    started: bool, resolved: bool,
 ) -> None:
     """A trusted thread hands its members the owner's own reach, so opening
     one is owner-only even for a turn with authority in its own trusted
-    group. A plain thread asks only authority: a trusted group's member may
-    open one the owner never touched; a discretion member or no turn may not."""
+    group -- whether `trusted` arrives explicit or, omitted, resolves to the
+    fixed full-trust default. A plain thread asks only authority: a trusted
+    group's member may open one the owner never touched; a discretion
+    member or no turn may not. A falsy or unparseable value always resolves
+    to discretion, never full trust."""
     module = _load(monkeypatch, tmp_path)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
@@ -3623,36 +3632,11 @@ def test_starting_a_thread_gates_on_trust_and_turn_authority(
          "dry_run": False, "confirm": True, "trusted": trusted}))
     assert out["success"] is started
     if started:
-        assert sent == [(["+15550001111"], "hi", trusted)]
+        assert sent == [(["+15550001111"], "hi", resolved)]
     else:
         assert sent == []
         assert "nothing was sent" in out["error"]
-        assert ("owner" if trusted else "authority") in out["error"]
-
-
-@pytest.mark.parametrize(("turn", "trusted", "resolved"), [
-    (_OWNER_DM, "tru", False), (_OWNER_DM, "maybe", False), (_OWNER_DM, "false", False),
-    (_OWNER_DM, None, True), (_TRUSTED_MEMBER, None, True)])
-def test_absent_trusted_grants_full_trust_and_falsy_or_unparseable_does_not(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], trusted: Any, resolved: bool
-) -> None:
-    """`trusted` omitted resolves to full trust on any turn -- fixed, not
-    recomputed from who is asking -- and a falsy or unparseable value opts
-    out to discretion. Full trust still needs the owner's own turn: a
-    trusted member's omitted `trusted` resolves to True and is refused, not
-    silently downgraded to discretion."""
-    module = _load(monkeypatch, tmp_path)
-    module._ACTIVE_TURN.set(turn)
-    sent: list[Any] = []
-    _live_tool(module, monkeypatch, "start_group_thread",
-               result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
-    out = json.loads(module._plow_start_group_message(
-        {"recipients": ["+15550001111"], "body": "hi",
-         "dry_run": False, "confirm": True, "trusted": trusted}))
-    if resolved and not turn["owner"]:
-        assert out["success"] is False and sent == []
-    else:
-        assert sent == [(["+15550001111"], "hi", resolved)]
+        assert ("owner" if resolved else "authority") in out["error"]
 
 
 def test_start_group_does_not_require_a_trust_question(
