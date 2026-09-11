@@ -2669,7 +2669,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "chat_uid": "cht_b",
         "owner": False,
         "dm": False,
-        "recall_everywhere": False,
+        "authority": False,
         "no_reply_ok": False,
         "suppress_reply": False,
         "recall_text": None,
@@ -2783,7 +2783,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "recall_everywhere": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False,
              "no_reply_ok": False, "suppress_reply": False, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
@@ -4642,44 +4642,34 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
         await adapter.on_processing_complete(event, None)
 
 
-_HOME_SOLE_MEMBER_NOT_OWNER = _chat("cht_a")
-next(p for p in _HOME_SOLE_MEMBER_NOT_OWNER["participants"] if p["type"] == "member")["role"] = "member"
-_HOME_WITH_PEER_AGENT = _chat("cht_a")
-_HOME_WITH_PEER_AGENT["participants"].append({"type": "agent", "relationship": "peer"})
-
-
 @pytest.mark.parametrize(
-    ("chat_uid", "chat", "expected"),
+    ("owner", "chat_type", "trusted", "expected"),
     [
-        ("cht_room", _chat("cht_room", group=True), False),
-        ("cht_room", _chat("cht_room", group=True, trusted=True), True),
-        ("cht_a", _chat("cht_a"), True),
-        ("cht_a", _chat("cht_a", group=True), False),
-        ("cht_a", _HOME_SOLE_MEMBER_NOT_OWNER, False),
-        ("cht_a", _HOME_WITH_PEER_AGENT, False),
+        (True, "dm", False, True),
+        (True, "group", False, True),
+        (True, "group", True, True),
+        (False, "group", True, True),
+        (False, "group", False, False),
+        (False, "dm", True, False),   # trust never promotes a DM
+        (False, "dm", False, False),
     ],
-    ids=["other-untrusted-room", "other-trusted-room", "home-owner-dm",
-         "home-configured-as-a-group", "home-sole-member-not-owner",
-         "home-with-peer-agent"],
+    ids=["owner-dm", "owner-untrusted-group", "owner-trusted-group", "member-trusted-group",
+         "member-untrusted-group", "member-dm-flagged-trusted", "member-dm"],
 )
-async def test_the_active_turn_carries_one_recall_decision(
+async def test_the_active_turn_carries_one_authority_decision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    chat_uid: str, chat: dict[str, Any], expected: bool,
+    owner: bool, chat_type: str, trusted: bool, expected: bool,
 ) -> None:
-    """`recall_everywhere` is identity AND shape: a PLOW_HOME_CHANNEL that
-    names a group, or whose sole human isn't the owner, must not hand that
-    member the owner's cross-chat recall; a trusted room reaches every chat
-    on its own, home or not."""
+    """A trusted group makes every participant the owner; nothing else does."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats[chat_uid] = chat
+    adapter._chats["cht_x"] = {**_chat("cht_x", group=chat_type == "group", trusted=trusted)}
     event = SimpleNamespace(
-        source=SimpleNamespace(chat_id=chat_uid, role_authorized=False, chat_type="group", user_id="cp_m"),
+        source=SimpleNamespace(chat_id="cht_x", role_authorized=owner, chat_type=chat_type, user_id="cp_m"),
         message_id="msg_1", channel_prompt="",
     )
     await adapter.on_processing_start(event)
-    turn = module._ACTIVE_TURN.get()
-    assert turn["recall_everywhere"] is expected
+    assert module._ACTIVE_TURN.get()["authority"] is expected
     await adapter.on_processing_complete(event, None)
 
 
@@ -5783,9 +5773,9 @@ _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "
 @pytest.mark.parametrize(
     ("turn", "expected_snippets"),
     [
-        ({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True},
+        ({"chat_uid": "cht_room", "owner": True, "dm": True, "authority": True},
          ["three possible addresses", "earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False},
+        ({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False},
          ["earlier in this room"]),
     ],
     ids=["everywhere", "room-only"],
@@ -5808,7 +5798,7 @@ def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
                          "role_filter": ["user", "assistant"], "limit": 30,
                          "fields": ("session_id", "role", "snippet", "timestamp")}]
     assert db.closed is True
-    if turn["recall_everywhere"]:
+    if turn["authority"]:
         assert text.splitlines()[1] == "- [2026-09-03] assistant: three possible addresses"
     assert text.splitlines()[-1] == "(end of recalled snippets)"
 
@@ -5824,7 +5814,7 @@ def test_recall_caps_at_six_lines(
     ]
     db = _FakeDb(rows, {})
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "recall_everywhere": True})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "authority": True})
     out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert out["context"].count("- [") == 6
 
@@ -5835,7 +5825,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -5848,7 +5838,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -5859,7 +5849,7 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "recall_everywhere": False})
+    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True
