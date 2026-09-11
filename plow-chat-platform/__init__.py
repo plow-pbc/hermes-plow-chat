@@ -1327,10 +1327,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._cancel_typing(chat_uid)
         self._typing[chat_uid] = asyncio.create_task(self._typing_until_reply(chat_uid))
         # Hermes builds its own events and swallows a raise here, so an
-        # unstamped event is a speakerless wake, not a missing turn.
+        # unstamped event is a speakerless wake read from nothing that can raise.
         if not hasattr(event, "authority"):
-            event.authority, event.recall_everywhere = _authority(
-                await self.get_chat_info(chat_uid), _owner_dm(self._chats[chat_uid]), human=False)
+            event.authority = event.recall_everywhere = _owner_dm(self._chats.get(chat_uid, {}))
         turn = {
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),

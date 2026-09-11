@@ -4640,25 +4640,29 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
         await adapter.on_processing_complete(event, None)
 
 
-@pytest.mark.parametrize(("group", "trusted", "authority"),
-                         [(False, False, True), (True, False, False), (True, True, False)],
-                         ids=["owner-dm", "discretion-group", "trusted-group"])
+@pytest.mark.parametrize(("chat_uid", "group", "trusted", "authority"),
+                         [("cht_b", False, False, True), ("cht_b", True, False, False),
+                          ("cht_b", True, True, False), ("cht_gone", True, True, False)],
+                         ids=["owner-dm", "discretion-group", "trusted-group", "chat-not-in-reach"])
 async def test_an_unstamped_hermes_event_opens_a_speakerless_wake_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, group: bool, trusted: bool, authority: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    chat_uid: str, group: bool, trusted: bool, authority: bool,
 ) -> None:
     """Hermes builds its own events -- process completions, `/loop` ticks,
     resumes -- with no stamp, and swallows a raise from this hook. Such an
-    event is a wake with no human speaker: authority only in the owner's DM,
-    a confined turn everywhere else, never no turn at all."""
+    event is a wake with no human speaker, read from nothing that can raise:
+    authority and recall only in a known owner DM, a confined turn everywhere
+    else -- an unknown chat included -- and never no turn at all."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     adapter._set_reach([_chat("cht_a"), _chat("cht_b", group=group, trusted=trusted), _chat("cht_other")])
     event = SimpleNamespace(
         text="[process finished]", internal=True, message_id=None, channel_prompt=None,
-        source=SimpleNamespace(chat_id="cht_b", chat_type="group" if group else "dm",
+        source=SimpleNamespace(chat_id=chat_uid, chat_type="group" if group else "dm",
                                role_authorized=not group, user_id="cp_m"))
     await adapter.on_processing_start(event)
-    assert adapter._active_turn.get()["authority"] is authority
+    turn = adapter._active_turn.get()
+    assert (turn["authority"], turn["recall_everywhere"]) == (authority, authority)
     assert (adapter._send_guard("cht_other") is None) is authority
     _live_tool(module, monkeypatch, "list_chats", result=[], record=[])
     assert json.loads(module._plow_list_chats({}))["success"] is authority
