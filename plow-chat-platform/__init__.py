@@ -923,8 +923,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     attacker's host. Refuse every redirect: this endpoint is fixed."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Drain and close the redirect response before raising; the base
+        # handler does the same before it would follow, so the socket is not
+        # left open for the GC to reclaim.
+        fp.read()
+        fp.close()
         raise urllib.error.HTTPError(
-            req.full_url, code, f"refusing redirect to {newurl}", headers, fp)
+            req.full_url, code, f"refusing redirect to {newurl}", headers, None)
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
