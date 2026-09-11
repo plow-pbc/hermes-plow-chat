@@ -3285,24 +3285,23 @@ def _is_draft_send(argv):
 
 # The plugin's accumulated routing knowledge: every observed first-turn miss
 # adds a row (tool -> condition on the parsed JSON result, sentence). A fresh
-# agent's first batch -- session_search, memory, its Plow contacts and chats
-# -- comes back empty or thin, and an empty store about itself reads as
-# absence in the owner's world (#127). Each sentence rides on the result the
-# way Hermes' own link_hint does, so the model reads it as part of the answer.
+# agent's first batch -- session_search, its Plow contacts and chats -- comes
+# back empty or thin, and an empty store about itself reads as absence in the
+# owner's world (#127). Each sentence rides on the result the way Hermes' own
+# link_hint does, so the model reads it as part of the answer. The hints only
+# make sense when a Mac is connected (there are plow_ tools to route to), so
+# the hook is gated on PLOW_MCP_URL, the same signal the Latch section uses.
 _MAC_ROUTE = (
     "Your owner's messages, mail, calendar, contacts, files and what Plow did "
     "for them before are on their Mac: plow_list_skills, then plow_read_skill "
     "for the skill that covers it, then do what it says."
 )
 ROUTING_HINTS = {
+    # An empty search is the only search that misses: sessions_searched is 0
+    # exactly when no session of this agent's own held the topic.
     "session_search": (
-        lambda r: not r.get("sessions_searched", r.get("count")),
+        lambda r: r.get("sessions_searched") == 0,
         "This searched only this agent's own past sessions. " + _MAC_ROUTE),
-    # Hermes' memory tool has no read action: a fresh agent "checking" it gets
-    # an error, and that error is the empty read this row answers.
-    "memory": (
-        lambda r: "error" in r,
-        "Memory is this agent's own notebook and holds nothing about your owner's world. " + _MAC_ROUTE),
     # Neither takes a query, so "no match" is not determinable from the result:
     # every successful read carries the note. Both are partial views by nature.
     "plow_contacts": (
@@ -3312,12 +3311,20 @@ ROUTING_HINTS = {
         lambda r: "chats" in r,
         "These are this agent's own Plow chats. " + _MAC_ROUTE),
 }
+# memory has no row: Hermes' memory tool has no read action (add/replace/remove
+# only), so it never returns a "read found nothing" result to hook -- its
+# content reaches the model as a prompt block, not a tool result. Hinting on
+# its write/usage errors would tell the model something false about the store.
 
 
 def _route_tool_result(tool_name, args, result, **_kwargs):
     """transform_tool_result: attach the ROUTING_HINTS row for this tool as a
     `routing_hint` field when its condition holds. None leaves the result as
-    Hermes has it; a result this hook cannot parse is never worth losing."""
+    Hermes has it; a result this hook cannot parse is never worth losing.
+    Silent when no Mac is connected: with no plow_ tools there is nowhere to
+    route, so an unset PLOW_MCP_URL means no hint at all."""
+    if not os.environ.get("PLOW_MCP_URL"):
+        return None
     try:
         condition, sentence = ROUTING_HINTS[tool_name]
         parsed = json.loads(result)
