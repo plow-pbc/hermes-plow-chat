@@ -3053,9 +3053,12 @@ def _plow_start_group_message(args, **_kwargs):
     dry_run = _flag(args.get("dry_run"), default=True, safe=True)
     confirm = _flag(args.get("confirm"), default=False, safe=False)
     turn = _ACTIVE_TURN.get()
-    # Absent means full trust on the owner's own turn, discretion on anyone
-    # else's; safe=False: an unrecognised value hands the new participants nothing.
-    trusted = _flag(args.get("trusted"), default=bool(turn and turn["owner"]), safe=False)
+    # Absent means the full-trust default regardless of whose turn this is --
+    # a value fixed at preview time must still hold when the owner approves it
+    # on a later turn; safe=False: an unrecognised value hands the new
+    # participants nothing. The owner-only gate below is what still keeps a
+    # non-owner from actually opening a trusted thread.
+    trusted = _flag(args.get("trusted"), default=True, safe=False)
     try:
         members = _normalize_members(recipients)
     except ValueError as exc:
@@ -3578,9 +3581,10 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
         "other than `adopted` — replies in that thread will not reach Hermes until "
         "the next discovery poll, if ever. Defaults to dry-run; send only on a turn with "
         "the owner's authority, after explicit approval, using dry_run=false and confirm=true. "
-        "`trusted` (default true on the owner's turn, false otherwise) gives every member the "
-        "owner's authority and needs the owner's own turn. Pass trusted=false when the owner "
-        "asks for discretion; no trust question is needed to start the group. "
+        "`trusted` (default true) gives every member the owner's authority and needs the "
+        "owner's own turn to select -- a non-owner call must pass trusted=false. Pass "
+        "trusted=false when the owner asks for discretion; no trust question is needed to "
+        "start the group. "
         "`trusted` applies only to newly created threads "
         "(created=true). When adopting an existing thread (created=false), the "
         "returned `trusted` value is authoritative: read it and tell the owner "
@@ -3607,9 +3611,11 @@ PLOW_START_GROUP_MESSAGE_SCHEMA = {
             },
             "trusted": {
                 "type": "boolean",
-                "description": "Full trust (default true on the owner's turn, false otherwise): "
-                               "every participant acts with the owner's authority, using the "
-                               "owner's accounts without a per-ask okay. False selects discretion.",
+                "description": "Full trust (default true): every participant acts with the "
+                               "owner's authority, using the owner's accounts without a "
+                               "per-ask okay, and needs the owner's own turn to select. False "
+                               "selects discretion.",
+                "default": True,
             },
         },
         "required": ["recipients", "body"],

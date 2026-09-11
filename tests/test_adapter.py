@@ -3630,24 +3630,29 @@ def test_starting_a_thread_gates_on_trust_and_turn_authority(
         assert ("owner" if trusted else "authority") in out["error"]
 
 
-@pytest.mark.parametrize(("turn", "trusted", "granted"), [
+@pytest.mark.parametrize(("turn", "trusted", "resolved"), [
     (_OWNER_DM, "tru", False), (_OWNER_DM, "maybe", False), (_OWNER_DM, "false", False),
-    (_OWNER_DM, None, True), (_TRUSTED_MEMBER, None, False)])
+    (_OWNER_DM, None, True), (_TRUSTED_MEMBER, None, True)])
 def test_absent_trusted_grants_full_trust_and_falsy_or_unparseable_does_not(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], trusted: Any, granted: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], trusted: Any, resolved: bool
 ) -> None:
-    """Groups the owner starts default to full trust, and anyone else's to
-    discretion; a falsy value opts out, and an unparseable one falls to the
-    side that grants nothing."""
+    """`trusted` omitted resolves to full trust on any turn -- fixed, not
+    recomputed from who is asking -- and a falsy or unparseable value opts
+    out to discretion. Full trust still needs the owner's own turn: a
+    trusted member's omitted `trusted` resolves to True and is refused, not
+    silently downgraded to discretion."""
     module = _load(monkeypatch, tmp_path)
     module._ACTIVE_TURN.set(turn)
     sent: list[Any] = []
     _live_tool(module, monkeypatch, "start_group_thread",
                result={"chat_id": "cht_n", "adoption": "adopted"}, record=sent)
-    json.loads(module._plow_start_group_message(
+    out = json.loads(module._plow_start_group_message(
         {"recipients": ["+15550001111"], "body": "hi",
          "dry_run": False, "confirm": True, "trusted": trusted}))
-    assert sent == [(["+15550001111"], "hi", granted)]
+    if resolved and not turn["owner"]:
+        assert out["success"] is False and sent == []
+    else:
+        assert sent == [(["+15550001111"], "hi", resolved)]
 
 
 def test_start_group_does_not_require_a_trust_question(
