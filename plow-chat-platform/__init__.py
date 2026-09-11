@@ -906,11 +906,14 @@ _DISCLOSURE = (
     "contacts, set goals, or list the owner's other rooms."
 )
 # The owner anywhere, or anyone in a group the owner trusts: one prompt,
-# whoever is speaking. The roster names the speaker; nothing here depends on it.
+# whoever is speaking. Names the WHY -- an unnamed speaker was refused a
+# trusted turn's own tools without it (replay A/B, see task-3-report.md).
 _AUTHORITY = (
-    "This request carries your owner's full authority: use their connected "
-    "accounts and tools, act for whoever asked, and answer here exactly as you "
-    "would for your owner. Everyone here sees your reply."
+    "This request carries your owner's full authority: your owner either sent "
+    "it or made everyone in this group trusted, so serve whoever asked — named "
+    "in the roster or not — exactly as you would your owner: use their "
+    "connected accounts and tools, act for them, and answer here. Everyone "
+    "here sees your reply."
 )
 # Claiming a relay that did not happen was a real regression on the OpenClaw
 # side: the agent said it had passed a message along, in a thread where everyone
