@@ -4675,12 +4675,15 @@ async def test_only_a_quiet_answer_is_cached(
     ("body", "sentinel_turn", "delivered"),
     [("NO_REPLY", True, False),
      ("  NO_REPLY \n", True, False),
+     # Elm posted exactly this into a live group: the sentinel ends the
+     # answer, so the working-out above it is not a message either.
+     ("Directed at Spruce, not me — staying quiet.\nNO_REPLY", True, False),
      ("NO_REPLY is what I would send here", True, True),
      ("(no reply needed)", True, True),
      ("NO_REPLY", False, True),
      ("NO_REPLY", None, True),
      ("NO_REPLY", "cross_chat", True)],
-    ids=["exact", "whitespace", "embedded", "prose_silence",
+    ids=["exact", "whitespace", "working_out_then_sentinel", "embedded", "prose_silence",
          "solo_dm_turn", "no_turn", "cross_chat_send"],
 )
 async def test_no_reply_sentinel_is_dropped_before_delivery(
@@ -5038,29 +5041,39 @@ async def test_a_peer_claiming_the_goal_is_done_cannot_settle_it(
 
 
 @pytest.mark.parametrize(
-    ("peer", "body", "goal_text", "reply_direction", "expect_silenced"),
+    ("peer", "body", "goal_text", "reply_direction", "held_floor", "expect_silenced"),
     [
-        pytest.param(True, "just thinking out loud", None, None, True, id="peer_unaddressed"),
-        pytest.param(True, "Elm, can you check the date?", None, None, False, id="peer_named"),
-        pytest.param(True, "just thinking out loud", "book the campsite", None, False, id="goal_unlocks"),
+        pytest.param(True, "just thinking out loud", None, None, False, True, id="peer_unaddressed"),
+        pytest.param(True, "Elm, can you check the date?", None, None, False, False, id="peer_named"),
+        pytest.param(True, "just thinking out loud", "book the campsite", None, False, False,
+                     id="goal_unlocks"),
         # The room is the boundary, not the speaker: a human's unaddressed
         # message is the case the owner actually complained about.
-        pytest.param(False, "what time are we leaving?", None, None, True, id="human_unaddressed"),
-        pytest.param(False, "Elm, what time are we leaving?", None, None, False, id="human_named"),
+        pytest.param(False, "what time are we leaving?", None, None, False, True, id="human_unaddressed"),
+        pytest.param(False, "Elm, what time are we leaving?", None, None, False, False, id="human_named"),
         # "helmet" carries "elm"; a substring match read that as being spoken to.
-        pytest.param(False, "we bought a helmet", None, None, True, id="name_inside_a_word"),
+        pytest.param(False, "we bought a helmet", None, None, False, True, id="name_inside_a_word"),
         # A reply to this agent's own message addresses it without naming it.
-        pytest.param(False, "yes, that one", None, "outbound", False, id="reply_to_us"),
-        pytest.param(False, "yes, that one", None, "inbound", True, id="reply_to_someone_else"),
+        pytest.param(False, "yes, that one", None, "outbound", False, False, id="reply_to_us"),
+        pytest.param(False, "yes, that one", None, "inbound", False, True, id="reply_to_someone_else"),
+        # Being named opens a conversation; the next line does not repeat it.
+        # "I would like to know again what is the stuff you can help me with"
+        # went unanswered in a live group (2026-09-11).
+        pytest.param(False, "what else can you do for me?", None, None, True, False,
+                     id="follow_up_while_holding_the_floor"),
+        # Naming another agent hands the floor over, mid-conversation or not.
+        pytest.param(False, "Ash, what about you?", None, None, True, True,
+                     id="another_agent_named_takes_the_floor"),
     ],
 )
 async def test_a_shared_room_draws_a_reply_only_when_named_replied_to_or_under_a_goal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     peer: bool, body: str, goal_text: str | None,
-    reply_direction: str | None, expect_silenced: bool,
+    reply_direction: str | None, held_floor: bool, expect_silenced: bool,
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     adapter = _goal_chat_with_owner_speaking(module)
+    adapter._held_floor["cht_a"] = held_floor
     if goal_text:
         module._goal_save("cht_a", module._goal_new(goal_text))
     handled = _capture_events(monkeypatch, adapter)

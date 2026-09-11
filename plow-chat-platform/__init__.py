@@ -679,7 +679,27 @@ def _goal_turn_line(record):
             f"{_goal_encode(record['text'])}]")
 
 
-def _should_stay_silent(chat, text, goal, slash_command=False, reply_to_self=False):
+def _names(text, name):
+    """True when `text` addresses `name` as a word, not as a substring.
+
+    Escaped, because a display name someone chose is data, never a pattern --
+    "C++" or "A." would otherwise be a broken regex or a wildcard. The word
+    boundary is a non-word character, so "Elm," and "@Elm" still address it
+    and "helmet" does not.
+    """
+    return bool(name) and re.search(rf"(?<!\w){re.escape(name)}(?!\w)",
+                                    text or "", re.IGNORECASE) is not None
+
+
+def _peer_names(chat):
+    """The display names of the other agents in the room, for reading who a
+    message hands the floor to."""
+    return [name for participant in (chat.get("participants") or [])
+            if participant.get("type") == "agent" and participant.get("relationship") == "peer"
+            for name in [(participant.get("line") or {}).get("display_name")] if name]
+
+
+def _should_stay_silent(chat, text, goal, slash_command=False, reply_to_self=False, held_floor=False):
     """True when a message in a shared room must not draw a reply.
 
     A group is other people's thread too. The agent answered every message in
@@ -696,11 +716,13 @@ def _should_stay_silent(chat, text, goal, slash_command=False, reply_to_self=Fal
     # it does not have is a permanent mute, not discretion.
     if not name:
         return False
-    # A token boundary, not a substring: "Ash" must not read "we paid cash"
-    # as its own name. Escaped, because a display name someone chose is data,
-    # never a pattern -- "C++" or "A." would otherwise be a broken regex or a
-    # wildcard. \w, so "Elm," and "@Elm" still address it.
-    return re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text or "", re.IGNORECASE) is None
+    if _names(text, name):
+        return False
+    # Being named opens a conversation; it does not have to be repeated in
+    # every line of it. While this agent is the one that spoke last, a
+    # follow-up with no name in it is still its own -- unless the message
+    # names another agent, which is how the floor is handed over.
+    return not (held_floor and not any(_names(text, peer) for peer in _peer_names(chat)))
 
 
 def _sender_key(sender):
@@ -1269,6 +1291,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._anchored_chats = {self.home_chat_uid: CHECKPOINT.exists()}
         self._last_uids = {self.home_chat_uid: self._load_checkpoint(self.home_chat_uid)}
         self._typing = {}
+        # Who spoke last among the AGENTS in a chat: True while this line's own
+        # message is the most recent agent turn there. The owner asked Spruce,
+        # Spruce answered, and "what else can you do?" was still Spruce's to
+        # answer -- it went unanswered because nothing carried that (group
+        # transcript, 2026-09-11). Humans speaking never changes it; a peer
+        # agent answering does.
+        self._held_floor = {}                # chat uid -> this line spoke last
         self._goal_wakes = {}                 # chat uid -> the one task pacing its goal
         self._goal_locks = {}                 # chat uid -> its load-modify-save lock
         self._goal_paced = False              # pacing runs only inside a live socket session
@@ -2021,16 +2050,21 @@ class PlowChatAdapter(BasePlatformAdapter):
             log.warning("plow_credit_error_replaced status=402 body_length=%d", len(body))
             body = "I've run out of Plow credit for now — top up in the portal and I'll pick this back up."
         turn = self._active_turn.get()
-        if (body == NO_REPLY_SENTINEL and turn is not None
+        # The sentinel ENDS the answer, and whatever the model wrote above it
+        # is its working-out, not a message: Elm posted "This is Daniel asking
+        # Spruce ... / NO_REPLY" into a live group (2026-09-11) because an
+        # exact whole-body match let the pair through as ordinary text. A
+        # trailing sentinel drops the body it closes. Still gated on the
+        # turn's own prompt having advertised it AND on the turn's own chat:
+        # on a solo owner DM, a cron delivery, or an explicit send to another
+        # granted chat, NO_REPLY is ordinary text and whoever asked for that
+        # literal string must get it. No verbose-preference read: this is the
+        # silence contract, not a diagnostic, so it never delivers.
+        lines = [line for line in body.splitlines() if line.strip()]
+        if (lines and lines[-1].strip() == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
-            # The turn's whole answer was "nothing to say" — honor it. Gated
-            # on the turn's own prompt having advertised the sentinel AND on
-            # the turn's own chat: on a solo owner DM, a cron delivery, or an
-            # explicit send to another granted chat, NO_REPLY is ordinary
-            # text — whoever asked for that literal string must get it. No
-            # verbose-preference read: this is the silence contract, not a
-            # diagnostic, so it never delivers.
-            log.info("[plow_chat] dropped NO_REPLY sentinel for %s", chat_id)
+            log.info("[plow_chat] dropped NO_REPLY sentinel for %s (%d line(s) of working-out with it)",
+                     chat_id, len(lines) - 1)
             return SendResult(success=True)
         chatter = _is_chatter(turn, chat_id, metadata)
         # Matched on text because Hermes gives these no metadata of their own:
@@ -2916,6 +2950,9 @@ class PlowChatAdapter(BasePlatformAdapter):
         """One inbound message, from the socket or from the backfill, queued
         for the chat's server."""
         if msg["direction"] != "inbound":
+            # The echo of our own send is the one durable signal that this
+            # line is the agent holding the floor here.
+            self._held_floor[chat_uid] = True
             return                           # the echo of our own send
         sender = msg["sender"]
         if sender["type"] not in ("member", "agent") or (
@@ -2924,6 +2961,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # an outbound agent sender carries a `line` object and NO uid key.
             log.info("[plow_chat] ignored sender.type=%r", sender["type"])
             return
+        if sender["type"] == "agent":
+            # Past the gate above, an agent sender is a peer: it answered, so
+            # the floor is no longer ours and a bare follow-up is theirs.
+            self._held_floor[chat_uid] = False
         uid = msg["uid"]
         if (chat_uid, uid) in self._seen:
             return                           # socket/backfill overlap - never re-fetch
@@ -3045,7 +3086,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         # frame without one is simply not a reply to us.
         replied_to = any((item.reply_to or {}).get("message", {}).get("direction") == "outbound"
                          for item in burst)
-        if _should_stay_silent(roster, spoken, goal, burst[0].starts_slash_command, replied_to):
+        if _should_stay_silent(roster, spoken, goal, burst[0].starts_slash_command, replied_to,
+                               self._held_floor.get(chat_uid, False)):
             channel_prompt = f"{_UNADDRESSED_SILENCE}{channel_prompt}"
         event = MessageEvent(
             text=text,
