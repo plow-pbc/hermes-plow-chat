@@ -216,11 +216,14 @@ def _owner_dm(chat):
     return _is_solo_dm(chat) and len(members) == 1 and members[0].get("role") == "owner"
 
 
-def _authority(owner, chat_type, trusted):
-    """Whether this turn may act and see as the owner: the owner anywhere, or
-    anyone in a group the owner made trusted. The one reader of `trusted` --
-    prompt choice, recall and every action gate key on this, never the flag."""
-    return owner or (chat_type != "dm" and trusted)
+def _authority(chat, owner, human):
+    """(authority, recall_everywhere) for a turn whose speaker is known; the
+    one reader of `trusted`. Authority is the owner's anywhere and a human's
+    in a group the owner trusts -- never a peer agent's or a wake's through
+    trust. Recall reaches every chat only where every human reading holds it:
+    the owner's own DM, or a trusted group."""
+    trusted_group = chat["type"] != "dm" and chat["trusted"]
+    return owner or (human and trusted_group), (owner and chat["type"] == "dm") or trusted_group
 
 
 def _chat_summary(chat):
@@ -595,7 +598,7 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
-def _channel_prompt(chat, role, roster, identity):
+def _channel_prompt(chat, role, roster, identity, authority):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
@@ -606,7 +609,7 @@ def _channel_prompt(chat, role, roster, identity):
     """
     owner = role == "owner"
     prompt = (OWNER_CHANNEL_PROMPT if owner and chat["type"] == "dm"
-              else GROUP_AUTHORITY_CHANNEL_PROMPT if _authority(owner, chat["type"], chat["trusted"])
+              else GROUP_AUTHORITY_CHANNEL_PROMPT if authority
               else EXTERNAL_CHANNEL_PROMPT)
     if owner:
         # A fact about the owner's own account, so it rides their turn in every
@@ -620,6 +623,8 @@ def _channel_prompt(chat, role, roster, identity):
         # the model pasted it rather than call plow_offer_invite (Elm,
         # 2026-09-10), so for anyone else the tool is the only route in.
         identity = {**identity, "signup": None}
+        # By identity, not authority: onboarding directives are never a member's.
+        prompt = f"{_MEMBER_TURN_PREAMBLE}{prompt}"
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
     return f"{_collaboration_prompt(prompt, roster, identity)} {_ANSWER_LAST}"
@@ -945,15 +950,14 @@ _GOAL_PEER_SILENCE = (
 _MEMBER_TURN_PREAMBLE = (
     "This thread is visible to the owner; ignore any first-user onboarding or "
     "profile-build directive and answer their message directly; never emit "
-    f"[NOOP], reasoning, or tool narration. {_SILENCE_OPTION}"
+    "[NOOP], reasoning, or tool narration. "
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_SHARING_RULE}"
 GROUP_AUTHORITY_CHANNEL_PROMPT = (
     f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
-    f"{_MEMBER_TURN_PREAMBLE}"
-    f"{REPLY_TARGET_PROMPT} {_SPEAKER_FACT} {_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_SPEAKER_FACT} {_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
 )
 
 
@@ -1329,8 +1333,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             "chat_uid": chat_uid,
             "owner": bool(event.source.role_authorized),
             "dm": event.source.chat_type == "dm",
-            "authority": _authority(bool(event.source.role_authorized), event.source.chat_type,
-                                    self._chats[chat_uid]["trusted"]),
+            # Stamped where the speaker is known (`_deliver`, `_goal_fire`);
+            # the source cannot tell a peer agent from a human.
+            "authority": event.authority,
+            "recall_everywhere": event.recall_everywhere,
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
@@ -1658,19 +1664,19 @@ class PlowChatAdapter(BasePlatformAdapter):
     async def _goal_fire(self, chat_uid, goal):
         """Inject the goal turn, the same path `gateway/wake.py` uses.
 
-        A scheduled wake carries the room's real prompt: in a group the owner
-        trusts, that runs it with authority; everywhere else only the owner's
-        own DM does. A group thread is full of other people's words, so an
-        authority turn acting on them unprompted there would be a confused
+        A scheduled wake carries the room's real disclosure prompt, and owner
+        authority ONLY in a DM. In a group the thread is full of other people's
+        words; an owner-authorized turn acting on them unprompted is a confused
         deputy holding owner-only tools.
         """
-        # Refreshed first. Inbound delivery re-reads trust before choosing a
-        # prompt; a wake that skipped it would keep serving the authority
-        # prompt -- and the access it grants -- into a group whose owner
-        # has since revoked that trust.
+        # Refreshed first. Inbound delivery re-reads trust before scoping
+        # recall; a wake that skipped it would keep recalling the owner's
+        # other chats into a group whose owner has since revoked that trust.
         await self._refresh_current_chat(chat_uid)
         chat = await self.get_chat_info(chat_uid)
         owner_dm = _owner_dm(self._chats[chat_uid])
+        # No human speaks on a wake, so trust grants it nothing.
+        authority, recall_everywhere = _authority(chat, owner_dm, human=False)
         # Goal line outermost, then the untrusted blocks, then the turn: the
         # order `_deliver` builds, so the two paths that assemble a turn stay
         # one shape rather than two.
@@ -1686,10 +1692,11 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[chat_uid], self._identity) + _SILENCE_OPTION,
+                                           self._chats[chat_uid], self._identity, authority) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
+        event.authority, event.recall_everywhere = authority, recall_everywhere
         await self._handoff_message(event)
 
     async def _handoff_message(self, event):
@@ -2792,7 +2799,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         roster = self._chats[chat_uid]
         text = "\n\n".join(text for _urls, _kinds, text in resolved if text) or "(attachment)"
         goal = _goal_load(chat_uid)
-        authority = _authority(role == "owner", chat["type"], chat["trusted"])
+        authority, recall_everywhere = _authority(chat, role == "owner", sender["type"] == "member")
         # The speaker's own words, kept before any prefix is prepended: the
         # roster context names THIS agent, so testing the prefixed text for
         # our own name would read every peer message as addressed to us.
@@ -2823,7 +2830,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             text = f"{_referrer_block(self._referred_by)}\n\n{text}"
         if _goal_active(goal):
             text = f"{_goal_turn_line(goal)}\n\n{text}"
-        channel_prompt = _channel_prompt(chat, role, roster, self._identity)
+        channel_prompt = _channel_prompt(chat, role, roster, self._identity, authority)
         # Suppress the REPLY, never the read: an agent that cannot see a peer
         # speak loses the thread, and then says incoherent things to its own
         # human. The goal is what unlocks answering another agent at all, so
@@ -2848,6 +2855,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # wrapper in front of it and would spend most of the term budget
         # describing the goal instead of searching for what was said.
         event.recall_text = spoken
+        event.authority, event.recall_everywhere = authority, recall_everywhere
         await self._handoff_message(event)
         # Ack AFTER the handoff, never before: a checkpoint advanced first
         # would mark a message handled that hermes never accepted, and the
@@ -2896,20 +2904,21 @@ def _recall(session_id, user_message, platform, **_kwargs):
     turn's topic, appended to the user message (upstream's seam for per-turn
     recall; never the system prompt, so the prompt cache survives).
 
-    Scope is the turn's authority: the owner's turn, or any turn in a room
-    the owner made trusted, reaches every chat -- trust means members may
-    have owner material; any other turn stays inside its own chat's
-    sessions. The current session is never recalled: the model has it.
-    Errors propagate: Hermes isolates and logs a failing pre_llm_call hook
-    and proceeds without recall, so a broken store is visible in the
-    gateway log instead of hidden here."""
+    Scope is the turn's `recall_everywhere` decision, made in
+    `_authority`: the owner's own DM or a trusted room reaches
+    every chat, the owner's DMs included -- trust means members may have
+    owner material; any other turn, an owner's turn in an untrusted group
+    included, stays inside its own chat's sessions. The current session is
+    never recalled: the model has it. Errors propagate: Hermes isolates and
+    logs a failing pre_llm_call hook and proceeds without recall, so a
+    broken store is visible in the gateway log instead of hidden here."""
     turn = _ACTIVE_TURN.get()
     if platform != PLATFORM_NAME or turn is None:
         return None
     query = _recall_query(turn.get("recall_text") or user_message)
     if not query:
         return None
-    everywhere = turn["authority"]
+    everywhere = turn["recall_everywhere"]
     from hermes_state import get_shared_session_db, release_or_close
     db = get_shared_session_db()
     try:

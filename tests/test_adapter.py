@@ -32,14 +32,14 @@ SIGNUP = {"name": "Life Assistant", "phrase": "Set this up for me: aiworthusing.
 NUMBER = "+16505550100"
 
 # The four turn shapes every action gate is keyed on, plus no turn at all
-# (a cron run). Authority is the owner anywhere, or anyone in a group the
-# owner made trusted -- so the trusted-group member is the one shape where
-# `owner` and `authority` diverge; the discretion member is the one shape
-# `authority` never grants.
-_OWNER_DM = {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True}
-_OWNER_GROUP = {"chat_uid": "cht_g", "owner": True, "dm": False, "authority": True}
-_TRUSTED_MEMBER = {"chat_uid": "cht_t", "owner": False, "dm": False, "authority": True}
-_DISCRETION_MEMBER = {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False}
+# (a cron run), as `_authority` derives them -- see the prompt matrix. The
+# trusted-group member is the one shape where `owner` and `authority` diverge;
+# the owner in a discretion group, where `authority` and recall diverge.
+_OWNER_DM = {"chat_uid": "cht_a", "owner": True, "dm": True, "authority": True, "recall_everywhere": True}
+_OWNER_GROUP = {"chat_uid": "cht_g", "owner": True, "dm": False, "authority": True, "recall_everywhere": False}
+_TRUSTED_MEMBER = {"chat_uid": "cht_t", "owner": False, "dm": False, "authority": True, "recall_everywhere": True}
+_DISCRETION_MEMBER = {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False,
+                      "recall_everywhere": False}
 
 
 @dataclass
@@ -368,6 +368,11 @@ def _owned(module: Any, prompt: str, chat: dict[str, Any]) -> str:
     roster the turn reads. What that sentence SAYS is pinned once, by the
     owner-turn test below; the matrix tests only own where it sits."""
     return f"{prompt} {module._owner_fact(module._owner_identity(chat))}"
+
+
+def _membered(module: Any, prompt: str) -> str:
+    """The same, for the guard every turn but the owner's opens with."""
+    return f"{module._MEMBER_TURN_PREAMBLE}{prompt}"
 
 
 def _envelope(
@@ -1275,7 +1280,7 @@ async def test_one_socket_demuxes_and_checkpoints_two_chats(
         assert block in owner_prompt
     member_prompt = handled[2]["channel_prompt"]
     assert member_prompt == _rendered(module,
-        _voiced(module, module.EXTERNAL_CHANNEL_PROMPT), None, adapter._identity)
+        _voiced(module, _membered(module, module.EXTERNAL_CHANNEL_PROMPT)), None, adapter._identity)
     for block in (module._SPEAKER_FACT, module._DISCLOSURE, module._NO_RELAY):
         assert block in member_prompt
     assert module._SPEAKER_FACT not in owner_prompt, "the owner is not a member"
@@ -1420,6 +1425,7 @@ async def test_every_turn_prompt_opens_with_who_this_agent_is(
     if role == "owner":
         expected = _owned(module, expected, chat)
     else:
+        expected = _membered(module, expected)
         identity = {**identity, "signup": None}
     if group:
         expected = _voiced(module, expected)
@@ -1524,13 +1530,16 @@ async def test_a_shared_thread_names_who_the_agent_speaks_for(
 
 
 @pytest.mark.parametrize(
-    ("group", "role", "trusted", "prompt_name"),
+    ("group", "role", "trusted", "prompt_name", "authority", "everywhere"),
     [
-        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", id="direct-owner"),
-        pytest.param(True, "owner", False, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="untrusted-group-owner"),
-        pytest.param(True, "owner", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="trusted-group-owner"),
-        pytest.param(True, "member", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", id="trusted-group-member"),
-        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", id="untrusted-group-member"),
+        pytest.param(False, "owner", False, "OWNER_CHANNEL_PROMPT", True, True, id="direct-owner"),
+        pytest.param(True, "owner", False, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, False,
+                     id="untrusted-group-owner"),
+        pytest.param(True, "owner", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, True, id="trusted-group-owner"),
+        pytest.param(True, "member", True, "GROUP_AUTHORITY_CHANNEL_PROMPT", True, True, id="trusted-group-member"),
+        pytest.param(True, "peer", True, "EXTERNAL_CHANNEL_PROMPT", False, True, id="trusted-group-peer-agent"),
+        pytest.param(True, "member", False, "EXTERNAL_CHANNEL_PROMPT", False, False, id="untrusted-group-member"),
+        pytest.param(False, "member", True, "EXTERNAL_CHANNEL_PROMPT", False, False, id="member-dm-flagged-trusted"),
     ],
 )
 async def test_authority_selects_the_prompt(
@@ -1540,26 +1549,38 @@ async def test_authority_selects_the_prompt(
     role: str,
     trusted: bool,
     prompt_name: str,
+    authority: bool,
+    everywhere: bool,
 ) -> None:
+    """Authority is the owner's anywhere and a human's in a trusted group --
+    never a peer agent's. Recall reaches every chat only where every human
+    reading holds it: the owner's DM, or a trusted group."""
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     chat = _chat("cht_a", group=group, trusted=trusted)
-    adapter._set_reach([chat])
+    adapter._set_reach([chat, _chat("cht_other")])
     _mark_anchored(adapter, "cht_a")
     handled = _capture_events(monkeypatch, adapter)
 
-    await adapter._on_frame(_envelope("evt_matrix", "cht_a", "msg_matrix", role=role), object())
+    frame = (_peer_envelope("evt_matrix", "cht_a", "msg_matrix") if role == "peer"
+             else _envelope("evt_matrix", "cht_a", "msg_matrix", role=role))
+    await adapter._on_frame(frame, object())
     await _settle(adapter)
 
     expected = getattr(module, prompt_name)
-    if role == "owner":
-        expected = _owned(module, expected, chat)
+    expected = _owned(module, expected, chat) if role == "owner" else _membered(module, expected)
     if group:
         expected = _voiced(module, expected)
-    prompt = handled[0]["channel_prompt"]
+    # A peer that did not name us, with no goal set, is also told to stay out.
+    silenced = module._GOAL_PEER_SILENCE if role == "peer" else ""
+    (event,) = handled
     # Byte-for-byte equality already pins _ANSWER_LAST's trailing position and
     # _SHARING_RULE's presence -- both are baked into `expected`.
-    assert prompt == _rendered(module, expected, None, adapter._identity)
+    assert event["channel_prompt"] == silenced + _rendered(module, expected, None, adapter._identity)
+    assert (event.authority, event.recall_everywhere) == (authority, everywhere)
+    await adapter.on_processing_start(event)
+    assert (adapter._send_guard("cht_other") is None) is authority, "the turn's gates follow its authority"
+    await adapter.on_processing_complete(event, None)
 
 
 # What an owner turn is told about its own owner. Both name the OWNER, whose
@@ -1829,7 +1850,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     handled = _capture_events(monkeypatch, adapter)
 
     await adapter._deliver(
-        [SimpleNamespace(uid="msg_refresh", sender={"uid": "mem_member", "role": "member", "display_name": "Daniel"}, starts_slash_command=False, reply_to=None)],
+        [SimpleNamespace(uid="msg_refresh", sender={"type": "member", "uid": "mem_member", "role": "member", "display_name": "Daniel"}, starts_slash_command=False, reply_to=None)],
         [([], [], "what is on the calendar?")],
         "cht_a",
     )
@@ -1837,7 +1858,7 @@ async def test_next_inbound_turn_refreshes_current_trust_before_prompt_selection
     assert http.calls == [("get", f"{module.BASE}/v1/chats/cht_a", {"headers": adapter.auth})]
     assert adapter._chats["cht_a"]["trusted"] is True
     assert handled[0]["channel_prompt"] == _rendered(module,
-        _voiced(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT), None, adapter._identity)
+        _voiced(module, _membered(module, module.GROUP_AUTHORITY_CHANNEL_PROMPT)), None, adapter._identity)
 
 
 async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
@@ -1856,7 +1877,7 @@ async def test_current_trust_refresh_failure_is_fail_closed_and_keeps_cache(
 
     with pytest.raises(RuntimeError, match="HTTP 503"):
         await adapter._deliver(
-            [SimpleNamespace(uid="msg_failed", sender={"uid": "mem_owner", "role": "owner", "display_name": "Sam"}, starts_slash_command=False, reply_to=None)],
+            [SimpleNamespace(uid="msg_failed", sender={"type": "member", "uid": "mem_owner", "role": "owner", "display_name": "Sam"}, starts_slash_command=False, reply_to=None)],
             [([], [], "calendar")],
             "cht_a",
         )
@@ -2329,7 +2350,7 @@ def test_external_turn_prompt_carries_disclosure_no_relay_and_ownership(monkeypa
     """The three canonical group rules ride every external turn: the room-scoped
     disclosure boundary, the no-relay fact, and who owns this agent."""
     module = _load(monkeypatch, tmp_path)
-    prompt = module._channel_prompt({"type": "group", "trusted": False}, "member", _chat("cht_a", group=True), {})
+    prompt = module._channel_prompt({"type": "group"}, "member", _chat("cht_a", group=True), {}, False)
     for rule in (module._DISCLOSURE, module._NO_RELAY, module._SPEAKER_FACT):
         assert rule in prompt
     assert module._AUTHORITY not in prompt
@@ -2655,6 +2676,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "owner": False,
         "dm": False,
         "authority": False,
+        "recall_everywhere": False,
         "no_reply_ok": False,
         "suppress_reply": False,
         "recall_text": None,
@@ -2768,7 +2790,7 @@ def test_invite_workflow_reports_delivery_failure(
         pytest.param(
             None,
             "missing",
-            {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False,
+            {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
              "no_reply_ok": False, "suppress_reply": False, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
@@ -2825,6 +2847,8 @@ async def test_active_turn_retains_only_server_invite_identity(
             user_name="attacker-controlled identity",
         ),
         text="attacker-controlled praise must not cross chats",
+        authority=False,
+        recall_everywhere=False,
     )
 
     await adapter.on_processing_start(event)
@@ -4629,42 +4653,11 @@ async def test_turn_open_reads_the_sentinel_contract_off_the_prompt(
                              (module.OWNER_CHANNEL_PROMPT, False)):
         event = SimpleNamespace(
             source=SimpleNamespace(chat_id="cht_a", chat_type="dm", user_id="u", role_authorized=True),
-            message_id="msg_1", channel_prompt=prompt)
+            message_id="msg_1", channel_prompt=prompt, authority=True, recall_everywhere=True)
         await adapter.on_processing_start(event)
         turn = adapter._active_turn.get()
         assert turn["no_reply_ok"] is expected
         await adapter.on_processing_complete(event, None)
-
-
-@pytest.mark.parametrize(
-    ("owner", "chat_type", "trusted", "expected"),
-    [
-        (True, "dm", False, True),
-        (True, "group", False, True),
-        (True, "group", True, True),
-        (False, "group", True, True),
-        (False, "group", False, False),
-        (False, "dm", True, False),   # trust never promotes a DM
-        (False, "dm", False, False),
-    ],
-    ids=["owner-dm", "owner-untrusted-group", "owner-trusted-group", "member-trusted-group",
-         "member-untrusted-group", "member-dm-flagged-trusted", "member-dm"],
-)
-async def test_the_active_turn_carries_one_authority_decision(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    owner: bool, chat_type: str, trusted: bool, expected: bool,
-) -> None:
-    """A trusted group makes every participant the owner; nothing else does."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    adapter._chats["cht_x"] = {**_chat("cht_x", group=chat_type == "group", trusted=trusted)}
-    event = SimpleNamespace(
-        source=SimpleNamespace(chat_id="cht_x", role_authorized=owner, chat_type=chat_type, user_id="cp_m"),
-        message_id="msg_1", channel_prompt="",
-    )
-    await adapter.on_processing_start(event)
-    assert module._ACTIVE_TURN.get()["authority"] is expected
-    await adapter.on_processing_complete(event, None)
 
 
 def test_every_silence_instruction_names_the_sentinel(
@@ -5187,9 +5180,11 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
     await adapter._goal_fire("cht_a", module._goal_load("cht_a"))
 
     assert handled[0]["source"]["role_authorized"] is False
-    # The room's real disclosure prompt, chosen from trust as it stands NOW,
-    # and the same identity opener a spoken turn gets -- a wake that knew what
-    # room it was in but not what it was would be half a turn.
+    # Trust as it stands NOW scopes the wake's recall; no trust gives a wake authority.
+    assert (handled[0].authority, handled[0].recall_everywhere) == (False, False)
+    # The room's real disclosure prompt, and the same identity opener a spoken
+    # turn gets -- a wake that knew what room it was in but not what it was
+    # would be half a turn.
     prompt = handled[0]["channel_prompt"]
     assert module.EXTERNAL_CHANNEL_PROMPT in prompt
     assert module.NO_REPLY_SENTINEL in prompt
@@ -5198,14 +5193,9 @@ async def test_a_scheduled_wake_in_a_group_is_not_owner_authorized(
 
 @pytest.mark.parametrize("group", [False, True], ids=["owner-dm", "group"])
 @pytest.mark.parametrize("trusted", [False, True], ids=["discretion", "full-trust"])
-async def test_goal_wake_can_start_a_thread_only_with_authority(
+async def test_goal_wake_can_start_a_thread_only_with_owner_dm_authority(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, group: bool, trusted: bool,
 ) -> None:
-    """`_goal_fire` grants a wake owner authority only in the owner's own DM --
-    a group is full of other people's words -- but a trusted group's
-    authority comes from the room, not from who is speaking, so a wake there
-    carries it too. Only a discretion group's wake, with no owner and no
-    trust behind it, lacks what a plain thread needs."""
     module = _load(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "MessageEvent", SimpleNamespace)
     sent: list[Any] = []
@@ -5217,7 +5207,6 @@ async def test_goal_wake_can_start_a_thread_only_with_authority(
     args = {"recipients": ["+15550001111"], "body": "Can we meet Friday?",
             "dry_run": False, "confirm": True, "trusted": False}
     results = []
-    expect_success = not group or trusted
 
     async def process(event: Any) -> None:
         await adapter.on_processing_start(event)
@@ -5230,12 +5219,12 @@ async def test_goal_wake_can_start_a_thread_only_with_authority(
     monkeypatch.setattr(adapter, "handle_message", process)
     await adapter._goal_fire("cht_a", module._goal_new("Arrange a meeting with Taylor"))
 
-    assert results[0]["success"] is expect_success
-    assert sent == ([(["+15550001111"], args["body"], False)] if expect_success else [])
-    if not expect_success:
-        assert "authority" in results[0]["error"] and "nothing was sent" in results[0]["error"]
+    assert results[0]["success"] is (not group)
+    assert sent == ([] if group else [(["+15550001111"], args["body"], False)])
+    if group:
+        assert "nothing was sent" in results[0]["error"]
     assert module._ACTIVE_TURN.get() is None
-    # A plain cron call has no processing event and acquires no authority.
+    # A plain cron call has no processing event and acquires no owner authority.
     assert json.loads(module._plow_start_group_message(args))["success"] is False
 
 
@@ -5793,12 +5782,13 @@ _SESSIONS = {"s_dm": {"chat_id": "cht_dm"}, "s_here": {"chat_id": "cht_room"}, "
 @pytest.mark.parametrize(
     ("turn", "expected_snippets"),
     [
-        ({"chat_uid": "cht_room", "owner": True, "dm": True, "authority": True},
-         ["three possible addresses", "earlier in this room"]),
-        ({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False},
-         ["earlier in this room"]),
+        ({**_OWNER_DM, "chat_uid": "cht_room"}, ["three possible addresses", "earlier in this room"]),
+        ({**_TRUSTED_MEMBER, "chat_uid": "cht_room"}, ["three possible addresses", "earlier in this room"]),
+        # Authority, but a member reads the reply: recall stays in the room.
+        ({**_OWNER_GROUP, "chat_uid": "cht_room"}, ["earlier in this room"]),
+        ({**_DISCRETION_MEMBER, "chat_uid": "cht_room"}, ["earlier in this room"]),
     ],
-    ids=["everywhere", "room-only"],
+    ids=["owner-dm", "trusted-group", "owner-in-discretion-group", "discretion-member"],
 )
 def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, turn: dict[str, Any], expected_snippets: list[str]
@@ -5818,7 +5808,7 @@ def test_recall_scope_follows_the_turns_role_and_the_rooms_trust(
                          "role_filter": ["user", "assistant"], "limit": 30,
                          "fields": ("session_id", "role", "snippet", "timestamp")}]
     assert db.closed is True
-    if turn["authority"]:
+    if turn["recall_everywhere"]:
         assert text.splitlines()[1] == "- [2026-09-03] assistant: three possible addresses"
     assert text.splitlines()[-1] == "(end of recalled snippets)"
 
@@ -5834,7 +5824,7 @@ def test_recall_caps_at_six_lines(
     ]
     db = _FakeDb(rows, {})
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": True, "authority": True})
+    module._ACTIVE_TURN.set({**_OWNER_DM, "chat_uid": "cht_room"})
     out = module._recall(session_id="s_here", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert out["context"].count("- [") == 6
 
@@ -5845,7 +5835,7 @@ def test_recall_is_silent_off_platform_without_a_turn_or_without_words(
     module = _load(monkeypatch, tmp_path)
     db = _FakeDb(_ROWS, _SESSIONS)
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     assert module._recall(session_id="s", user_message="hello there", platform="telegram") is None
     assert module._recall(session_id="s", user_message="x\n\n1", platform=module.PLATFORM_NAME) is None
     module._ACTIVE_TURN.set(None)
@@ -5858,7 +5848,7 @@ def test_recall_returns_none_when_nothing_matches(
 ) -> None:
     module = _load(monkeypatch, tmp_path)
     _stub_hermes_state(monkeypatch, _FakeDb([], {}))
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     assert module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME) is None
 
 
@@ -5869,7 +5859,7 @@ def test_recall_lets_a_store_failure_propagate(
     db = _FakeDb([], {})
     db.search_messages = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("fts locked"))  # type: ignore[method-assign]
     _stub_hermes_state(monkeypatch, db)
-    module._ACTIVE_TURN.set({"chat_uid": "cht_room", "owner": True, "dm": False, "authority": False})
+    module._ACTIVE_TURN.set({**_DISCRETION_MEMBER, "chat_uid": "cht_room"})
     with pytest.raises(RuntimeError, match="fts locked"):
         module._recall(session_id="s", user_message="anything at all", platform=module.PLATFORM_NAME)
     assert db.closed is True
@@ -6486,7 +6476,7 @@ async def test_a_later_turn_start_does_not_strip_the_running_turn(monkeypatch, t
 
     event = SimpleNamespace(
         source=SimpleNamespace(chat_id='cht_a', role_authorized=True, chat_type='dm'),
-        channel_prompt='', message_id='', text='')
+        channel_prompt='', message_id='', text='', authority=True, recall_everywhere=True)
     await adapter.on_processing_start(event)
     second = adapter._active_turn.get()
     assert second is not first, 'the fixture should have produced a distinct second turn'
