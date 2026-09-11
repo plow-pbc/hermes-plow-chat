@@ -2688,6 +2688,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         injects a wake: signed by Plow rather than the owner, owner authority
         only in the owner's DM, and a prompt that lets the turn stay silent."""
         home = self.home_chat_uid
+        await self._refresh_current_chat(home)  # authority from the live roster, as in `_goal_fire`
         chat = await self.get_chat_info(home)
         owner_dm = _owner_dm(self._chats[home])
         await self._handoff_message(MessageEvent(

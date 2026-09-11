@@ -2072,6 +2072,7 @@ async def test_a_first_ever_connect_primes_the_agent_once(monkeypatch: pytest.Mo
         monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: _SocketHTTP())
         monkeypatch.setattr(adapter, "send", mock.AsyncMock(return_value=_SendResult(success=True)))
         monkeypatch.setattr(adapter, "_refresh_reach", mock.AsyncMock())
+        monkeypatch.setattr(adapter, "_refresh_current_chat", mock.AsyncMock())
         monkeypatch.setattr(adapter, "_backfill", mock.AsyncMock(side_effect=[OSError("socket dropped"), None]))
         handed.append(_capture_events(monkeypatch, adapter))
         with mock.patch.object(module.asyncio, "sleep", side_effect=[None, StopAsyncIteration]):
