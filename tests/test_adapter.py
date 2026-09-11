@@ -2258,13 +2258,20 @@ def test_platform_declaration_carries_the_facts_hermes_reads_off_it(
     which is where this channel says it is the agent's own line, the one place
     a per-channel identity fact has to live."""
     module = _load(monkeypatch, tmp_path)
+    monkeypatch.delenv("PLOW_MCP_URL", raising=False)
     ctx = mock.Mock()
     module.register(ctx)
     [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert kwargs["cron_deliver_env_var"] == "PLOW_HOME_CHANNEL"
     assert "your own line" in kwargs["platform_hint"]
     # The owner's world is on the Mac (#129): the hint is in force from the
-    # first turn, before any section or skill is read.
+    # first turn, before any section or skill is read -- and only when there
+    # is a Mac, which plow-init signals with PLOW_MCP_URL.
+    assert "on their Mac behind the plow_ tools" not in kwargs["platform_hint"]
+    monkeypatch.setenv("PLOW_MCP_URL", "https://api.plow.co/v1/relay/devices/u/mcp")
+    ctx = mock.Mock()
+    module.register(ctx)
+    [kwargs] = [call.kwargs for call in ctx.register_platform.call_args_list if call.kwargs["name"] == "plow_chat"]
     assert "on their Mac behind the plow_ tools" in kwargs["platform_hint"]
 
 
