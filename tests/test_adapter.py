@@ -5775,7 +5775,7 @@ def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tm
         def do_POST(self) -> None:
             hits.append(self.path)
             self.send_response(302)
-            self.send_header("Location", "http://attacker.example/steal")
+            self.send_header("Location", "http://attacker.example/steal?t=line-scoped-token")
             self.end_headers()
 
         def log_message(self, *_a: Any) -> None:
@@ -5785,8 +5785,12 @@ def test_fetch_mac_skills_refuses_a_redirect(monkeypatch: pytest.MonkeyPatch, tm
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
-        with pytest.raises(urllib.error.HTTPError):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
             module._fetch_mac_skills(url, "line-scoped-token", timeout=5.0)
+        # The refusal must not carry the attacker-controlled Location, which
+        # can reflect the bearer token, into the error that gets logged.
+        assert "attacker.example" not in str(excinfo.value)
+        assert "line-scoped-token" not in str(excinfo.value)
     finally:
         server.shutdown()
         server.server_close()

@@ -928,8 +928,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         # left open for the GC to reclaim.
         fp.read()
         fp.close()
-        raise urllib.error.HTTPError(
-            req.full_url, code, f"refusing redirect to {newurl}", headers, None)
+        # NEVER interpolate newurl: a compromised Mac controls the Location and
+        # could reflect the bearer token into it, and this error is logged.
+        raise urllib.error.HTTPError(req.full_url, code, "refusing redirect", headers, None)
 
 
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
@@ -979,7 +980,7 @@ def _refresh_mac_skills() -> None:
     try:
         text = _render_mac_skills(_fetch_mac_skills(url, token))
     except Exception as e:  # noqa: BLE001 -- a Mac that is off is the ordinary case
-        log.info("plow_chat: Mac skill manifest not fetched (%s); Latch section carries no skills yet", e)
+        log.info("plow_chat: Mac skill manifest not fetched (%s); Latch section carries no skills yet", type(e).__name__)
         return
     with _mac_skills["lock"]:
         _mac_skills["text"] = text
