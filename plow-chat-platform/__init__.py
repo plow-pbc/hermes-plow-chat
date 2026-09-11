@@ -3055,26 +3055,68 @@ def _lost_answer(exc):
 
 
 _RECALL_TOKEN = re.compile(r"[^\W_]{4,}")
+# Sixteen, not eight: the words of a thin reply and the agent's own last words
+# both have to fit, and eight let "looking OR forward" crowd out every
+# discriminative term the turn had. Measured against the live store on a
+# 494-token message -- 8: 78ms, 16: 90ms, 32: 156ms, uncapped: 335ms -- and
+# this query runs on every turn, inside pre_llm_call, before the model sees it.
+_RECALL_TOKEN_LIMIT = 16
+# How far back to look for the agent's own last words. A previous turn's final
+# message is a row or three back; ten covers the tool calls in between.
+_RECALL_TAIL_SCAN = 10
+# messages_fts indexes `tool_calls` alongside `content`, and snippet() renders
+# whichever column it likes best -- so a row can match on its prose and still
+# come back as tool-call JSON. The column filter in _recall_query stops the
+# matching; this stops the rendering.
+_RECALL_PAYLOAD = re.compile(r'"(?:call_id|response_item_id|arguments|tool_call_id)"\s*:')
 
 
-def _recall_query(text):
-    """An FTS5 OR-query from the words of the turn's own message.
+def _recall_words(text):
+    """The searchable words of one message, its untrusted blocks stripped.
 
     A turn opens with whatever untrusted blocks it carries -- the roster, and
     on an owner turn who invited them (the gateway may put the speaker label in
     front of one on the same line); everything after them is the message, blank
-    lines included, so every paragraph counts. OR, not FTS5's default AND: a
-    strict conjunction of every word in a sentence matches nothing, which is
-    why session_search's phrase queries return zero sessions for topics the
-    store plainly holds."""
+    lines included, so every paragraph counts."""
     paragraphs = text.split("\n\n")
     while paragraphs and _UNTRUSTED_MARK in paragraphs[0]:
         paragraphs = paragraphs[1:]
-    words = _RECALL_TOKEN.findall(" ".join(paragraphs).lower())
-    return " OR ".join(list(dict.fromkeys(words))[:8])
+    return _RECALL_TOKEN.findall(" ".join(paragraphs).lower())
+
+
+def _recall_query(text, tail=""):
+    """An FTS5 OR-query from the turn's own words, then the agent's own last.
+
+    OR, not FTS5's default AND: a strict conjunction of every word in a
+    sentence matches nothing, which is why session_search's phrase queries
+    return zero sessions for topics the store plainly holds.
+
+    The turn's words come first, so a message with something to say fills the
+    budget alone and `tail` never dilutes it. `tail` earns its place on the
+    turn that has no words of its own -- "ok", "thanks", "looking forward to
+    it!" -- which is exactly the turn where someone is answering a claim this
+    agent made from another chat, and the only place that turn's topic is
+    written down is what the agent itself last said.
+
+    Scoped to `{content}` because messages_fts also indexes `tool_calls`: an
+    unscoped query matches inside serialized tool arguments, which is how a
+    click on `#forward-button` and a mail search for "Leap Forward" came back
+    as this agent's recollection of a dinner."""
+    words = list(dict.fromkeys(_recall_words(text) + _recall_words(tail)))
+    if not words:
+        return ""
+    return "{content} : (" + " OR ".join(words[:_RECALL_TOKEN_LIMIT]) + ")"
 
 
 _RECALL_LIMIT = 6
+
+
+def _recall_tail(db, session_id):
+    """This agent's own last words in this session, or "" if it has none."""
+    for row in reversed(db.get_messages(session_id, limit=_RECALL_TAIL_SCAN, latest=True)):
+        if row.get("role") == "assistant" and (row.get("content") or "").strip():
+            return row["content"]
+    return ""
 
 
 def _recall(session_id, user_message, platform, **_kwargs):
@@ -3093,19 +3135,22 @@ def _recall(session_id, user_message, platform, **_kwargs):
     turn = _ACTIVE_TURN.get()
     if platform != PLATFORM_NAME or turn is None:
         return None
-    query = _recall_query(turn.get("recall_text") or user_message)
-    if not query:
-        return None
     everywhere = turn["recall_everywhere"]
     from hermes_state import get_shared_session_db, release_or_close
     db = get_shared_session_db()
     try:
+        query = _recall_query(turn.get("recall_text") or user_message,
+                              _recall_tail(db, session_id))
+        if not query:
+            return None
         rows = db.search_messages(query, source_filter=[PLATFORM_NAME],
                                   role_filter=["user", "assistant"], limit=30,
                                   fields=("session_id", "role", "snippet", "timestamp"))
         lines = []
         for row in rows:
             if row["session_id"] == session_id:
+                continue
+            if _RECALL_PAYLOAD.search(row["snippet"]):
                 continue
             if not everywhere:
                 session = db.get_session(row["session_id"]) or {}
