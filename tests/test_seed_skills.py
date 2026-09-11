@@ -53,7 +53,7 @@ def test_a_seed_skill_names_only_tools_the_plugin_registers(
 
 def test_the_owners_mac_skill_claims_every_question_about_the_owners_world() -> None:
     """A fresh agent's own stores are empty, and the model reads that as "no
-    record" of the owner's world (#128). Hermes picks a skill by its
+    record" of the owner's world (#128). The model reaches a skill by its
     description, so this one has to name the whole of that world, in
     general terms -- no person, no product line -- and route to the Mac
     rather than the agent's own sessions."""

@@ -25,6 +25,9 @@ on Mac-managed instances). Those tools act on the Mac as the owner.
 2. `plow_read_skill` with the name of the skill whose description covers
    what was asked. That skill is the only source for the command and its
    arguments; never carry a spelling from memory or from this file.
+   Where one of your own skills already covers the part asked about
+   (`google-workspace` for Gmail and Google Calendar), its rules apply
+   on top of the Mac's; read both.
 3. Do what the skill says, in the same turn, before you reply. Read the
    result back to the owner; the answer comes first, any caveat after.
 
