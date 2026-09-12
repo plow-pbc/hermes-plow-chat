@@ -1413,48 +1413,38 @@ class _Stop(Exception):
     """Raised out of the patched sleep, so `_serve`'s forever-loop ends."""
 
 
-async def test_reconnect_backoff_grows_and_saturates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+@pytest.mark.parametrize(
+    ("stays_up_after", "expected"),
+    [
+        pytest.param(None, [30, 60, 120, 240, 300], id="never-connects"),
+        pytest.param(1, [30, 30, 60], id="one-healthy-session"),
+    ],
+)
+async def test_the_reconnect_backoff_grows_saturates_and_resets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    stays_up_after: int | None, expected: list[int],
 ) -> None:
-    """A repeatedly-failing socket backs off 30s, 60s, 120s, 240s, 300s -- not a flat 5s.
+    """Upstream's `_reconnect_backoff` curve: 30s doubling to a 300s cap -- not a flat 5s.
 
     Flat retry was a regression (7253bad): 720 attempts an hour against a dead
-    backend. The curve is upstream's `_reconnect_backoff`.
+    backend. And a session that stayed up past the base was a real connection,
+    so the next outage starts at 30s again rather than wherever the last one
+    ended -- otherwise a long-lived line ratchets toward the cap across
+    unrelated drops and never returns to base.
     """
-    transport = _load(monkeypatch, tmp_path)._transport
-    slept: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        slept.append(seconds)
-        if len(slept) == 5:
-            raise _Stop
-
-    async def always_fails(http: Any) -> None:
-        raise RuntimeError("handshake refused")
-
-    monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
-    with pytest.raises(_Stop):
-        await transport._serve(always_fails, lambda: None, "plow_chat")
-    assert slept == [30, 60, 120, 240, 300]
-
-
-async def test_a_long_lived_session_resets_the_backoff(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """An outage after a healthy connection starts again at the base, not where the last one ended."""
     transport = _load(monkeypatch, tmp_path)._transport
     slept: list[float] = []
     clock = {"now": 0.0}
 
     async def fake_sleep(seconds: float) -> None:
         slept.append(seconds)
-        if len(slept) == 3:
+        if len(slept) == len(expected):
             raise _Stop
 
-    async def fails_then_stays_up(http: Any) -> None:
-        # Attempts 1 and 3 fail instantly; attempt 2 lives well past the base.
-        if len(slept) == 1:
+    async def session(http: Any) -> None:
+        # This row's healthy attempt, if it has one, lives well past the base;
+        # every other attempt fails instantly, leaving the clock where it was.
+        if len(slept) == stays_up_after:
             clock["now"] += transport.RECONNECT_BACKOFF_BASE_SECONDS + 1
         raise RuntimeError("dropped")
 
@@ -1463,8 +1453,8 @@ async def test_a_long_lived_session_resets_the_backoff(
                         lambda: SimpleNamespace(time=lambda: clock["now"]))
     monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
     with pytest.raises(_Stop):
-        await transport._serve(fails_then_stays_up, lambda: None, "plow_chat")
-    assert slept == [30, 30, 60]
+        await transport._serve(session, lambda: None, "plow_chat")
+    assert slept == expected
 
 
 async def test_a_revoked_credential_reports_a_fatal_status(
