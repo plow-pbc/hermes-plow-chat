@@ -1257,6 +1257,11 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._identity = {"signup": None, "number": None}   # read at reach refresh, see _refresh_reach
         self._referred_by = None            # (name, product) of whoever invited the owner, see _read_referrer
         config.extra["group_sessions_per_user"] = False
+        # We hold the indicator ourselves at Plow's 85-90s expiry
+        # (`_typing_until_reply`), so the base's 2s refresh is a second owner of
+        # one lifecycle event -- inert, since we override neither `send_typing`
+        # nor `stop_typing`, but still a task per turn. Same call as email.py's.
+        config.typing_indicator = False
         self.chat_uids = frozenset({self.home_chat_uid})
         self._foreign = frozenset()          # granted uids another platform serves
         self._chats = {

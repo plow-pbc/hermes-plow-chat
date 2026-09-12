@@ -4426,6 +4426,20 @@ async def test_status_frames_follow_verbose_preference(
         assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
 
 
+def test_the_chat_platform_opts_out_of_the_base_typing_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """We hold the indicator ourselves at Plow's 85-90s expiry, so the base's
+    2s refresh is a second owner of one lifecycle event. It is inert -- we
+    override neither `send_typing` nor `stop_typing`, so it ticks against
+    upstream's no-op stubs -- but it is still a task per turn. email.py:58
+    already makes this call, for the same reason."""
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    assert adapter.config.typing_indicator is False
+
+
 async def test_mid_turn_sends_keep_the_typing_indicator_alive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
