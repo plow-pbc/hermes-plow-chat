@@ -86,6 +86,14 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
         def _mark_connected(self) -> None: ...
         def _mark_disconnected(self) -> None: ...
 
+        def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
+            # Mirrors gateway/platforms/base.py:2069-2073 -- the fields
+            # run_adapters.py reads to surface a dead platform.
+            self._running = False
+            self._fatal_error_code = code
+            self._fatal_error_message = message
+            self._fatal_error_retryable = retryable
+
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
     base.SendResult = _SendResult  # type: ignore[attr-defined]
@@ -1389,6 +1397,62 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
 
     with pytest.raises(module._PlowAuthError):
         await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"), object())
+
+
+class _Stop(Exception):
+    """Raised out of the patched sleep, so `_serve`'s forever-loop ends."""
+
+
+@pytest.mark.parametrize(
+    ("connects_on_attempt", "clean_close", "expected"),
+    [
+        pytest.param(None, False, [30, 60, 120, 240, 300], id="never-connects"),
+        pytest.param(2, False, [30, 30, 60], id="one-healthy-session"),
+        # A server-side CLOSE ends the frame loop by returning, not raising.
+        pytest.param(None, True, [30, 60], id="graceful-close"),
+    ],
+)
+async def test_the_reconnect_backoff_grows_saturates_and_resets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    connects_on_attempt: int | None, clean_close: bool, expected: list[int],
+) -> None:
+    """Upstream's `_reconnect_backoff` curve: 30s doubling to a 300s cap -- not a flat 5s.
+
+    Flat retry was a regression (7253bad): 720 attempts an hour against a dead
+    backend. Reaching the socket restarts the curve, so the next outage starts
+    at 30s again rather than wherever the last one ended -- otherwise a
+    long-lived line ratchets toward the cap across unrelated drops and never
+    returns to base. Only `connected()` resets it: a slow *failure* takes just
+    as long as a healthy session, so elapsed time cannot stand in for it.
+    """
+    transport = _load(monkeypatch, tmp_path)._transport
+    slept: list[float] = []
+    drops: list[int] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == len(expected):
+            raise _Stop
+
+    async def session(http: Any, connected: Any) -> None:
+        attempts["n"] += 1
+        if attempts["n"] == connects_on_attempt:
+            connected()                      # this row's one healthy socket
+        if clean_close:
+            return
+        raise RuntimeError("dropped")
+
+    monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _Session())
+    with pytest.raises(_Stop):
+        await transport._serve(session, lambda: drops.append(1), lambda: None, "plow_chat",
+                               on_fatal=lambda: None)
+    assert slept == expected
+    # Every ended attempt marks the line down -- a session that returns is as
+    # disconnected as one that raises, and reporting otherwise leaves the line
+    # "connected" for the whole retry delay.
+    assert len(drops) == len(expected)
 
 
 @pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
@@ -4107,7 +4171,13 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
     """401 at the ticket mint is terminal, not a blip: every retry presents the
     same revoked credential (observed in production -- one WARNING a minute,
     line dead, adapter reporting itself connected). Everything else keeps
-    warn-and-retry."""
+    warn-and-retry.
+
+    The terminal row also carries the fatal status. A stop that reports nothing
+    is the same outage from the operator's side as no stop at all: the line is
+    silent and `hermes status` / `/platform list` still read healthy, because
+    those surfaces read the fields `_set_fatal_error` writes.
+    """
     module = _load(monkeypatch, tmp_path)
     adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
     calls: list[str] = []
@@ -4118,11 +4188,15 @@ async def test_ticket_mint_status_decides_terminal_vs_retry(
         with mock.patch.object(module.asyncio, "sleep", side_effect=StopAsyncIteration):
             with pytest.raises(StopAsyncIteration):
                 await adapter._listen()
+        assert getattr(adapter, "_fatal_error_code", None) is None, "a retryable stop is not fatal"
     else:
         monkeypatch.setattr(module, "_live", (adapter, None))  # published, as an earlier successful connect would have
         with mock.patch.object(module.asyncio, "sleep", side_effect=AssertionError("must not retry a revoked token")):
             await adapter._listen()  # returns; raising into the sleep would fail
         assert module._live is None, "a terminal stop must retire the tool handle"
+        assert adapter._fatal_error_code == "credential_refused"
+        assert adapter._fatal_error_retryable is False
+        assert "re-credential" in adapter._fatal_error_message
     assert "ws_connect" not in calls, calls
 
 

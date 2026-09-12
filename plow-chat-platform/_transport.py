@@ -13,8 +13,18 @@ import os
 import aiohttp
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
-RECONNECT_SECONDS = 5
+# Upstream's reconnect curve (`gateway/run.py:_reconnect_backoff`): 30s, 60s,
+# 120s, ... capped at 5 minutes. This loop had a bounded backoff until 7253bad
+# replaced it with a flat 5s during a 2,938-line rewrite -- 720 retries an hour
+# against a dead backend, with no signal that anything was wrong.
+RECONNECT_BACKOFF_BASE_SECONDS = 30
+RECONNECT_BACKOFF_CAP_SECONDS = 300
 log = logging.getLogger(__name__)
+
+
+def _reconnect_backoff(attempt):
+    """Seconds to wait before retry number `attempt` (1-based)."""
+    return min(RECONNECT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), RECONNECT_BACKOFF_CAP_SECONDS)
 
 
 class _PlowAuthError(Exception):
@@ -79,33 +89,53 @@ def _socket(http, ticket):
     return http.ws_connect(f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}", heartbeat=30)
 
 
-async def _serve(session, on_drop, tag):
+async def _serve(session, on_drop, on_connect, tag, *, on_fatal):
     """The reconnect loop the chat adapter runs, written to be shared with
     the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 
-    `session(http)` is one connection attempt -- read reach, mint, connect,
-    consume frames until the socket closes or raises. Returns only on a
-    revoked credential: every retry would present the same dead token
+    `session(http, connected)` is one connection attempt -- read reach, mint,
+    connect, consume frames until the socket closes or raises. Returns only on
+    a revoked credential: every retry would present the same dead token
     (observed on the str agent 2026-08-27 -- one WARNING a minute, the line
-    dead, the adapter reporting itself connected). `on_drop` marks the
-    adapter disconnected on either exit.
+    dead, the adapter reporting itself connected). `on_drop` marks the adapter
+    disconnected on either exit; `on_fatal` reports the stop through the
+    gateway's fatal-status fields, so a line that will never come back reads
+    as dead rather than healthy in `hermes status`.
+
+    The session calls `connected()` once its socket is up -- that, and only
+    that, restarts the backoff. Elapsed time cannot stand in for it: a reach
+    read, ticket mint or handshake that fails slowly takes just as long as a
+    healthy session and would pin the retry at the base forever.
     """
+    attempt = 0
+
+    def connected():
+        nonlocal attempt
+        attempt = 0
+        on_connect()
+
     while True:
         try:
             async with aiohttp.ClientSession() as http:
-                await session(http)
+                await session(http, connected)
         except _PlowAuthError:
             log.error("[%s] credential refused (401) -- stopping the listen loop; "
                       "re-credential this agent", tag)
             on_drop()
+            on_fatal()
             return
         except Exception as exc:              # noqa: BLE001 - reconnect, never die
             # TYPE only: the ticket is a query parameter, so a non-101
             # handshake raises an exception carrying the whole URL, and
             # that ticket is still live.
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
-            on_drop()
-        await asyncio.sleep(RECONNECT_SECONDS)
+        # Both endings, not just the raising one: a server-side CLOSE ends the
+        # frame loop by returning, and leaving that path unmarked reported the
+        # line connected for the whole retry delay -- five minutes once the
+        # backoff saturates, where it used to be five seconds.
+        on_drop()
+        attempt += 1
+        await asyncio.sleep(_reconnect_backoff(attempt))
 
 
 def _one_line(text):

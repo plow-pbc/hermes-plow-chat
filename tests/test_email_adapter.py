@@ -223,6 +223,19 @@ async def test_a_reply_goes_to_the_chat_send_endpoint_and_only_the_answer_goes(
     assert success or result.error.startswith("Plow Email")
 
 
+async def test_the_email_line_names_its_own_terminal_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """`_serve` is shared with the phone line, so the stop is reported the same
+    way -- but the message an operator reads must name the line that died."""
+    module, _entry = _load_email(monkeypatch, tmp_path)
+    mail = _adapter(module)
+    mail._credential_refused()
+    assert mail._fatal_error_code == "credential_refused"
+    assert mail._fatal_error_retryable is False
+    assert mail._fatal_error_message.startswith("Plow Email")
+
+
 def test_register_declares_both_platforms_on_one_transport(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
