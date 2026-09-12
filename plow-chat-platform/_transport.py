@@ -13,8 +13,18 @@ import os
 import aiohttp
 
 BASE = os.environ.get("PLOW_API_BASE", "https://api.plow.co").rstrip("/")
-RECONNECT_SECONDS = 5
+# Upstream's reconnect curve (`gateway/run.py:_reconnect_backoff`): 30s, 60s,
+# 120s, ... capped at 5 minutes. This loop had a bounded backoff until 7253bad
+# replaced it with a flat 5s during a 2,938-line rewrite -- 720 retries an hour
+# against a dead backend, with no signal that anything was wrong.
+RECONNECT_BACKOFF_BASE_SECONDS = 30
+RECONNECT_BACKOFF_CAP_SECONDS = 300
 log = logging.getLogger(__name__)
+
+
+def _reconnect_backoff(attempt):
+    """Seconds to wait before retry number `attempt` (1-based)."""
+    return min(RECONNECT_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), RECONNECT_BACKOFF_CAP_SECONDS)
 
 
 class _PlowAuthError(Exception):
@@ -90,7 +100,9 @@ async def _serve(session, on_drop, tag):
     dead, the adapter reporting itself connected). `on_drop` marks the
     adapter disconnected on either exit.
     """
+    attempt = 0
     while True:
+        started = asyncio.get_running_loop().time()
         try:
             async with aiohttp.ClientSession() as http:
                 await session(http)
@@ -105,7 +117,13 @@ async def _serve(session, on_drop, tag):
             # that ticket is still live.
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
             on_drop()
-        await asyncio.sleep(RECONNECT_SECONDS)
+        # A session that stayed up past the base interval was a real
+        # connection, not a failing handshake -- start the next outage from
+        # the base rather than wherever the last one ended.
+        if asyncio.get_running_loop().time() - started >= RECONNECT_BACKOFF_BASE_SECONDS:
+            attempt = 0
+        attempt += 1
+        await asyncio.sleep(_reconnect_backoff(attempt))
 
 
 def _one_line(text):

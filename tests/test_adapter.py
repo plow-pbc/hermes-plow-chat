@@ -1391,6 +1391,74 @@ async def test_adopt_lets_a_revoked_credential_stay_terminal(
         await adapter._on_frame(_envelope("evt_dead", "cht_dead", "msg_dead"), object())
 
 
+class _NullSession:
+    """Stands in for aiohttp.ClientSession: the session callable under test never uses it."""
+
+    async def __aenter__(self) -> "_NullSession":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class _Stop(Exception):
+    """Raised out of the patched sleep, so `_serve`'s forever-loop ends."""
+
+
+async def test_reconnect_backoff_grows_and_saturates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A repeatedly-failing socket backs off 30s, 60s, 120s, 240s, 300s -- not a flat 5s.
+
+    Flat retry was a regression (7253bad): 720 attempts an hour against a dead
+    backend. The curve is upstream's `_reconnect_backoff`.
+    """
+    transport = _load(monkeypatch, tmp_path)._transport
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == 5:
+            raise _Stop
+
+    async def always_fails(http: Any) -> None:
+        raise RuntimeError("handshake refused")
+
+    monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
+    with pytest.raises(_Stop):
+        await transport._serve(always_fails, lambda: None, "plow_chat")
+    assert slept == [30, 60, 120, 240, 300]
+
+
+async def test_a_long_lived_session_resets_the_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An outage after a healthy connection starts again at the base, not where the last one ended."""
+    transport = _load(monkeypatch, tmp_path)._transport
+    slept: list[float] = []
+    clock = {"now": 0.0}
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) == 3:
+            raise _Stop
+
+    async def fails_then_stays_up(http: Any) -> None:
+        # Attempts 1 and 3 fail instantly; attempt 2 lives well past the base.
+        if len(slept) == 1:
+            clock["now"] += transport.RECONNECT_BACKOFF_BASE_SECONDS + 1
+        raise RuntimeError("dropped")
+
+    monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(transport.asyncio, "get_running_loop",
+                        lambda: SimpleNamespace(time=lambda: clock["now"]))
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
+    with pytest.raises(_Stop):
+        await transport._serve(fails_then_stays_up, lambda: None, "plow_chat")
+    assert slept == [30, 30, 60]
+
+
 @pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
 @pytest.mark.parametrize(
     ("group", "role", "base"),
