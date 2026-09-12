@@ -2732,7 +2732,8 @@ class PlowChatAdapter(BasePlatformAdapter):
         await self._refresh_current_chat(home)  # authority from the live roster, as in `_goal_fire`
         chat = await self.get_chat_info(home)
         owner_dm = _owner_dm(self._chats[home])
-        await self._handoff_message(MessageEvent(
+        authority, recall_everywhere = _authority(chat, owner_dm, human=False)
+        event = MessageEvent(
             text=SETUP_TURN,
             source=self.build_source(chat_id=home, chat_name=chat["name"], chat_type=chat["type"],
                                      user_id="plow_setup", user_name="Plow setup",
@@ -2740,8 +2741,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"setup-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[home], self._identity) + _SILENCE_OPTION,
-        ))
+                                           self._chats[home], self._identity, authority) + _SILENCE_OPTION,
+        )
+        event.authority, event.recall_everywhere = authority, recall_everywhere
+        await self._handoff_message(event)
 
     async def _backfill(self, http, chat_uid):
         """Process what arrived while the socket was down.
