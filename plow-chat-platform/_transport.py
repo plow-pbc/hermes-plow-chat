@@ -89,31 +89,40 @@ def _socket(http, ticket):
     return http.ws_connect(f"{BASE.replace('http', 'ws', 1)}/v1/ws?ticket={ticket}", heartbeat=30)
 
 
-async def _serve(session, on_drop, tag, *, on_fatal=None):
+async def _serve(session, on_drop, on_connect, tag, *, on_fatal):
     """The reconnect loop the chat adapter runs, written to be shared with
     the email platform tracked in plow-pbc/hermes-plugin-plow#109.
 
-    `session(http)` is one connection attempt -- read reach, mint, connect,
-    consume frames until the socket closes or raises. Returns only on a
-    revoked credential: every retry would present the same dead token
+    `session(http, connected)` is one connection attempt -- read reach, mint,
+    connect, consume frames until the socket closes or raises. Returns only on
+    a revoked credential: every retry would present the same dead token
     (observed on the str agent 2026-08-27 -- one WARNING a minute, the line
-    dead, the adapter reporting itself connected). `on_drop` marks the
-    adapter disconnected on either exit; `on_fatal` (optional) reports the
-    stop through the gateway's fatal-status fields, so a line that will never
-    come back reads as dead rather than healthy in `hermes status`.
+    dead, the adapter reporting itself connected). `on_drop` marks the adapter
+    disconnected on either exit; `on_fatal` reports the stop through the
+    gateway's fatal-status fields, so a line that will never come back reads
+    as dead rather than healthy in `hermes status`.
+
+    The session calls `connected()` once its socket is up -- that, and only
+    that, restarts the backoff. Elapsed time cannot stand in for it: a reach
+    read, ticket mint or handshake that fails slowly takes just as long as a
+    healthy session and would pin the retry at the base forever.
     """
     attempt = 0
+
+    def connected():
+        nonlocal attempt
+        attempt = 0
+        on_connect()
+
     while True:
-        started = asyncio.get_running_loop().time()
         try:
             async with aiohttp.ClientSession() as http:
-                await session(http)
+                await session(http, connected)
         except _PlowAuthError:
             log.error("[%s] credential refused (401) -- stopping the listen loop; "
                       "re-credential this agent", tag)
             on_drop()
-            if on_fatal is not None:
-                on_fatal()
+            on_fatal()
             return
         except Exception as exc:              # noqa: BLE001 - reconnect, never die
             # TYPE only: the ticket is a query parameter, so a non-101
@@ -121,11 +130,6 @@ async def _serve(session, on_drop, tag, *, on_fatal=None):
             # that ticket is still live.
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
             on_drop()
-        # A session that stayed up past the base interval was a real
-        # connection, not a failing handshake -- start the next outage from
-        # the base rather than wherever the last one ended.
-        if asyncio.get_running_loop().time() - started >= RECONNECT_BACKOFF_BASE_SECONDS:
-            attempt = 0
         attempt += 1
         await asyncio.sleep(_reconnect_backoff(attempt))
 

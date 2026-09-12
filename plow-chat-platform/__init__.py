@@ -2812,7 +2812,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         # not tear down every session after it.
         owes_prime = first_install
 
-        async def session(http):
+        async def session(http, connected):
             nonlocal first_connection, owes_prime
             global _live
             if not first_connection:
@@ -2843,7 +2843,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             # loop for its whole life.
             _live = (self, asyncio.get_running_loop())
             async with _socket(http, ticket) as ws:
-                self._mark_connected()
+                connected()
                 log.info("[plow_chat] websocket connected")
                 try:
                     for chat_uid in self.chat_uids:
@@ -2863,7 +2863,7 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # deliver instructions to stop it.
                     self._goal_pause_wakes()
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
+        await _serve(session, self._mark_disconnected, self._mark_connected, PLATFORM_NAME,
                      on_fatal=self._credential_refused)
         # Terminal. State first (`_serve` marked us disconnected), then the
         # tool handle: a confirmed group send against a retired credential

@@ -117,19 +117,19 @@ class PlowEmailAdapter(BasePlatformAdapter):
     async def _listen(self):
         first_connection = True
 
-        async def session(http):
+        async def session(http, connected):
             nonlocal first_connection
             if not first_connection:
                 await self._refresh_reach(http)
             first_connection = False
             async with _socket(http, await _ticket(http, self.auth)) as ws:
-                self._mark_connected()
+                connected()
                 log.info("[plow_email] websocket connected")
                 async for frame in ws:
                     if frame.type == aiohttp.WSMsgType.TEXT:
                         await self._on_frame(frame.json(), http)
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
+        await _serve(session, self._mark_disconnected, self._mark_connected, PLATFORM_NAME,
                      on_fatal=self._credential_refused)
 
     async def _on_frame(self, frame, http):
