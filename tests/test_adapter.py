@@ -86,6 +86,14 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
         def _mark_connected(self) -> None: ...
         def _mark_disconnected(self) -> None: ...
 
+        def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
+            # Mirrors gateway/platforms/base.py:2069-2073 -- the fields
+            # run_adapters.py reads to surface a dead platform.
+            self._running = False
+            self._fatal_error_code = code
+            self._fatal_error_message = message
+            self._fatal_error_retryable = retryable
+
     base.BasePlatformAdapter = _Adapter  # type: ignore[attr-defined]
     base.MessageEvent = lambda **kw: _AttrDict(kw)  # type: ignore[attr-defined]
     base.SendResult = _SendResult  # type: ignore[attr-defined]
@@ -1457,6 +1465,51 @@ async def test_a_long_lived_session_resets_the_backoff(
     with pytest.raises(_Stop):
         await transport._serve(fails_then_stays_up, lambda: None, "plow_chat")
     assert slept == [30, 30, 60]
+
+
+async def test_a_revoked_credential_reports_a_fatal_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The terminal 401 stop sets the fields `hermes status` / `/platform list` read.
+
+    Without them the listen loop stops forever and every status surface still
+    shows the platform healthy -- the 2026-08-27 str-agent shape.
+    """
+    module = _load(monkeypatch, tmp_path)
+    transport = module._transport
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def refused(http: Any) -> None:
+        raise transport._PlowAuthError()
+
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
+    await transport._serve(refused, adapter._mark_disconnected, "plow_chat",
+                           on_fatal=adapter._credential_refused)
+    assert adapter._fatal_error_code == "credential_refused"
+    assert adapter._fatal_error_retryable is False
+    assert "re-credential" in adapter._fatal_error_message
+
+
+async def test_a_transient_drop_sets_no_fatal_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Only a revoked credential is fatal; a network drop must stay retryable."""
+    module = _load(monkeypatch, tmp_path)
+    transport = module._transport
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+
+    async def fake_sleep(seconds: float) -> None:
+        raise _Stop
+
+    async def dropped(http: Any) -> None:
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _NullSession())
+    with pytest.raises(_Stop):
+        await transport._serve(dropped, adapter._mark_disconnected, "plow_chat",
+                               on_fatal=adapter._credential_refused)
+    assert getattr(adapter, "_fatal_error_code", None) is None
 
 
 @pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])

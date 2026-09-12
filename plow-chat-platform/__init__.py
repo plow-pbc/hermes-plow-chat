@@ -1488,6 +1488,12 @@ class PlowChatAdapter(BasePlatformAdapter):
         self._goal_pause_wakes()
         self._mark_disconnected()
 
+    def _credential_refused(self):
+        """Name this platform's terminal stop for the gateway's status surfaces."""
+        self._set_fatal_error("credential_refused",
+                              "Plow rejected the agent token (401); re-credential this agent",
+                              retryable=False)
+
     async def on_processing_start(self, event):
         chat_uid = event.source.chat_id
         self._cancel_typing(chat_uid)
@@ -2857,7 +2863,8 @@ class PlowChatAdapter(BasePlatformAdapter):
                     # deliver instructions to stop it.
                     self._goal_pause_wakes()
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
+                     on_fatal=self._credential_refused)
         # Terminal. State first (`_serve` marked us disconnected), then the
         # tool handle: a confirmed group send against a retired credential
         # must refuse, not invoke this adapter. (Re-port of #17.)

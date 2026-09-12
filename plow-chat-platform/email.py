@@ -108,6 +108,12 @@ class PlowEmailAdapter(BasePlatformAdapter):
             self._ws_task.cancel()
         self._mark_disconnected()
 
+    def _credential_refused(self):
+        """Name this platform's terminal stop for the gateway's status surfaces."""
+        self._set_fatal_error("credential_refused",
+                              "Plow Email rejected the agent token (401); re-credential this agent",
+                              retryable=False)
+
     async def _listen(self):
         first_connection = True
 
@@ -123,7 +129,8 @@ class PlowEmailAdapter(BasePlatformAdapter):
                     if frame.type == aiohttp.WSMsgType.TEXT:
                         await self._on_frame(frame.json(), http)
 
-        await _serve(session, self._mark_disconnected, PLATFORM_NAME)
+        await _serve(session, self._mark_disconnected, PLATFORM_NAME,
+                     on_fatal=self._credential_refused)
 
     async def _on_frame(self, frame, http):
         if frame.get("type") == "connected":
