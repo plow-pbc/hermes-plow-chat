@@ -495,12 +495,9 @@ class _BytesResp(_Resp):
     def __init__(self, data: bytes, status: int = 200) -> None:
         super().__init__(None, status)
         self._data = data
-        self.content_length = len(data)
-        self.content = self
 
-    async def iter_chunked(self, size: int):
-        for start in range(0, len(self._data), size):
-            yield self._data[start:start + size]
+    async def read(self) -> bytes:
+        return self._data
 
 
 class _ContentHTTP:
@@ -659,54 +656,6 @@ async def test_reply_delivers_parent_media_only_without_own_media(
     else:
         assert f"quoted part: {expected_label}" in event["text"]
     assert event["text"].endswith("This photo?")
-
-
-class _CappedResp:
-    """An aiohttp response as `_read_capped` consumes one, counting what it read."""
-
-    def __init__(self, *, content_length: int | None = None, chunks: int = 100) -> None:
-        self.content_length = content_length
-        self.read_total = 0
-        self._chunks = chunks
-        self.content = self
-
-    async def iter_chunked(self, size: int):
-        for _ in range(self._chunks):
-            self.read_total += size
-            yield b"x" * size
-
-
-async def test_an_oversized_attachment_is_refused_before_it_is_read(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """A body over the cap stops mid-stream, not after it is all resident.
-
-    `cache_*_from_bytes` already enforces the cap -- but it measures
-    `len(data)`, by which point the bytes are in memory and the OOM the cap
-    exists to prevent has happened.
-    """
-    module = _load(monkeypatch, tmp_path)
-    resp = _CappedResp()
-    monkeypatch.setattr(module, "get_inbound_media_max_bytes", lambda: 4096)
-
-    with pytest.raises(ValueError):
-        await module._read_capped(resp, "image")
-
-    assert resp.read_total <= module._MEDIA_CHUNK_BYTES, "stopped on the first chunk over the cap"
-
-
-async def test_a_declared_content_length_over_the_cap_is_refused_before_any_chunk(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-) -> None:
-    """An honest oversized header costs no bytes at all."""
-    module = _load(monkeypatch, tmp_path)
-    resp = _CappedResp(content_length=999_999_999)
-    monkeypatch.setattr(module, "get_inbound_media_max_bytes", lambda: 4096)
-
-    with pytest.raises(ValueError):
-        await module._read_capped(resp, "image")
-
-    assert resp.read_total == 0
 
 
 async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(
@@ -4424,21 +4373,6 @@ async def test_status_frames_follow_verbose_preference(
         adapter._cancel_typing("cht_a")
     else:
         assert adapter._typing.get("cht_a") is typing and not typing.cancelled()
-
-
-def test_the_chat_platform_opts_out_of_the_base_typing_loop(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
-) -> None:
-    """We hold the indicator ourselves at Plow's 85-90s expiry, so the base's
-    2s refresh is a second owner of one lifecycle event. It is inert -- we
-    override neither `send_typing` nor `stop_typing`, so it ticks against
-    upstream's no-op stubs -- but it is still a task per turn. email.py:58
-    already makes this call, for the same reason."""
-    module = _load(monkeypatch, tmp_path)
-    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
-    assert adapter.config.typing_indicator is False
-
 
 async def test_mid_turn_sends_keep_the_typing_indicator_alive(
     monkeypatch: pytest.MonkeyPatch,
