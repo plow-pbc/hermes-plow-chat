@@ -22,6 +22,37 @@ reference realization of a prose spec. That framing is retired along with the
 
 `just test` is the gate. `README.md` is the only prose contract.
 
+
+## Check upstream before inventing
+
+This repo extends Hermes, and the single most expensive defect class here is
+re-solving something the framework already ships. It is easy to commit and hard
+to see: `just test` stubs the `gateway.*` modules, so this repo builds, tests and
+ships without upstream ever being on disk. The author — human or agent — is
+usually not ignoring prior art; they cannot see it.
+
+Two sibling entries exist so a reviewer can. Both are subtrees of the upstream
+mirror, materialized at `.siblings/<slug>/` like any other sibling:
+
+- `NousResearch/hermes-gateway-platforms` — `BasePlatformAdapter` and
+  `ADDING_A_PLATFORM.md`, which enumerates what the plugin system already
+  handles for an adapter.
+- `NousResearch/hermes-platform-adapters` — the framework's own ~22 adapters.
+  Read one that faces the same problem before accepting a new mechanism here;
+  `bluebubbles` is the closest peer (`PROVIDER = "imessage"`).
+
+**The grep will not find this for you.** Sibling prior-art search fires on names
+the diff introduces, and a reinvention coins a *new* name for a mechanism
+upstream already has under a different one — so it comes back empty exactly when
+the defect is present. `_GROUP_SPEAK_RULE` (#140) returns zero hits everywhere;
+upstream's `require_mention` appears in 73 files and `channel_context` in 12.
+Ask what the construct *does*, then look for that behaviour upstream by concept.
+
+| DON'T | DO |
+|---|---|
+| Accept `Prior-art: none` for a new adapter mechanism when the upstream slugs report `missing` — that is a coverage gap, not a clean run. | Flag any new **adapter-plumbing** mechanism (dedup, retry/backoff, reconnect, typing lifecycle, media caching, error classification, mention gating) that upstream already ships, citing `.siblings/<slug>/<path>:<line>`. |
+| Demand a repo change for an upstream gap. When upstream's own mechanism is the wrong shape, say so and leave the local one — with the reason recorded. | Flag a config default this repo silently inherits and never sets, where upstream expects an adapter to opt out — `config.typing_indicator` defaults `True` and drives a base `_keep_typing` loop; this repo never disables it. |
+| Treat product behaviour as suspect. Goals, grants, trust and message recovery are genuinely this repo's, and upstream has no equivalent. | Prefer the subtractive remedy: adopting the upstream mechanism should usually *delete* local code. If the switch adds LOC, say why. |
 ## Review priority
 
 | DON'T (suppress / flag-as-shape) | DO (real finding) |

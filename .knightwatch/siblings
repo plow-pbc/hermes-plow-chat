@@ -16,3 +16,25 @@ plow-pbc/plow
 plow-pbc/plow-hermes-agent
 plow-pbc/agent-mgr
 plow-pbc/latch
+
+# Upstream. `plow_chat` is a Hermes platform adapter — it subclasses
+# `BasePlatformAdapter` and is the only repo here that imports upstream
+# Python symbols — so "did Hermes already solve this?" is a real review
+# question and the four entries above cannot answer it. Both are SUBTREES
+# of an operator-staged mirror: the framework is ~2M LOC and only its peer
+# set belongs in the corpus.
+#
+#   hermes-gateway-platforms — the base class plus ADDING_A_PLATFORM.md,
+#     which enumerates what the plugin system already handles (adapter
+#     creation, config parsing, user authorization, cron delivery,
+#     send_message routing, system-prompt hints, status display).
+#   hermes-platform-adapters — the framework's own ~22 adapters. They are
+#     worked examples of the same extension points this repo touches;
+#     bluebubbles is the closest peer (PROVIDER = "imessage").
+#
+# Upstream mirrors are forks and org-sync excludes forks, so these are
+# operator-staged and not auto-refreshed. If they report `missing`, the
+# mirror is absent on this host — that is a coverage gap, not a clean run.
+
+NousResearch/hermes-gateway-platforms
+NousResearch/hermes-platform-adapters
