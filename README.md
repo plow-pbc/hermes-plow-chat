@@ -361,9 +361,11 @@ one line after the agent was named (owner ruling, 2026-09-11). The rule also tel
 calling any tool, so someone else's errand never moves the owner's mail,
 calendar or Mac — an instruction with **no enforcement behind it**: suppression
 lands in `send`, which runs after a tool already has. What the code
-does hold is the sentinel. `send` drops a body whose last non-empty line is
-exactly it, so an answer that arrives as working-out plus `NO_REPLY` posts
-nothing at all — that pair reached a live group once. The read is never
+does hold is the sentinel. `send` drops a body whose last non-empty line is the
+marker — bare, or decorated the way models emit it (`.NO_REPLY`, `*NO_REPLY*`) —
+so an answer that arrives as working-out plus `NO_REPLY` posts nothing at all;
+that pair reached a live group once. Prose that merely mentions the token, and
+any turn whose prompt never offered it, deliver normally. The read is never
 suppressed either way: an agent blind to the room loses the thread and then
 talks past its own human.
 

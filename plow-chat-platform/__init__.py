@@ -1538,6 +1538,10 @@ class PlowChatAdapter(BasePlatformAdapter):
             # The sentinel is only a control value on turns whose prompt
             # established it; read the prompt itself so the gate can't drift.
             "no_reply_ok": NO_REPLY_SENTINEL in (getattr(event, "channel_prompt", "") or ""),
+            # The cursor as it stands while this turn runs. `_deliver` acks
+            # AFTER the handoff, so a turn that silenced itself and then failed
+            # can put this back and let the backfill replay its message.
+            "checkpoint_was": self._last_uids.get(chat_uid),
             # What recall should search for, when it is not the delivered text.
             "recall_text": getattr(event, "recall_text", None),
             "source_message_id": str(
@@ -1574,6 +1578,19 @@ class PlowChatAdapter(BasePlatformAdapter):
         # turn's own replies are still reachable.
         turn = self._active_turn.get()
         said = list(turn.get("said") or ()) if turn else []
+        # Silence is only silence on a turn that worked. `send` acknowledges a
+        # trailing sentinel before the outcome exists, so a turn that failed
+        # after being silenced left the person with neither an answer nor a
+        # failure -- indistinguishable from a deliberate quiet. Rolling the
+        # checkpoint back makes the backfill replay that message and answer it
+        # for real, which beats any apology this seam could post. Compared by
+        # value, not by importing ProcessingOutcome: this plugin's turn hooks
+        # are also driven with None, and the enum is not in the import surface.
+        if (turn is not None and turn.get("silenced")
+                and getattr(outcome, "value", outcome) == "failure"):
+            baseline = turn.get("checkpoint_was")
+            log.warning("[plow_chat] silenced turn failed for %s; replaying its message", chat_uid)
+            self._checkpoint(baseline or "", chat_uid)
         self._cancel_typing(chat_uid)
         self._active_turn.set(None)
         # This turn's ownership and this turn's tasks: a completion that
@@ -2043,6 +2060,10 @@ class PlowChatAdapter(BasePlatformAdapter):
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s (%d line(s) of working-out with it)",
                      chat_id, len(lines) - 1)
+            # Acknowledged before the outcome exists, so remember it: a turn
+            # that goes on to FAIL said nothing and answered nothing, and the
+            # person is owed the retry rather than the silence.
+            turn["silenced"] = True
             return SendResult(success=True)
         chatter = _is_chatter(turn, chat_id, metadata)
         # Matched on text because Hermes gives these no metadata of their own:

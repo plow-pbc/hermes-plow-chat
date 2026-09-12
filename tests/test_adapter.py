@@ -1582,10 +1582,10 @@ async def test_authority_selects_the_prompt(
     if group:
         expected = _voiced(module, expected)
     (event,) = handled
-    # These chats are unnamed lines, which cannot be addressed by name and so
-    # are never silenced -- what the silence matrix below owns. Byte-for-byte
-    # equality already pins _ANSWER_LAST's trailing position and
-    # _SHARING_RULE's presence: both are baked into `expected`.
+    # Byte-for-byte equality pins _ANSWER_LAST's trailing position and
+    # _SHARING_RULE's presence -- both are baked into `expected`. Nothing is
+    # suppressed by code here: whether a turn is this agent's to answer is the
+    # model's call, made from the prompt this test pins.
     assert event["channel_prompt"] == _rendered(module, expected, None, adapter._identity)
     assert (event.authority, event.recall_everywhere) == (authority, everywhere)
     await adapter.on_processing_start(event)
@@ -2785,6 +2785,7 @@ def _invite_turn(**overrides: Any) -> dict[str, Any]:
         "authority": False,
         "recall_everywhere": False,
         "no_reply_ok": False,
+        "checkpoint_was": None,
         "recall_text": None,
         "participant_uid": "cp_taylor",
         "participant_identity": "Taylor",
@@ -2897,7 +2898,7 @@ def test_invite_workflow_reports_delivery_failure(
             None,
             "missing",
             {"chat_uid": "cht_b", "owner": False, "dm": False, "authority": False, "recall_everywhere": False,
-             "no_reply_ok": False, "recall_text": None,
+             "no_reply_ok": False, "checkpoint_was": None, "recall_text": None,
              "source_message_id": "msg_delight_1"},
             id="missing-participant",
         ),
@@ -4697,8 +4698,9 @@ async def test_no_reply_sentinel_is_dropped_before_delivery(
     """A turn whose whole answer is the sentinel stays silent: reported as a
     success to the gateway (silence is the intended outcome, not a failure to
     retry) but never posted, and without the verbose-preference read — this is
-    the silence contract, not a diagnostic. Only the exact sentinel is
-    silence, and only on and for the turn whose prompt established it: prose
+    the silence contract, not a diagnostic. Only a trailing sentinel is
+    silence -- bare or decorated as models emit it -- and only on and for the
+    turn whose prompt established it: prose
     that merely mentions it, a solo-DM turn whose prompt never advertised it,
     a turn-less (cron) delivery, and an owner turn's explicit send to a
     *different* granted chat are all real content and deliver."""
@@ -4765,6 +4767,51 @@ async def test_an_unstamped_hermes_event_opens_a_speakerless_wake_turn(
     _live_tool(module, monkeypatch, "list_chats", result=[], record=[])
     assert json.loads(module._plow_list_chats({}))["success"] is authority
     await adapter.on_processing_complete(event, None)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "replayed"),
+    [
+        pytest.param(SimpleNamespace(value="failure"), True, id="failed-turn-replays"),
+        pytest.param(SimpleNamespace(value="success"), False, id="successful-turn-stays-silent"),
+        pytest.param(None, False, id="no-outcome-stays-silent"),
+    ],
+)
+async def test_a_silenced_turn_that_failed_gives_the_message_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    outcome: Any, replayed: bool,
+) -> None:
+    """Silence is only silence on a turn that worked.
+
+    `send` acknowledges a trailing sentinel before the outcome exists, and the
+    inbound is already acked, so a turn that failed after going quiet left the
+    person with neither an answer nor a failure -- indistinguishable from a
+    deliberate silence. The cursor goes back and the backfill answers it for
+    real.
+    """
+    module = _load(monkeypatch, tmp_path)
+    adapter = module.PlowChatAdapter(SimpleNamespace(extra={}))
+    adapter._set_reach([_chat("cht_a", group=True)])
+    _mark_anchored(adapter, "cht_a")
+    adapter._checkpoint("msg_before", "cht_a")
+    http = _HTTP()
+    monkeypatch.setattr(module.aiohttp, "ClientSession", lambda *a, **k: http)
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="cht_a", chat_type="group", user_id="u",
+                              role_authorized=True),
+        message_id="msg_1", channel_prompt=module.EXTERNAL_CHANNEL_PROMPT,
+        authority=True, recall_everywhere=False)
+    await adapter.on_processing_start(event)
+    # The turn answers with working-out and the sentinel: nothing is posted.
+    assert (await adapter.send("cht_a", "not mine to answer\nNO_REPLY")).success
+    assert [call for call in http.posts if call[0].endswith("/messages")] == []
+    adapter._checkpoint("msg_1", "cht_a")      # as `_deliver` acks after the handoff
+    await adapter.on_processing_complete(event, outcome)
+
+    expected = "msg_before" if replayed else "msg_1"
+    assert adapter._last_uids["cht_a"] == expected
+    assert adapter._checkpoint_path("cht_a").read_text() == expected
 
 
 def test_every_silence_instruction_names_the_sentinel(
