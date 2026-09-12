@@ -159,7 +159,10 @@ owner's turn became *"Already saved that. Now I'll wait for her next reply."*
 The ordering is the model's to get right, and `_ANSWER_LAST` closes every
 channel prompt asking for it — appended once in `_channel_prompt`, the one seam
 both production paths go through, after the identity opener each prompt has to
-start with.
+start with. Its silence half is appended only to a prompt that already
+offered the sentinel: `no_reply_ok` is read off the prompt itself, so a tail
+that named the token on every turn marked a solo owner DM silent-capable and
+would have swallowed an owner's answer that happened to end in it.
 
 One exception rides with it: a tool that *posts* to the chat is itself the
 answer. A successful `plow_send_sequence` has already delivered the turn's

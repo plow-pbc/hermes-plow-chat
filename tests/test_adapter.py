@@ -56,9 +56,14 @@ def _rendered(module: Any, prompt: str, name: Any, identity: Any) -> str:
     """A channel prompt as `_channel_prompt` renders it.
 
     Identity opens it and the answer-ordering rule closes it; the tests below
-    model both so a change to either has one place to land.
+    model both so a change to either has one place to land. The silence half of
+    that rule follows the same opt-in production uses -- a prompt that never
+    offered the sentinel must not end by reserving it.
     """
-    return f"{module._with_identity(prompt, name, identity)} {module._ANSWER_LAST}"
+    composed = module._with_identity(prompt, name, identity)
+    tail = (f"{module._ANSWER_LAST}{module._ANSWER_LAST_SILENCE}"
+            if module.NO_REPLY_SENTINEL in composed else module._ANSWER_LAST)
+    return f"{composed} {tail}"
 
 
 def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_questions: bool = True) -> Any:
@@ -4808,8 +4813,12 @@ def test_every_silence_instruction_names_the_sentinel(
                                           {"signup": None, "number": None}, False)
     assert module._GROUP_SPEAK_RULE not in signed
     assert module._VOICE_RULE in signed, "it still speaks for its own human"
-    # The sentinel gets the last word, because _ANSWER_LAST is the last word.
-    assert module.NO_REPLY_SENTINEL in module._ANSWER_LAST
+    # The sentinel gets the last word where silence is on offer -- and only
+    # there. The unconditional tail must not name it: `no_reply_ok` is read off
+    # the composed prompt, so a tail that named it marked a solo owner DM
+    # silent-capable and swallowed an answer ending in the token.
+    assert module.NO_REPLY_SENTINEL not in module._ANSWER_LAST
+    assert module.NO_REPLY_SENTINEL in module._ANSWER_LAST_SILENCE
     for constant in (module.EXTERNAL_CHANNEL_PROMPT,
                      module.GROUP_AUTHORITY_CHANNEL_PROMPT,
                      module.OWNER_CHANNEL_PROMPT):
@@ -4817,6 +4826,15 @@ def test_every_silence_instruction_names_the_sentinel(
     assert "on a turn you speak" in module._MEMBER_TURN_PREAMBLE
     # A solo owner DM never warrants unprompted silence, so its prompt does
     # not reserve the token — send()'s gate keys off exactly this absence.
+    # Asserted on the COMPOSED prompt, not the constant: the constant stayed
+    # clean while _ANSWER_LAST put the token into every turn.
+    solo = module._channel_prompt({**_dm_chat(), "type": "dm"}, "owner", _dm_chat(),
+                                  {"signup": None, "number": None}, True)
+    assert module.NO_REPLY_SENTINEL not in solo, "an owner DM must not reserve the token"
+    assert module._ANSWER_LAST in solo, "the ordering rule still rides every turn"
+    group = module._channel_prompt({**_collaboration_chat(), "type": "group"}, "owner",
+                                   _collaboration_chat(), {"signup": None, "number": None}, True)
+    assert module._ANSWER_LAST_SILENCE in group, "a group turn ends on the sentinel"
     assert module.NO_REPLY_SENTINEL not in module.OWNER_CHANNEL_PROMPT
 
 

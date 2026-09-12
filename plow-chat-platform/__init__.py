@@ -629,7 +629,13 @@ def _channel_prompt(chat, role, roster, identity, authority, speak_rule=True):
         prompt = f"{_MEMBER_TURN_PREAMBLE}{prompt}"
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
-    return f"{_collaboration_prompt(prompt, roster, identity, speak_rule)} {_ANSWER_LAST}"
+    composed = _collaboration_prompt(prompt, roster, identity, speak_rule)
+    # The sentinel sentence follows the same opt-in that named the sentinel in
+    # the first place: a prompt that never offered silence must not reserve the
+    # token, because `no_reply_ok` is derived from the prompt itself.
+    tail = (f"{_ANSWER_LAST}{_ANSWER_LAST_SILENCE}" if NO_REPLY_SENTINEL in composed
+            else _ANSWER_LAST)
+    return f"{composed} {tail}"
 
 
 def _goal_encode(value):
@@ -846,8 +852,15 @@ _ANSWER_LAST = (
     "Do not narrate the work on the way there: no running commentary "
     "on what you are about to click, search, fill in or try, and no progress "
     "notes between steps. When the work is done, say what happened, once. "
-    "When this turn is not yours to answer at all, the sentinel is that last "
-    f"word: reply with exactly {NO_REPLY_SENTINEL} and nothing else. "
+)
+# The silence half of the ordering rule, appended only to a prompt that has
+# already offered silence. Ordering IS the mechanism here -- this is the last
+# word the model reads -- but a solo owner DM never offers the token, and
+# putting it in the unconditional tail marked those turns no_reply_ok and
+# swallowed an owner's answer that happened to end in it.
+_ANSWER_LAST_SILENCE = (
+    "And when this turn is not yours to answer at all, the sentinel is that "
+    f"last word: reply with exactly {NO_REPLY_SENTINEL} and nothing else. "
 )
 # Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
 # plugin states the routing rule itself. Rendered only when plow-init exported
