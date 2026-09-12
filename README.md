@@ -294,10 +294,16 @@ exists so the model never has to.
 
 Hermes keeps one session per chat, so a turn in one chat knows nothing of the
 others unless told. On every Plow Chat turn the plugin's `pre_llm_call` hook
-runs an OR-query built from the message's own words over the Hermes session
+runs an OR-query over the Hermes session
 store and appends up to six dated one-line snippets from other sessions to the
 turn (upstream's seam for per-turn recall: the user message, never the system
-prompt). The room is the boundary, not the asker: the home chat (the owner's
+prompt). The query takes the message's own words first and then the agent's own
+last words in this session, so a message with something to say fills the term
+budget alone while a bare acknowledgement — the turn where someone is answering
+a claim the agent made from another chat — still has a topic to search on. It
+matches message content only, and skips a snippet that renders as tool-call
+JSON: the store indexes serialized tool calls too, so an unscoped query matches
+inside tool arguments. The room is the boundary, not the asker: the home chat (the owner's
 own DM) and a full-trust room recall from every chat, the owner's DMs included —
 full trust also enables this broader recall. Every other turn, an owner's turn in a
 group using discretion included, recalls only from its own chat's earlier sessions.
