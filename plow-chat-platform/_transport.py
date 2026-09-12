@@ -129,7 +129,11 @@ async def _serve(session, on_drop, on_connect, tag, *, on_fatal):
             # handshake raises an exception carrying the whole URL, and
             # that ticket is still live.
             log.warning("[%s] websocket error: %s", tag, type(exc).__name__)
-            on_drop()
+        # Both endings, not just the raising one: a server-side CLOSE ends the
+        # frame loop by returning, and leaving that path unmarked reported the
+        # line connected for the whole retry delay -- five minutes once the
+        # backoff saturates, where it used to be five seconds.
+        on_drop()
         attempt += 1
         await asyncio.sleep(_reconnect_backoff(attempt))
 

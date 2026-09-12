@@ -1404,15 +1404,17 @@ class _Stop(Exception):
 
 
 @pytest.mark.parametrize(
-    ("connects_on_attempt", "expected"),
+    ("connects_on_attempt", "clean_close", "expected"),
     [
-        pytest.param(None, [30, 60, 120, 240, 300], id="never-connects"),
-        pytest.param(2, [30, 30, 60], id="one-healthy-session"),
+        pytest.param(None, False, [30, 60, 120, 240, 300], id="never-connects"),
+        pytest.param(2, False, [30, 30, 60], id="one-healthy-session"),
+        # A server-side CLOSE ends the frame loop by returning, not raising.
+        pytest.param(None, True, [30, 60], id="graceful-close"),
     ],
 )
 async def test_the_reconnect_backoff_grows_saturates_and_resets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    connects_on_attempt: int | None, expected: list[int],
+    connects_on_attempt: int | None, clean_close: bool, expected: list[int],
 ) -> None:
     """Upstream's `_reconnect_backoff` curve: 30s doubling to a 300s cap -- not a flat 5s.
 
@@ -1425,6 +1427,7 @@ async def test_the_reconnect_backoff_grows_saturates_and_resets(
     """
     transport = _load(monkeypatch, tmp_path)._transport
     slept: list[float] = []
+    drops: list[int] = []
     attempts = {"n": 0}
 
     async def fake_sleep(seconds: float) -> None:
@@ -1436,14 +1439,20 @@ async def test_the_reconnect_backoff_grows_saturates_and_resets(
         attempts["n"] += 1
         if attempts["n"] == connects_on_attempt:
             connected()                      # this row's one healthy socket
+        if clean_close:
+            return
         raise RuntimeError("dropped")
 
     monkeypatch.setattr(transport.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(transport.aiohttp, "ClientSession", lambda *a, **k: _Session())
     with pytest.raises(_Stop):
-        await transport._serve(session, lambda: None, lambda: None, "plow_chat",
+        await transport._serve(session, lambda: drops.append(1), lambda: None, "plow_chat",
                                on_fatal=lambda: None)
     assert slept == expected
+    # Every ended attempt marks the line down -- a session that returns is as
+    # disconnected as one that raises, and reporting otherwise leaves the line
+    # "connected" for the whole retry delay.
+    assert len(drops) == len(expected)
 
 
 @pytest.mark.parametrize("agent_name", [None, "Elm"], ids=["unnamed", "named"])
