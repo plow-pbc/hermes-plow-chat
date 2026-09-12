@@ -119,6 +119,14 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
     base.cache_audio_from_bytes = _cache("aud")  # type: ignore[attr-defined]
     base.cache_video_from_bytes = _cache("vid")  # type: ignore[attr-defined]
     base.cache_document_from_bytes = _cache_doc()  # type: ignore[attr-defined]
+    base.get_inbound_media_max_bytes = lambda: 128 * 1024 * 1024  # type: ignore[attr-defined]
+
+    def _validate_size(size: int, *, media_type: str = "media", max_bytes: int | None = None) -> None:
+        limit = base.get_inbound_media_max_bytes() if max_bytes is None else max_bytes
+        if limit and size > limit:
+            raise ValueError(f"Inbound {media_type} payload is too large ({size} bytes > {limit} bytes)")
+
+    base.validate_inbound_media_size = _validate_size  # type: ignore[attr-defined]
 
     deferred = types.ModuleType("gateway.deferred_questions")
 
@@ -487,9 +495,12 @@ class _BytesResp(_Resp):
     def __init__(self, data: bytes, status: int = 200) -> None:
         super().__init__(None, status)
         self._data = data
+        self.content_length = len(data)
+        self.content = self
 
-    async def read(self) -> bytes:
-        return self._data
+    async def iter_chunked(self, size: int):
+        for start in range(0, len(self._data), size):
+            yield self._data[start:start + size]
 
 
 class _ContentHTTP:
@@ -648,6 +659,54 @@ async def test_reply_delivers_parent_media_only_without_own_media(
     else:
         assert f"quoted part: {expected_label}" in event["text"]
     assert event["text"].endswith("This photo?")
+
+
+class _CappedResp:
+    """An aiohttp response as `_read_capped` consumes one, counting what it read."""
+
+    def __init__(self, *, content_length: int | None = None, chunks: int = 100) -> None:
+        self.content_length = content_length
+        self.read_total = 0
+        self._chunks = chunks
+        self.content = self
+
+    async def iter_chunked(self, size: int):
+        for _ in range(self._chunks):
+            self.read_total += size
+            yield b"x" * size
+
+
+async def test_an_oversized_attachment_is_refused_before_it_is_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """A body over the cap stops mid-stream, not after it is all resident.
+
+    `cache_*_from_bytes` already enforces the cap -- but it measures
+    `len(data)`, by which point the bytes are in memory and the OOM the cap
+    exists to prevent has happened.
+    """
+    module = _load(monkeypatch, tmp_path)
+    resp = _CappedResp()
+    monkeypatch.setattr(module, "get_inbound_media_max_bytes", lambda: 4096)
+
+    with pytest.raises(ValueError):
+        await module._read_capped(resp, "image")
+
+    assert resp.read_total <= module._MEDIA_CHUNK_BYTES, "stopped on the first chunk over the cap"
+
+
+async def test_a_declared_content_length_over_the_cap_is_refused_before_any_chunk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+) -> None:
+    """An honest oversized header costs no bytes at all."""
+    module = _load(monkeypatch, tmp_path)
+    resp = _CappedResp(content_length=999_999_999)
+    monkeypatch.setattr(module, "get_inbound_media_max_bytes", lambda: 4096)
+
+    with pytest.raises(ValueError):
+        await module._read_capped(resp, "image")
+
+    assert resp.read_total == 0
 
 
 async def test_inbound_multi_attachment_keeps_good_parts_and_notes_failed(

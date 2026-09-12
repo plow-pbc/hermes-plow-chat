@@ -42,6 +42,8 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
+    get_inbound_media_max_bytes,
+    validate_inbound_media_size,
 )
 from gateway.session import build_session_key
 from hermes_constants import get_hermes_home
@@ -738,6 +740,30 @@ def _write_channel_aliases(names):
     os.replace(tmp, path)
 
 
+_MEDIA_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_capped(resp, media_type):
+    """Read a body under Hermes' inbound media cap, bounding the read itself.
+
+    `cache_*_from_bytes` already enforces the cap -- but on `len(data)`, by
+    which point the bytes are resident and the OOM it exists to prevent has
+    happened. Upstream bounds the read for httpx (`base._read_httpx_body_with_limit`);
+    this is that, for aiohttp. A declared Content-Length over the cap costs no
+    bytes at all, and the running total is re-checked per chunk so an absent or
+    lying header cannot smuggle more.
+    """
+    limit = get_inbound_media_max_bytes()
+    if resp.content_length is not None:
+        validate_inbound_media_size(resp.content_length, media_type=media_type, max_bytes=limit)
+    chunks, total = [], 0
+    async for chunk in resp.content.iter_chunked(_MEDIA_CHUNK_BYTES):
+        total += len(chunk)
+        validate_inbound_media_size(total, media_type=media_type, max_bytes=limit)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _fetch_attachment(item, content_type):
     """Download one inbound part into Hermes' media cache; the local path.
 
@@ -752,7 +778,7 @@ async def _fetch_attachment(item, content_type):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
             async with http.get(BASE + item["url"]) as resp:
                 resp.raise_for_status()
-                data = await resp.read()
+                data = await _read_capped(resp, content_type.split("/", 1)[0] or "media")
             ext = mimetypes.guess_extension(content_type)
             if content_type.startswith("image/"):
                 return cache_image_from_bytes(data, ext or ".jpg")
