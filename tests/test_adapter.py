@@ -4772,18 +4772,27 @@ def test_every_silence_instruction_names_the_sentinel(
     is told to answer with the sentinel send() drops instead."""
     module = _load(monkeypatch, tmp_path)
     collaboration = module._collaboration_prompt("", _collaboration_chat(), {"signup": None, "number": None})
-    for prompt in (module.EXTERNAL_CHANNEL_PROMPT,
-                   module.GROUP_AUTHORITY_CHANNEL_PROMPT,
-                   collaboration):
+    for prompt in (module.EXTERNAL_CHANNEL_PROMPT, collaboration):
         assert module.NO_REPLY_SENTINEL in prompt
         assert "say nothing" not in prompt and "stay silent" not in prompt
+    # One instruction per turn, not two: the group-authority constant is only
+    # ever composed into a shared room, where the rule names the sentinel. The
+    # EXTERNAL constant keeps its own copy because it also serves a solo
+    # non-owner DM, where the rule is not composed at all.
+    assert module.NO_REPLY_SENTINEL not in module.GROUP_AUTHORITY_CHANNEL_PROMPT
+    assert module._SILENCE_OPTION in module.EXTERNAL_CHANNEL_PROMPT
+    group_owner_turn = module._collaboration_prompt(
+        module.GROUP_AUTHORITY_CHANNEL_PROMPT, _collaboration_chat(),
+        {"signup": None, "number": None})
+    assert group_owner_turn.count(f"reply with exactly {module.NO_REPLY_SENTINEL}") == 1
     # Quiet in a group is the MODEL's call, made from this rule and answered
     # with the sentinel: the adapter holds no name match and no addressed-ness
     # check of its own (owner ruling, 2026-09-11). A solo non-owner DM is an
     # ordinary question, so the rule rides the shared-room seam, not a prompt
     # constant. All four signals are named, the goal one included -- a goal
     # wake names nobody.
-    assert not hasattr(module, "_should_stay_silent"), "the decision is the model's, not the code's"
+    assert not [name for name in dir(module) if "stay_silent" in name], \
+        "the decision is the model's, not the code's -- no predicate of any name"
     for signal in ("your name", "follow-up", "a reply to a message of yours",
                    "a goal for", "reply with exactly"):
         assert signal in module._GROUP_SPEAK_RULE
@@ -4793,6 +4802,14 @@ def test_every_silence_instruction_names_the_sentinel(
     for guard in ("before you look anything up or use any tool", "call nothing"):
         assert guard in module._GROUP_SPEAK_RULE
     assert collaboration.count(module._GROUP_SPEAK_RULE) == 1
+    # A wake or setup turn is exempt: SETUP_TURN tells it to call
+    # plow_list_skills once, which "call nothing, fetch nothing" forbade.
+    signed = module._collaboration_prompt("", _collaboration_chat(),
+                                          {"signup": None, "number": None}, False)
+    assert module._GROUP_SPEAK_RULE not in signed
+    assert module._VOICE_RULE in signed, "it still speaks for its own human"
+    # The sentinel gets the last word, because _ANSWER_LAST is the last word.
+    assert module.NO_REPLY_SENTINEL in module._ANSWER_LAST
     for constant in (module.EXTERNAL_CHANNEL_PROMPT,
                      module.GROUP_AUTHORITY_CHANNEL_PROMPT,
                      module.OWNER_CHANNEL_PROMPT):

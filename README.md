@@ -354,7 +354,10 @@ what it was just asked or just said, a reply to a message of its own, or an
 active goal — and answered with the sentinel when the answer is no. The adapter
 holds no name match and no addressed-ness check of its own: a substring match
 read "we paid cash" as an agent called Ash, and no check could read a follow-up
-one line after the agent was named (owner ruling, 2026-09-11). What the code
+one line after the agent was named (owner ruling, 2026-09-11). The rule also tells it to settle that question before
+calling any tool, so someone else's errand never moves the owner's mail,
+calendar or Mac — an instruction with **no enforcement behind it**: suppression
+lands in `send`, which runs after a tool already has. What the code
 does hold is the sentinel. `send` drops a body whose last non-empty line is
 exactly it, so an answer that arrives as working-out plus `NO_REPLY` posts
 nothing at all — that pair reached a live group once. The read is never

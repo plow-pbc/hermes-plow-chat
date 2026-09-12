@@ -256,7 +256,7 @@ def _chat_summary(chat):
     return summary
 
 
-def _collaboration_prompt(prompt, chat, identity):
+def _collaboration_prompt(prompt, chat, identity, speak_rule=True):
     """System-authority context contains ops-seeded agent names only.
 
     Gated on a PEER, which is narrower than the roster prefix's gate: this
@@ -271,8 +271,12 @@ def _collaboration_prompt(prompt, chat, identity):
         # so they belong with every prompt that gets a roster -- the same gate
         # _VOICE_RULE already uses, rather than repeated into each of the four
         # group-shaped prompts.
+        # A wake or setup turn has no speaker to be addressed by, and its own
+        # text is the errand: telling it to call nothing and answer NO_REPLY
+        # contradicts SETUP_TURN's "call plow_list_skills once".
+        rule = _GROUP_SPEAK_RULE if speak_rule else ""
         prompt = (f"{_VOICE_RULE}{_RELATIONSHIP_FACT} {_NAME_FACT} "
-                  f"{_GROUP_SPEAK_RULE}{prompt}")
+                  f"{rule}{prompt}")
     participants = chat.get("participants") or []
     peers = [
         (peer.get("line") or {}).get("display_name") or "an unnamed peer agent"
@@ -596,7 +600,7 @@ def _goal_wake_generation(message_id):
     return parts[1] if len(parts) >= 3 and parts[0] == "goal" else None
 
 
-def _channel_prompt(chat, role, roster, identity, authority):
+def _channel_prompt(chat, role, roster, identity, authority, speak_rule=True):
     """The turn's channel prompt for this room and speaker.
 
     One owner for the matrix: a scheduled goal wake needs exactly the same
@@ -625,7 +629,7 @@ def _channel_prompt(chat, role, roster, identity, authority):
         prompt = f"{_MEMBER_TURN_PREAMBLE}{prompt}"
     # Appended, not prepended: every turn prompt has to OPEN with who this
     # agent is, and the ordering rule is the same for every room and speaker.
-    return f"{_collaboration_prompt(prompt, roster, identity)} {_ANSWER_LAST}"
+    return f"{_collaboration_prompt(prompt, roster, identity, speak_rule)} {_ANSWER_LAST}"
 
 
 def _goal_encode(value):
@@ -757,7 +761,13 @@ def _reply_parts(reply):
 def _quoted_reply_context(reply, chat):
     """Quote frame data without letting its text or labels close the fence."""
     parent = reply["message"]
-    name = _speaker_name(parent["sender"], chat)[0]
+    # Ours by line uid, not by name: a reply to this agent's own message is a
+    # fact the frame already carries, and the model should not have to infer it.
+    ours = _self_agent_line(chat).get("uid")
+    if ours and ((parent["sender"] or {}).get("line") or {}).get("uid") == ours:
+        name = "you (this agent)"
+    else:
+        name = _speaker_name(parent["sender"], chat)[0]
     _parts, label = _reply_parts(reply)
     context = f'Quoted message from {name} at {parent["created_at"]}: "{parent["body"]}"'
     if label is not None:
@@ -814,6 +824,14 @@ REPLY_TARGET_PROMPT = (
 # lost the intended answer in live trials, twice; see README and
 # plow-pbc/hermes-plugin-plow#89. So the ordering is asked for here rather than
 # inferred there, and it is what keeps the answer out of the withheld set.
+# The model's one legal way to stay silent. An empty response is not silence:
+# hermes' conversation loop retries empty content at full input cost and the
+# retry pressure makes the model verbalize its silence instead ("(no reply
+# needed)"), which then delivers as a real message. The sentinel gives the
+# turn non-empty content that send() drops before delivery: the marker alone,
+# or the marker closing a turn whose working-out came first.
+NO_REPLY_SENTINEL = "NO_REPLY"
+
 _ANSWER_LAST = (
     "Write your answer LAST. Whatever you write last is what this turn is "
     "read as, and it is the one message certain to reach this chat -- anything "
@@ -828,6 +846,8 @@ _ANSWER_LAST = (
     "Do not narrate the work on the way there: no running commentary "
     "on what you are about to click, search, fill in or try, and no progress "
     "notes between steps. When the work is done, say what happened, once. "
+    "When this turn is not yours to answer at all, the sentinel is that last "
+    f"word: reply with exactly {NO_REPLY_SENTINEL} and nothing else. "
 )
 # Hermes 0.21 drops the MCP `instructions` Latch sends on initialize, so the
 # plugin states the routing rule itself. Rendered only when plow-init exported
@@ -1056,12 +1076,6 @@ _NO_RELAY = (
     "actually sent with a tool is a different thing, and stays truthful."
 )
 _SPEAKER_FACT = "The message below is from a participant in this chat who does not own this agent."
-# The model's one legal way to stay silent. An empty response is not silence:
-# hermes' conversation loop retries empty content at full input cost and the
-# retry pressure makes the model verbalize its silence instead ("(no reply
-# needed)"), which then delivers as a real message. The sentinel gives the
-# turn non-empty content that send() drops before delivery. Exact match only.
-NO_REPLY_SENTINEL = "NO_REPLY"
 _SILENCE_OPTION = (
     f"When you have nothing to say, reply with exactly {NO_REPLY_SENTINEL} "
     "and it will not be delivered. "
@@ -1115,8 +1129,13 @@ _GROUP_SPEAK_RULE = (
     "however well you could answer it. "
 )
 OWNER_CHANNEL_PROMPT = f"You are talking to your owner. {REPLY_TARGET_PROMPT} {_SHARING_RULE}"
+# No _SILENCE_OPTION: this prompt is only ever composed into a shared room,
+# where _GROUP_SPEAK_RULE already names the sentinel. EXTERNAL keeps its copy --
+# that one also serves a solo non-owner DM, where the rule is not composed at
+# all and dropping it would strip the sentinel from the prompt `no_reply_ok`
+# reads.
 GROUP_AUTHORITY_CHANNEL_PROMPT = (
-    f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
+    f"{REPLY_TARGET_PROMPT} {_AUTHORITY} {_SHARING_RULE} {_NO_RELAY}"
 )
 EXTERNAL_CHANNEL_PROMPT = (
     f"{REPLY_TARGET_PROMPT} {_SILENCE_OPTION}{_SPEAKER_FACT} {_DISCLOSURE} {_SHARING_RULE} {_NO_RELAY}"
@@ -1851,7 +1870,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"goal-{goal['generation']}-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[chat_uid], self._identity, authority) + _SILENCE_OPTION,
+                                           self._chats[chat_uid], self._identity, authority, speak_rule=False) + _SILENCE_OPTION,
         )
         # A wake has no spoken words; the goal itself is what it is about.
         event.recall_text = goal["text"]
@@ -1957,7 +1976,7 @@ class PlowChatAdapter(BasePlatformAdapter):
         turn = self._active_turn.get()
         # A completed sequence already delivered this turn's reply, so the
         # trailing prose the model adds after it is the same duplicate the
-        # peer gate above exists to stop. Keyed on the sequence's own turn
+        # sentinel drop in send() exists to stop. Keyed on the sequence's own turn
         # rather than the chat, and invalidated by the next inbound handoff
         # even when Hermes recurses before ending this processing lifecycle.
         if (turn and turn.get("sequence_completed") and id(turn) in self._sequence_turns
@@ -2001,7 +2020,13 @@ class PlowChatAdapter(BasePlatformAdapter):
         # literal string must get it. No verbose-preference read: this is the
         # silence contract, not a diagnostic, so it never delivers.
         lines = [line for line in body.splitlines() if line.strip()]
-        if (lines and lines[-1].strip() == NO_REPLY_SENTINEL and turn is not None
+        # ".NO_REPLY" and "*NO_REPLY*" are the same answer decorated, which
+        # gateway/response_filters.py already tolerates upstream. Its own
+        # matcher is not reusable here: the interactive one demands the whole
+        # body BE the marker, which is exactly the case that shipped Elm's
+        # reasoning to a live group, and its successful-turn gate needs an
+        # agent_result that send() never sees.
+        if (lines and lines[-1].strip().strip(".*_ `") == NO_REPLY_SENTINEL and turn is not None
                 and turn.get("no_reply_ok") and chat_id == turn["chat_uid"]):
             log.info("[plow_chat] dropped NO_REPLY sentinel for %s (%d line(s) of working-out with it)",
                      chat_id, len(lines) - 1)
@@ -2735,7 +2760,7 @@ class PlowChatAdapter(BasePlatformAdapter):
             message_id=f"setup-{uuid.uuid4().hex}",
             message_type=_message_type([]),
             channel_prompt=_channel_prompt(chat, "owner" if owner_dm else "member",
-                                           self._chats[home], self._identity, authority) + _SILENCE_OPTION,
+                                           self._chats[home], self._identity, authority, speak_rule=False) + _SILENCE_OPTION,
         )
         event.authority, event.recall_everywhere = authority, recall_everywhere
         await self._handoff_message(event)
