@@ -44,6 +44,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
 )
 from gateway.session import build_session_key
+from hermes_constants import get_hermes_home
 
 from ._transport import (
     BACKGROUND_REVIEW_PREFIX,
@@ -715,8 +716,14 @@ def _write_channel_aliases(names):
     our own key and leave the rest exactly as we found it. A file we cannot
     parse is left alone rather than overwritten -- the caller logs it every
     pass until someone fixes it.
+
+    Not `_STATE_ROOT`: the checkpoint and the goals are ours, this file is the
+    image's. It reads it at `get_hermes_home() / "channel_aliases.json"`
+    (gateway/channel_directory.py:44-45), whose fallback when HERMES_HOME is
+    unset is one segment past where `_STATE_ROOT`'s stops -- so on the exe.dev
+    image we published names nothing ever read.
     """
-    path = CHECKPOINT.parent / "channel_aliases.json"
+    path = get_hermes_home() / "channel_aliases.json"
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)

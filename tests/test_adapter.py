@@ -14,6 +14,7 @@ import http.server
 import importlib.util
 import json
 import logging
+import os
 import pathlib
 import re
 import sys
@@ -149,6 +150,14 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
     redact.redact_sensitive_text = lambda text, force=False: redact._SIGNAL_PHONE_RE.sub(  # type: ignore[attr-defined]
         lambda m: m.group(1)[:4] + "****" + m.group(1)[-4:], text)
 
+    # Upstream's resolution order (hermes_constants.py:101-108), reduced to the
+    # two branches the alias-path tests exercise: HERMES_HOME, else the
+    # platform-native home. Read at call time, as upstream reads it.
+    constants = types.ModuleType("hermes_constants")
+    constants.get_hermes_home = lambda: (  # type: ignore[attr-defined]
+        pathlib.Path(os.environ["HERMES_HOME"]) if os.environ.get("HERMES_HOME")
+        else pathlib.Path.home() / ".hermes")
+
     modules = {
         "agent": types.ModuleType("agent"),
         "agent.redact": redact,
@@ -157,6 +166,7 @@ def _load(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, *, deferred_q
         "gateway.platforms": types.ModuleType("gateway.platforms"),
         "gateway.platforms.base": base,
         "gateway.session": session,
+        "hermes_constants": constants,
     }
     if deferred_questions:
         modules["gateway.deferred_questions"] = deferred
@@ -4193,6 +4203,32 @@ def test_a_corrupt_alias_file_is_not_clobbered(
     with pytest.raises(ValueError):
         module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
     assert path.read_text() == "[]"
+
+
+def test_aliases_land_where_the_gateway_reads_when_hermes_home_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Unset HERMES_HOME is the exe.dev image, and there our state root is the wrong place.
+
+    The gateway resolves this file through `get_hermes_home()`
+    (gateway/channel_directory.py:44-45), which falls back to the platform home
+    -- one segment past where `_STATE_ROOT`'s own fallback stops. Every other
+    test in this suite runs under the fixture's pinned HERMES_HOME, which is
+    exactly why the divergence stayed latent; this one escapes it.
+    """
+    module = _load(monkeypatch, tmp_path)
+    home = tmp_path / "fake-home"
+    (home / ".hermes").mkdir(parents=True)
+    monkeypatch.delenv("HERMES_HOME")
+    monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: home))
+
+    module._write_channel_aliases({"cht_a": "Cleaning (cht_a)"})
+
+    assert json.loads((home / ".hermes" / "channel_aliases.json").read_text()) == {
+        "plow_chat": {"cht_a": "Cleaning (cht_a)"}}
+    # The checkpoint's home is adapter-private and does not move with it.
+    assert not (tmp_path / "channel_aliases.json").exists()
 
 
 def test_reach_publishes_the_names_it_resolved(
